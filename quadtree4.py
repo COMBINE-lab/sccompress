@@ -19,29 +19,36 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
     count = 0
     with open(file_path, 'r') as file:
         csv_reader = csv.reader(file)
+        coln = file.readline().split(",")
+        col_num = len(colnames)
+        mind = [0]*col_num
+        maxd = [0]*col_num
         for row in csv_reader:
-            #print(len(row))
             if len(row) >= 3:  # Ensure there are at least two values per row
-              try:
+              #try:
+                  # Track min and max for each column
+                for i in range(idx_cell,len(row)):
+                  mind[i] = min(float(row[i]),mind[i])
+                  maxd[i] = max(float(row[i]),maxd[i])
+                    
                 x, y= float(row[idx_x]), float(row[idx_y])
                     #max_abs = max(max_abs, *coords)
-                cells  = []
+                #cells  = []
                 if endpt is None:
                   if allgenes:
                     endpt = len(row)
                   else:
                     endpt = idx_cell + 1 
-                for i in range(idx_cell,endpt):
-                  cells.append(float(row[i]))
+                #for i in range(idx_cell,endpt):
+                cells = [float(value) for value in row[idx_cell:endpt]]
                 coords.append([x, y,cells])
                 #print(row)
                 xs.append(x)
                 ys.append(y)
                     # coordinates.append((x, y, z))
                 count += 1
-              except ValueError:
-                coln.append(row)
-                print("Skipping invalid row: {row}")  # Handle invalid data gracefully
+             # except ValueError:
+                #print(f"Skipping invalid row: {row}")  # Handle invalid data gracefully
     #print(count)
     minx = min(*xs)-1
     miny = min(*ys)-1
@@ -58,15 +65,15 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
     if loop:
       sequence = np.arange(0, 1, step)
       for x in sequence:
-        maxerrors = qtree.divide(x,method)
+        maxerror = qtree.divide(x,method,mind,maxd,maxerrors=[])
         print(x)
-        print(maxerrors)
+        print(maxerror)
         y = qtree.blocks()
         y_points.append(y)
-        maxerrorsl.append(maxerrors)
+        maxerrorsl.append(maxerror)
       return(maxerrorsl,y_points)
     else:
-      maxerrors = qtree.divide(step,method)
+      maxerrors = qtree.divide(step,method,mind,maxd,maxerrors=[])
       return(maxerrors,qtree)
       #print(y)
       #print(qtree.points)
@@ -86,11 +93,11 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
 #file_path = "/Users/zhezhenwang/Documents/patro/Moffitt_and_Bambah-Mukku_et_al_merfish_all_cells.csv"
 file_path = "/Users/zhezhenwang/Documents/patro/merfish6k.csv"
 #file_path = "/Users/zhezhenwang/Documents/patro/test2.csv"
-selected = tree_from_csv(file_path,step = 0.7)
+selected = tree_from_csv(file_path,step = 0.5)
 #sys.setrecursionlimit(1500) #increase maximum recursion depth
 df = selected[1].quadtree_to_df()
 df.columns = coln[0][1:len(coln[0])]
-df.to_csv("~/Documents/patro/quadtreedf_meanmean0.7.csv", index=False)
+df.to_csv("~/Documents/patro/quadtreedf_maxmean0.5.csv", index=False)
 
 #with open("/Users/zhezhenwang/Documents/patro/qdtree_allg0.5.pkl","rb") as file:
 #  loaded_data = pickle.load(file)
@@ -108,6 +115,7 @@ df.to_csv("~/Documents/patro/quadtreedf_meanmean0.7.csv", index=False)
 # 
 # selected = tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,step = 0.5)
 
+selected = tree_from_csv(file_path,loop=True)
 plt.figure(figsize=(6, 6))  # Optional: Set the figure size
 #step=0.1
 #plt.scatter(y_mean[0], y_mean[1], color="blue", marker="o", label="qdtree")

@@ -116,7 +116,7 @@ class QuadTree:
       self.sw.query(boundary, found_points)
     return found_points
   
-  def calculate_error(self,method):
+  def calculate_error(self,method,mind,maxd):
     cells = self.query(self.boundary,[])
     #print(cells)
     maxerrors = []
@@ -128,24 +128,28 @@ class QuadTree:
         elif method == "mean":
           block_mean = np.mean([i.data[j] for i in cells])
         #print(cells[0].data)
-        maxd = max([x.data[j] for x in cells])
-        mind = min([x.data[j] for x in cells])
+        #maxd = max([x.data[j] for x in cells])
+        #mind = min([x.data[j] for x in cells])
       # divider = maxd-mind
       # if divider==0: divider = divider+0.0001
-        maxerror = mean([abs(x.data[j] - block_mean) for x in cells])/(maxd-mind + 0.01)
-        maxerrors.append(maxerror)
-      maxerror = mean(maxerrors)
+        maxerror = sum([abs(x.data[j] - block_mean) for x in cells])/(maxd[j]-mind[j] + 0.01)
+        maxerrors.append(float(maxerror))
+      #print(maxerrors)
+      maxerror = np.max(maxerrors)
     else:
       maxerror = 0
-    print("maxerror :" + str(maxerror))
+   # print("maxerror :" + str(maxerror))
     return maxerror
 
-  def divide(self,thereshold,method,maxerrors=[]):
-      maxerror = 0
+  def divide(self,thereshold,method,mind,maxd,maxerrors=[]):
+      # maxerror = 0
       #print(len(self))
       #print(self.points)
-      if len(self)>0: maxerror = self.calculate_error(method)
-      if maxerror > thereshold:
+      if len(self)>0: 
+        maxerror = self.calculate_error(method,mind,maxd)
+      else:
+        maxerror = 0
+      if maxerror > thereshold and len(self)>1:
    # There's room for our point without dividing the QuadTree.
    # """Divide (branch) this node by spawning four children nodes."""
         cx, cy = self.boundary.cx, self.boundary.cy
@@ -174,21 +178,22 @@ class QuadTree:
     # print(self.depth)
         self.points = list(set(self.points)- set(points_nw+points_ne+points_sw+points_se))
         
-        if(len(self)>1):
-          self.divided = True
-          self.nw.divide(thereshold,method)
-          self.ne.divide(thereshold,method)
-          self.sw.divide(thereshold,method)
-          self.se.divide(thereshold,method)
+        #if(len(self)>1):
+        self.divided = True
+        self.nw.divide(thereshold,method,mind,maxd,maxerrors)
+        self.ne.divide(thereshold,method,mind,maxd,maxerrors)
+        self.sw.divide(thereshold,method,mind,maxd,maxerrors)
+        self.se.divide(thereshold,method,mind,maxd,maxerrors)
       else:
         #print("maxerror"+str(maxerror))
         #print(thereshold)
         self.divided = False
-        if not isinstance(maxerror, int): 
-          maxerror = maxerror.item()
         self.maxerror = maxerror
         maxerrors.append(maxerror)
-        #print(np.std(maxerrors))
+        #print(maxerrors)
+        #print(len(maxerrors))
+        # if not isinstance(maxerror, int): 
+        #   maxerror = maxerror.item()
       return(np.mean(maxerrors))
 # 
 #   def insert(self, point,thereshold,median = False):
@@ -262,6 +267,16 @@ class QuadTree:
       npoints = self.nw.blocks()+self.ne.blocks()+self.se.blocks()+self.sw.blocks()
     return npoints
   
+  def non0blocks(self):
+    """Return # of non 0 blocks in the quadtree."""
+    npoints = 0
+    if not self.divided:
+      if len(self.points)>0:
+        npoints = 1
+    else:
+      npoints = self.nw.non0blocks()+self.ne.non0blocks()+self.se.non0blocks()+self.sw.non0blocks()
+    return npoints
+  
   # Recursive function to populate the matrix
   def quadtree_to_df(self, df = None):
     if df is None:
@@ -290,15 +305,19 @@ class QuadTree:
       df = self.se.quadtree_to_df(df= df)
       df = self.sw.quadtree_to_df(df= df)
     return(df)
-## this function has something wrong don't know why it won't update with change of points and reconstructing the tree
-  # def draw(self, ax):
-  #   """Draw a representation of the quadtree on Matplotlib Axes ax."""
-  #   self.boundary.draw(ax)
-  #   if self.divided:
-  #     self.nw.draw(ax)
-  #     self.ne.draw(ax)
-  #     self.se.draw(ax)
-  #     self.sw.draw(ax)
+  ## this function has something wrong don't know why it won't update with change of points and reconstructing the tree
+  def draw(self, ax,xs=[],ys=[]):
+    """Draw a representation of the quadtree on Matplotlib Axes ax."""
+    self.boundary.draw(ax)
+    for i in self.points:
+      xs.append(i.x)
+      ys.append(i.y)
+    if self.divided:
+      self.nw.draw(ax,xs,ys)
+      self.ne.draw(ax,xs,ys)
+      self.se.draw(ax,xs,ys)
+      self.sw.draw(ax,xs,ys)
+    plt.scatter(xs, ys, color='r')
   #     
   # def aggregate(self, boundary):
   #   if not self.divided:
