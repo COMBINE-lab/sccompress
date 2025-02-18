@@ -20,14 +20,17 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
     with open(file_path, 'r') as file:
         csv_reader = csv.reader(file)
         coln = file.readline().split(",")
-        col_num = len(colnames)
+        col_num = len(coln)
+       # print(colnames)
         mind = [0]*col_num
         maxd = [0]*col_num
         for row in csv_reader:
             if len(row) >= 3:  # Ensure there are at least two values per row
               #try:
                   # Track min and max for each column
+                #print(row)
                 for i in range(idx_cell,len(row)):
+                  #print(mind)
                   mind[i] = min(float(row[i]),mind[i])
                   maxd[i] = max(float(row[i]),maxd[i])
                     
@@ -68,7 +71,7 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
         maxerror = qtree.divide(x,method,mind,maxd,maxerrors=[])
         print(x)
         print(maxerror)
-        y = qtree.blocks()
+        y = qtree.non0blocks()
         y_points.append(y)
         maxerrorsl.append(maxerror)
       return(maxerrorsl,y_points)
@@ -118,7 +121,9 @@ df.to_csv("~/Documents/patro/quadtreedf_maxmean0.5.csv", index=False)
 selected = tree_from_csv(file_path,loop=True)
 plt.figure(figsize=(6, 6))  # Optional: Set the figure size
 #step=0.1
-#plt.scatter(y_mean[0], y_mean[1], color="blue", marker="o", label="qdtree")
+y_mean = selected
+plt.scatter(y_mean[0], y_mean[1], color="blue", marker="o", label="qdtree")
+plt.show()
 #plt.scatter(y_med[0], y_med[1], color="blue", marker="o", label="median")
 #se_mean = [0.128,0.128,0.128, 0.129, 0.132,0.054,0.077,0.107,0.097,0.143]
 #se_median = [0.1278582,0.1278582,0.1278582,0.1291324,0.1317702,0.05409406,0.1142056,0.07731104,0.1030225,0.0639858]

@@ -132,7 +132,7 @@ class QuadTree:
         #mind = min([x.data[j] for x in cells])
       # divider = maxd-mind
       # if divider==0: divider = divider+0.0001
-        maxerror = sum([abs(x.data[j] - block_mean) for x in cells])/(maxd[j]-mind[j] + 0.01)
+        maxerror = np.mean([abs(x.data[j] - block_mean) for x in cells])/(maxd[j]-mind[j] + 0.01)
         maxerrors.append(float(maxerror))
       #print(maxerrors)
       maxerror = np.max(maxerrors)
@@ -278,7 +278,7 @@ class QuadTree:
     return npoints
   
   # Recursive function to populate the matrix
-  def quadtree_to_df(self, df = None):
+  def quadtree_to_df(self, df = None,exp=True):
     if df is None:
       df = pd.DataFrame()
     # df = pd.DataFrame(columns=["x", "y"])
@@ -289,21 +289,30 @@ class QuadTree:
       for pt in self.points:
         new_data = {"x":pt.x, "y":pt.y}
         #new_cols = {}
-        for i in range(0,len(values[0])):
-          elements = [j[i] for j in values]
+        if exp:
+          for i in range(0,len(values[0])):
+            elements = [j[i] for j in values]
           # Generate column names dynamically
           #new_cols["col"+str(i)] = np.nanmean(elements)
           new_data["col"+str(i)] = np.nanmean(elements) #pd.DataFrame(new_cols, index=[3])
         # Add list as new columns with dynamically generated names
        # new_data[new_col_names] = pd.DataFrame(new_cols)
+        else:
+          new_data["error"] = self.maxerror  
         df = pd.concat([df, pd.DataFrame([new_data])])
     if self.divided:
       # not Leaf node
       # Recursively process child nodes
-      df = self.nw.quadtree_to_df(df= df)
-      df = self.ne.quadtree_to_df(df= df)
-      df = self.se.quadtree_to_df(df= df)
-      df = self.sw.quadtree_to_df(df= df)
+      if exp:
+        df = self.nw.quadtree_to_df(df= df)
+        df = self.ne.quadtree_to_df(df= df)
+        df = self.se.quadtree_to_df(df= df)
+        df = self.sw.quadtree_to_df(df= df)
+      else:
+        df = self.nw.quadtree_to_df(df= df,exp=False)
+        df = self.ne.quadtree_to_df(df= df,exp=False)
+        df = self.se.quadtree_to_df(df= df,exp=False)
+        df = self.sw.quadtree_to_df(df= df,exp=False)        
     return(df)
   ## this function has something wrong don't know why it won't update with change of points and reconstructing the tree
   def draw(self, ax,xs=[],ys=[]):
