@@ -10,7 +10,7 @@ import csv
 # DPI = 72
 #np.random.seed(60)
 coln = []
-def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
+def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,thereshold = 1,
                   step=0.1,loop = False,method = "mean",endpt= None,allgenes = True):
     coords = []
     xs = []
@@ -29,23 +29,21 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
               #try:
                   # Track min and max for each column
                 #print(row)
-                for i in range(idx_cell,len(row)):
-                  #print(mind)
-                  mind[i] = min(float(row[i]),mind[i])
-                  maxd[i] = max(float(row[i]),maxd[i])
                     
                 x, y= float(row[idx_x]), float(row[idx_y])
                     #max_abs = max(max_abs, *coords)
-                #cells  = []
+                cells  = []
                 if endpt is None:
                   if allgenes:
                     endpt = len(row)
                   else:
                     endpt = idx_cell + 1 
                 #for i in range(idx_cell,endpt):
-                cells = [float(value) for value in row[idx_cell:endpt]]
+                for i in range(idx_cell,endpt):
+                  cells.append(float(row[i]))#[float(value) for value in row[idx_cell:endpt]]
+                  mind[i-idx_cell] = min(float(row[i]),mind[i-idx_cell])
+                  maxd[i-idx_cell] = max(float(row[i]),maxd[i-idx_cell])
                 coords.append([x, y,cells])
-                #print(row)
                 xs.append(x)
                 ys.append(y)
                     # coordinates.append((x, y, z))
@@ -53,6 +51,8 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
              # except ValueError:
                 #print(f"Skipping invalid row: {row}")  # Handle invalid data gracefully
     #print(count)
+    #print(maxd)
+    #print(mind)
     minx = min(*xs)-1
     miny = min(*ys)-1
     maxx = max(*xs)+1
@@ -66,7 +66,7 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
     qtree = QuadTree(domain,points)
     #print(maxdata)
     if loop:
-      sequence = np.arange(0, 1, step)
+      sequence = np.arange(0, thereshold, step)
       for x in sequence:
         maxerror = qtree.divide(x,method,mind,maxd,maxerrors=[])
         print(x)
@@ -76,7 +76,7 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
         maxerrorsl.append(maxerror)
       return(maxerrorsl,y_points)
     else:
-      maxerrors = qtree.divide(step,method,mind,maxd,maxerrors=[])
+      maxerrors = qtree.divide(step,method,mind,maxd)
       return(maxerrors,qtree)
       #print(y)
       #print(qtree.points)
@@ -96,11 +96,12 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,
 #file_path = "/Users/zhezhenwang/Documents/patro/Moffitt_and_Bambah-Mukku_et_al_merfish_all_cells.csv"
 file_path = "/Users/zhezhenwang/Documents/patro/merfish6k.csv"
 #file_path = "/Users/zhezhenwang/Documents/patro/test2.csv"
-selected = tree_from_csv(file_path,step = 0.5)
+selected = tree_from_csv(file_path,loop = True)
+selected = tree_from_csv(file_path,step = 0.9)
 #sys.setrecursionlimit(1500) #increase maximum recursion depth
 df = selected[1].quadtree_to_df()
 df.columns = coln[0][1:len(coln[0])]
-df.to_csv("~/Documents/patro/quadtreedf_maxmean0.5.csv", index=False)
+#df.to_csv("~/Documents/patro/quadtreedf_maxmean0.5.csv", index=False)
 
 #with open("/Users/zhezhenwang/Documents/patro/qdtree_allg0.5.pkl","rb") as file:
 #  loaded_data = pickle.load(file)

@@ -132,23 +132,23 @@ class QuadTree:
         #mind = min([x.data[j] for x in cells])
       # divider = maxd-mind
       # if divider==0: divider = divider+0.0001
-        maxerror = np.mean([abs(x.data[j] - block_mean) for x in cells])/(maxd[j]-mind[j] + 0.01)
+        maxerror = np.max([abs(x.data[j] - block_mean) for x in cells])/(maxd[j]-mind[j] + 0.01)
         maxerrors.append(float(maxerror))
       #print(maxerrors)
       maxerror = np.max(maxerrors)
     else:
       maxerror = 0
-   # print("maxerror :" + str(maxerror))
+    #print("maxerror :" + str(maxerror))
     return maxerror
 
   def divide(self,thereshold,method,mind,maxd,maxerrors=[]):
       # maxerror = 0
       #print(len(self))
       #print(self.points)
-      if len(self)>0: 
-        maxerror = self.calculate_error(method,mind,maxd)
-      else:
-        maxerror = 0
+      #if len(self)>0: 
+      maxerror = self.calculate_error(method,mind,maxd)
+      #else:
+      #  maxerror = 0
       if maxerror > thereshold and len(self)>1:
    # There's room for our point without dividing the QuadTree.
    # """Divide (branch) this node by spawning four children nodes."""
@@ -189,12 +189,14 @@ class QuadTree:
         #print(thereshold)
         self.divided = False
         self.maxerror = maxerror
+        #print(maxerror)
         maxerrors.append(maxerror)
-        #print(maxerrors)
+        #print(np.max(maxerrors))
         #print(len(maxerrors))
         # if not isinstance(maxerror, int): 
         #   maxerror = maxerror.item()
-      return(np.mean(maxerrors))
+        # print(maxerrors)
+      return(np.max(maxerrors))
 # 
 #   def insert(self, point,thereshold,median = False):
 #     """Try to insert Point point into this QuadTree."""
