@@ -68,16 +68,16 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,thereshold = 1,
     if loop:
       sequence = np.arange(0, thereshold, step)
       for x in sequence:
-        maxerror = qtree.divide(x,method,mind,maxd,maxerrors=[])
+        maxerrorl = qtree.divide(x,method,mind,maxd,maxerrors=[])
         print(x)
-        print(maxerror)
+        print(np.max(maxerrorl))
         y = qtree.non0blocks()
         y_points.append(y)
-        maxerrorsl.append(maxerror)
+        maxerrorsl.append(maxerrorl)
       return(maxerrorsl,y_points)
     else:
-      maxerrors = qtree.divide(step,method,mind,maxd)
-      return(maxerrors,qtree)
+      maxerrorl = qtree.divide(step,method,mind,maxd,maxerrors=[])
+      return(maxerrorl,qtree)
       #print(y)
       #print(qtree.points)
     # qtree.aggregate(domain)
@@ -97,11 +97,36 @@ def tree_from_csv(file_path,idx_x = 1, idx_y = 2, idx_cell = 3,thereshold = 1,
 file_path = "/Users/zhezhenwang/Documents/patro/merfish6k.csv"
 #file_path = "/Users/zhezhenwang/Documents/patro/test2.csv"
 selected = tree_from_csv(file_path,loop = True)
-selected = tree_from_csv(file_path,step = 0.9)
+selected = tree_from_csv(file_path,step = 0.5)
 #sys.setrecursionlimit(1500) #increase maximum recursion depth
 df = selected[1].quadtree_to_df()
-df.columns = coln[0][1:len(coln[0])]
-#df.to_csv("~/Documents/patro/quadtreedf_maxmean0.5.csv", index=False)
+df.columns = coln[1:]
+df.to_csv("~/Documents/patro/quadtreedf_max0.5.csv", index=False)
+
+import json
+
+# Convert NumPy floats to Python native floats
+def convert_numpy_to_python(obj):
+    if isinstance(obj, list):
+        return [convert_numpy_to_python(el) for el in obj]
+    elif isinstance(obj, np.floating):  # np.float32, np.float64
+        return float(obj)  # Convert to standard Python float
+    return obj
+
+cleaned_list = convert_numpy_to_python(selected[0])
+
+# Save as JSON
+with open("errorlist.json", "w") as f:
+    json.dump(cleaned_list, f)
+
+
+with open("/Users/zhezhenwang/Documents/patro/errorlist.json", "r") as f:
+    try:
+        data = json.load(f)
+        #print("Valid JSON:", data)
+    except json.JSONDecodeError as e:
+        print("JSON Error:", e)
+
 
 #with open("/Users/zhezhenwang/Documents/patro/qdtree_allg0.5.pkl","rb") as file:
 #  loaded_data = pickle.load(file)
@@ -122,30 +147,30 @@ df.columns = coln[0][1:len(coln[0])]
 selected = tree_from_csv(file_path,loop=True)
 plt.figure(figsize=(6, 6))  # Optional: Set the figure size
 #step=0.1
-y_mean = selected
-plt.scatter(y_mean[0], y_mean[1], color="blue", marker="o", label="qdtree")
-plt.show()
+# y_mean = selected
+# plt.scatter(y_mean[0], y_mean[1], color="blue", marker="o", label="qdtree")
+# plt.show()
 #plt.scatter(y_med[0], y_med[1], color="blue", marker="o", label="median")
 #se_mean = [0.128,0.128,0.128, 0.129, 0.132,0.054,0.077,0.107,0.097,0.143]
 #se_median = [0.1278582,0.1278582,0.1278582,0.1291324,0.1317702,0.05409406,0.1142056,0.07731104,0.1030225,0.0639858]
 # based on the number of updated quadtree with all genes
-plt.scatter(selected[0], selected[1], color="blue", marker="o", label="quadtree")
-se_mean = [0.1278582,0.1278582,0.1278582,0.1278582,0.1278582, 0.007186814, 0.007186814, 0.1188337, 0.1503888,0.138239]
-plt.scatter(se_mean, selected[1], color="red", marker="o", label="seraster")
+# se_max = [0, 0.4996818,0.6113045, 0.6935697, 0.7524031, 0.8538634, 0.8636900, 0.8738089,0.9114140, 0.9410685]
+# plt.scatter(selected[0], selected[1], color="blue", marker="o", label="quadtree")
+# plt.scatter(se_max, selected[1], color="red", marker="o", label="seraster")
 
-# Add labels and title
-plt.xlabel("average error rate")
-plt.ylabel("quadtree # blocks")
-#plt.title("Scatter Plot of Points")
-plt.legend()  # Add legend
-plt.grid(True)  # Add grid for better visualization
-# Add numbers (data labels) to each point
-# for i in range(len(se_mean)):
-#     plt.annotate(f"{round(se_mean[i],3)}", (se_mean[i], selected[1][i]),
-#     textcoords="offset points", xytext=(0, 5), ha='center')
-
-# Display the plot
-plt.show()
+# # Add labels and title
+# plt.xlabel("average error rate")
+# plt.ylabel("quadtree # non0 blocks")
+# #plt.title("Scatter Plot of Points")
+# plt.legend()  # Add legend
+# plt.grid(True)  # Add grid for better visualization
+# # Add numbers (data labels) to each point
+# # for i in range(len(se_mean)):
+# #     plt.annotate(f"{round(se_mean[i],3)}", (se_mean[i], selected[1][i]),
+# #     textcoords="offset points", xytext=(0, 5), ha='center')
+# 
+# # Display the plot
+# plt.show()
 
 # plt.boxplot(y_points[0])
 # plt.show()
@@ -170,8 +195,12 @@ plt.show()
 #   pickle.dump(dfs,file)
   
   
-# with open("/Users/zhezhenwang/Documents/patro/data/df0.9.pkl","rb") as file:
-#   loaded_data = pickle.load(file)
+with open("/Users/zhezhenwang/Documents/patro/non0.pkl","rb") as file:
+  loaded_data = pickle.load(file)
+import rpy2.robjects as robjects
+my_list = [1, 2, 3, 4, 5]
+r_list = robjects.ListVector({f"item{i+1}": robjects.IntVector([val]) for i, val in enumerate(my_list)})
+robjects.r['saveRDS'](r_list, file="my_list.rds")
 #   
 # loaded_data.to_csv('/Users/zhezhenwang/Documents/patro/data/qdtree0.9.csv', index=False) 
 
