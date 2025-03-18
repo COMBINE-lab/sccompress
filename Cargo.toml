@@ -1,0 +1,13 @@
+[package]
+name = "quadtree-analysis"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+
+[dependencies]
+csv = "1.2"
+ndarray = "0.15"
+
+[[bin]]
+name = "quadt_reg4"
+path = "quadt_reg4.rs" 
