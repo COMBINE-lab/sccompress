@@ -1,11 +1,14 @@
 use csv::ReaderBuilder;
-use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, BufRead};
 use std::path::Path;
 use ndarray::{Array1, Array2};
+use serde::{Serialize, Deserialize};
+use bincode;
+use flate2::{Compression, write::GzEncoder};
+use serde_json;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Point {
     x: f64,
     y: f64,
@@ -18,7 +21,7 @@ impl Point {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Rect {
     cx: f64,
     cy: f64,
@@ -56,7 +59,7 @@ impl Rect {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct QuadTree {
     boundary: Rect,
     points: Vec<Point>,
@@ -267,9 +270,9 @@ fn tree_from_csv(
     idx_x: usize,
     idx_y: usize,
     idx_cell: usize,
-    threshold: f64,
+    //threshold: f64,
     step: f64,
-    loop_flag: bool,
+    //loop_flag: bool,
     method: &str,
     endpt: Option<usize>,
     allgenes: bool,
@@ -315,7 +318,7 @@ fn tree_from_csv(
 
     let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
     let mut qtree = QuadTree::new(domain, coords, 1);
-
+/* 
     if loop_flag {
         let sequence: Vec<f64> = (0..).map(|x| x as f64 * step).take_while(|&x| x < threshold).collect();
         let mut y_points = Vec::new();
@@ -328,16 +331,23 @@ fn tree_from_csv(
         
         (maxerrorsl, qtree)
     } else {
+     */
         let mut maxerrors = Vec::new();
         let maxerrorl = qtree.divide(step, method, &mind, &maxd, &mut maxerrors);
         (maxerrors, qtree)
-    }
+    //}
+
 }
 
 fn main() {
     let file_path = "/Users/zhezhenwang/Documents/patro/Moffitt_and_Bambah-Mukku_et_al_merfish_all_cells.csv";
-    let (maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 1.0, 0.5, false, "mean", None, true);
-
-    println!("Max Errors: {:?}", maxerrorl);
-    println!("QuadTree Blocks: {}", qtree.blocks());
+    let (maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 0.5, "mean", None, true);
+    
+    let file = File::create("output.bin.gz").unwrap();
+    let encoder = GzEncoder::new(file, Compression::default());
+    bincode::serialize_into(encoder, &qtree).unwrap();
+    
+    //println!("Max Errors: {:?}", maxerrorl);
+    //println!("QuadTree Blocks: {}", qtree.blocks());
 }
+
