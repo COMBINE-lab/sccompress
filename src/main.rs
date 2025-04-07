@@ -1,0 +1,431 @@
+use bincode::{config, BorrowDecode, Decode, Encode};
+use csv::ReaderBuilder;
+use flate2::{write::GzEncoder, Compression};
+use std::fs::File;
+use std::path::Path;
+use tracing::info;
+use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
+
+#[derive(Debug, Copy, Clone)]
+pub enum ErrorMetric {
+    Mean,
+    Median,
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+struct Point {
+    x: f64,
+    y: f64,
+    data: Vec<f64>,
+}
+
+impl Point {
+    #[inline(always)]
+    const fn new(x: f64, y: f64, data: Vec<f64>) -> Self {
+        Self { x, y, data }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Rect {
+    cx: f64,
+    cy: f64,
+    w: f64,
+    h: f64,
+    west_edge: f64,
+    east_edge: f64,
+    north_edge: f64,
+    south_edge: f64,
+}
+
+impl Rect {
+    #[inline(always)]
+    const fn new(cx: f64, cy: f64, w: f64, h: f64) -> Self {
+        Self {
+            cx,
+            cy,
+            w,
+            h,
+            west_edge: cx - w / 2.0,
+            east_edge: cx + w / 2.0,
+            north_edge: cy - h / 2.0,
+            south_edge: cy + h / 2.0,
+        }
+    }
+
+    #[inline(always)]
+    const fn contains(&self, point: &Point) -> bool {
+        point.x >= self.west_edge
+            && point.x < self.east_edge
+            && point.y >= self.north_edge
+            && point.y < self.south_edge
+    }
+
+    #[inline(always)]
+    const fn intersects(&self, other: &Self) -> bool {
+        !(other.west_edge > self.east_edge
+            || other.east_edge < self.west_edge
+            || other.north_edge > self.south_edge
+            || other.south_edge < self.north_edge)
+    }
+}
+
+// Manual implementation of de/serialization for `Rect`.
+// We don't need to store the edges since they can computed from the other fields.
+impl Encode for Rect {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        Encode::encode(&self.cx, encoder)?;
+        Encode::encode(&self.cy, encoder)?;
+        Encode::encode(&self.w, encoder)?;
+        Encode::encode(&self.h, encoder)?;
+        Ok(())
+    }
+}
+
+impl<Context> Decode<Context> for Rect {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
+        let cx = Decode::decode(decoder)?;
+        let cy = Decode::decode(decoder)?;
+        let w = Decode::decode(decoder)?;
+        let h = Decode::decode(decoder)?;
+        Ok(Self::new(cx, cy, w, h))
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for Rect {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
+        let cx = BorrowDecode::borrow_decode(decoder)?;
+        let cy = BorrowDecode::borrow_decode(decoder)?;
+        let w = BorrowDecode::borrow_decode(decoder)?;
+        let h = BorrowDecode::borrow_decode(decoder)?;
+        Ok(Self::new(cx, cy, w, h))
+    }
+}
+
+#[derive(Debug, Encode, Decode)]
+struct QuadTree {
+    boundary: Rect,
+    points: Vec<Point>,
+    depth: usize,
+    divided: bool,
+    maxerror: Option<f64>,
+    nw: Option<Box<Self>>,
+    ne: Option<Box<Self>>,
+    se: Option<Box<Self>>,
+    sw: Option<Box<Self>>,
+}
+
+impl QuadTree {
+    #[inline(always)]
+    const fn new(boundary: Rect, points: Vec<Point>, depth: usize) -> Self {
+        Self {
+            boundary,
+            points,
+            depth,
+            divided: false,
+            maxerror: None,
+            nw: None,
+            ne: None,
+            se: None,
+            sw: None,
+        }
+    }
+
+    fn query(&self, boundary: &Rect, found_points: &mut Vec<Point>) {
+        if !self.boundary.intersects(boundary) {
+            return;
+        }
+
+        for point in &self.points {
+            if boundary.contains(point) {
+                found_points.push(point.clone());
+            }
+        }
+
+        if self.divided {
+            if let Some(ref nw) = self.nw {
+                nw.query(boundary, found_points);
+            }
+            if let Some(ref ne) = self.ne {
+                ne.query(boundary, found_points);
+            }
+            if let Some(ref se) = self.se {
+                se.query(boundary, found_points);
+            }
+            if let Some(ref sw) = self.sw {
+                sw.query(boundary, found_points);
+            }
+        }
+    }
+
+    fn calculate_error(&self, method: ErrorMetric, mind: &[f64], maxd: &[f64], _prob: f64) -> f64 {
+        let mut found_points = Vec::new();
+        self.query(&self.boundary, &mut found_points);
+
+        if found_points.is_empty() {
+            return 0.0;
+        }
+
+        let mut maxerrors = Vec::new();
+        for j in 0..found_points[0].data.len() {
+            let block_mean = match method {
+                ErrorMetric::Median => {
+                    let mut values: Vec<f64> = found_points.iter().map(|p| p.data[j]).collect();
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                }
+                ErrorMetric::Mean => {
+                    found_points.iter().map(|p| p.data[j]).sum::<f64>() / found_points.len() as f64
+                }
+            };
+
+            let maxerror = found_points
+                .iter()
+                .map(|p| (p.data[j] - block_mean).abs())
+                .collect::<Vec<f64>>();
+
+            let maxerror =
+                maxerror.iter().fold(0.0, |a, &b| f64::max(a, b)) / (maxd[j] - mind[j] + 0.01);
+            maxerrors.push(maxerror);
+        }
+
+        maxerrors.iter().fold(0.0, |a, &b| f64::max(a, b))
+    }
+
+    fn divide(
+        &mut self,
+        threshold: f64,
+        method: ErrorMetric,
+        mind: &[f64],
+        maxd: &[f64],
+        maxerrors: &mut Vec<f64>,
+    ) -> f64 {
+        let maxerror = self.calculate_error(method, mind, maxd, 1.0);
+        maxerrors.push(maxerror);
+
+        if maxerror > threshold && self.points.len() > 1 {
+            let cx = self.boundary.cx;
+            let cy = self.boundary.cy;
+            let w = self.boundary.w / 2.0;
+            let h = self.boundary.h / 2.0;
+
+            let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
+            let mut nw_points = Vec::new();
+            self.query(&nw_boundary, &mut nw_points);
+            self.nw = Some(Box::new(Self::new(nw_boundary, nw_points, self.depth + 1)));
+
+            let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
+            let mut ne_points = Vec::new();
+            self.query(&ne_boundary, &mut ne_points);
+            self.ne = Some(Box::new(Self::new(ne_boundary, ne_points, self.depth + 1)));
+
+            let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
+            let mut se_points = Vec::new();
+            self.query(&se_boundary, &mut se_points);
+            self.se = Some(Box::new(Self::new(se_boundary, se_points, self.depth + 1)));
+
+            let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
+            let mut sw_points = Vec::new();
+            self.query(&sw_boundary, &mut sw_points);
+            self.sw = Some(Box::new(Self::new(sw_boundary, sw_points, self.depth + 1)));
+
+            self.divided = true;
+            // At this stage, every point has been inserted in one of the subtrees, so we can drop the vector to avoid duplicating data.
+            self.points = Vec::new();
+
+            if let Some(ref mut nw) = self.nw {
+                nw.divide(threshold, method, mind, maxd, maxerrors);
+            }
+            if let Some(ref mut ne) = self.ne {
+                ne.divide(threshold, method, mind, maxd, maxerrors);
+            }
+            if let Some(ref mut se) = self.se {
+                se.divide(threshold, method, mind, maxd, maxerrors);
+            }
+            if let Some(ref mut sw) = self.sw {
+                sw.divide(threshold, method, mind, maxd, maxerrors);
+            }
+        } else {
+            self.divided = false;
+            self.maxerror = Some(maxerror);
+        }
+        maxerror
+    }
+
+    fn len(&self) -> usize {
+        let mut npoints = self.points.len();
+        if self.divided {
+            if let Some(ref nw) = self.nw {
+                npoints += nw.len();
+            }
+            if let Some(ref ne) = self.ne {
+                npoints += ne.len();
+            }
+            if let Some(ref se) = self.se {
+                npoints += se.len();
+            }
+            if let Some(ref sw) = self.sw {
+                npoints += sw.len();
+            }
+        }
+        npoints
+    }
+
+    fn blocks(&self) -> usize {
+        if !self.divided {
+            1
+        } else {
+            let mut npoints = 0;
+            if let Some(ref nw) = self.nw {
+                npoints += nw.blocks();
+            }
+            if let Some(ref ne) = self.ne {
+                npoints += ne.blocks();
+            }
+            if let Some(ref se) = self.se {
+                npoints += se.blocks();
+            }
+            if let Some(ref sw) = self.sw {
+                npoints += sw.blocks();
+            }
+            npoints
+        }
+    }
+
+    fn non_zero_blocks(&self) -> usize {
+        let mut npoints = 0;
+        if !self.divided {
+            if !self.points.is_empty() {
+                npoints = 1;
+            }
+        } else {
+            if let Some(ref nw) = self.nw {
+                npoints += nw.non_zero_blocks();
+            }
+            if let Some(ref ne) = self.ne {
+                npoints += ne.non_zero_blocks();
+            }
+            if let Some(ref se) = self.se {
+                npoints += se.non_zero_blocks();
+            }
+            if let Some(ref sw) = self.sw {
+                npoints += sw.non_zero_blocks();
+            }
+        }
+        npoints
+    }
+}
+
+fn tree_from_csv<T: AsRef<Path>>(
+    file_path: T,
+    idx_x: usize,
+    idx_y: usize,
+    idx_cell: usize,
+    //threshold: f64,
+    step: f64,
+    //loop_flag: bool,
+    method: ErrorMetric,
+    endpt: Option<usize>,
+    allgenes: bool,
+) -> (Vec<f64>, QuadTree) {
+    let mut coords = Vec::new();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    let mut mind = Vec::new();
+    let mut maxd = Vec::new();
+
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(file_path)
+        .expect("Failed to open file");
+
+    for result in rdr.records() {
+        let record = result.expect("Failed to read record");
+        let x: f64 = record[idx_x].parse().unwrap();
+        let y: f64 = record[idx_y].parse().unwrap();
+        xs.push(x);
+        ys.push(y);
+
+        let mut cells = Vec::new();
+        let end = endpt.unwrap_or(if allgenes { record.len() } else { idx_cell + 1 });
+        for i in idx_cell..end {
+            let value: f64 = record[i].parse().unwrap();
+            cells.push(value);
+            if mind.len() <= i - idx_cell {
+                mind.push(value);
+                maxd.push(value);
+            } else {
+                mind[i - idx_cell] = mind[i - idx_cell].min(value);
+                maxd[i - idx_cell] = maxd[i - idx_cell].max(value);
+            }
+        }
+        coords.push(Point::new(x, y, cells));
+    }
+
+    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let w = maxx - minx;
+    let h = maxy - miny;
+
+    let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
+    let mut qtree = QuadTree::new(domain, coords, 1);
+    /*
+    if loop_flag {
+        let sequence: Vec<f64> = (0..).map(|x| x as f64 * step).take_while(|&x| x < threshold).collect();
+        let mut y_points = Vec::new();
+        let mut maxerrorsl = Vec::new();
+
+        for x in sequence {
+            let maxerrorl = qtree.divide(x, method, &mind, &maxd, &mut maxerrorsl);
+            y_points.push(qtree.non0blocks());
+        }
+
+        (maxerrorsl, qtree)
+    } else {
+     */
+    let mut maxerrors = Vec::new();
+    let _maxerrorl = qtree.divide(step, method, &mind, &maxd, &mut maxerrors);
+    (maxerrors, qtree)
+    //}
+}
+
+fn main() -> anyhow::Result<()> {
+    // Check the `RUST_LOG` variable for the logger level and
+    // respect the value found there. If this environment
+    // variable is not set then set the logging level to
+    // INFO.
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy()
+                // we don't want to hear anything below a warning from ureq
+                .add_directive("ureq=warn".parse()?),
+        )
+        .init();
+
+    use std::env;
+    let args: Vec<String> = env::args().collect();
+    let file_path = Path::new(&args[1]);
+    let (_maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 0.5, ErrorMetric::Mean, None, true);
+
+    let config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+    let file = File::create("output.bin.gz").unwrap();
+    let mut encoder = GzEncoder::new(file, Compression::default());
+    bincode::encode_into_std_write(&qtree, &mut encoder, config).unwrap();
+    //info!("Max Errors: {:?}", maxerrorl);
+    info!("QuadTree Blocks: {}", qtree.blocks());
+    Ok(())
+}
