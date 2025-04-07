@@ -1,4 +1,4 @@
-use bincode::{BorrowDecode, Decode, Encode, config};
+use bincode::{BorrowDecode, Decode, Encode};
 use clap::Parser;
 use csv::ReaderBuilder;
 use flate2::{Compression, write::GzEncoder};
@@ -260,6 +260,7 @@ impl QuadTree {
         maxerror
     }
 
+    #[allow(dead_code)]
     fn len(&self) -> usize {
         let mut npoints = self.points.len();
         if self.divided {
@@ -405,6 +406,8 @@ fn tree_from_csv<T: AsRef<Path>>(
 struct CmdArgs {
     /// Input csv
     input: PathBuf,
+    /// Output file (default "output.bin.gz")
+    output: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -430,10 +433,15 @@ fn main() -> anyhow::Result<()> {
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
-    let file = File::create("output.bin.gz").unwrap();
+    let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
+    let file = File::create(ofname).unwrap();
     let mut encoder = GzEncoder::new(file, Compression::default());
     bincode::encode_into_std_write(&qtree, &mut encoder, config).unwrap();
     //info!("Max Errors: {:?}", maxerrorl);
-    info!("QuadTree Blocks: {}", qtree.blocks());
+    info!(
+        "QuadTree Blocks: {} (non-zero blocks: {})",
+        qtree.blocks(),
+        qtree.non_zero_blocks()
+    );
     Ok(())
 }
