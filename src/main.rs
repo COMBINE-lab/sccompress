@@ -13,6 +13,11 @@ pub enum ErrorMetric {
     Median,
 }
 
+pub trait PointLike {
+    fn xpos(&self) -> f64;
+    fn ypos(&self) -> f64;
+}
+
 #[derive(Debug, Clone, Encode, Decode)]
 struct Point {
     x: f64,
@@ -24,6 +29,48 @@ impl Point {
     #[inline(always)]
     const fn new(x: f64, y: f64, data: Vec<f64>) -> Self {
         Self { x, y, data }
+    }
+}
+
+impl PointLike for Point {
+    #[inline(always)]
+    fn xpos(&self) -> f64 {
+        self.x
+    }
+    #[inline(always)]
+    fn ypos(&self) -> f64 {
+        self.y
+    }
+}
+
+#[derive(Debug, Clone, Encode, Decode)]
+struct DatalessPoint {
+    x: f64,
+    y: f64,
+}
+
+impl DatalessPoint {
+    #[inline(always)]
+    const fn new(x: f64, y: f64) -> Self {
+        Self { x, y }
+    }
+    #[inline(always)]
+    fn from_point(o: &Point) -> Self {
+        Self {
+            x: o.xpos(),
+            y: o.ypos(),
+        }
+    }
+}
+
+impl PointLike for DatalessPoint {
+    #[inline(always)]
+    fn xpos(&self) -> f64 {
+        self.x
+    }
+    #[inline(always)]
+    fn ypos(&self) -> f64 {
+        self.y
     }
 }
 
@@ -121,6 +168,8 @@ struct QuadTree {
     ne: Option<Box<Self>>,
     se: Option<Box<Self>>,
     sw: Option<Box<Self>>,
+    data: Vec<f64>,
+    positions: Vec<DatalessPoint>,
 }
 
 impl QuadTree {
@@ -136,6 +185,8 @@ impl QuadTree {
             ne: None,
             se: None,
             sw: None,
+            data: Vec::new(),
+            positions: Vec::new(),
         }
     }
 
@@ -164,6 +215,24 @@ impl QuadTree {
                 sw.query(boundary, found_points);
             }
         }
+    }
+
+    fn block_data_repr(&self, method: ErrorMetric) -> Vec<f64> {
+        let mut block_mean = Vec::<f64>::with_capacity(self.points[0].data.len());
+        for j in 0..self.points[0].data.len() {
+            let block_mean_j = match method {
+                ErrorMetric::Median => {
+                    let mut values: Vec<f64> = self.points.iter().map(|p| p.data[j]).collect();
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                }
+                ErrorMetric::Mean => {
+                    self.points.iter().map(|p| p.data[j]).sum::<f64>() / self.points.len() as f64
+                }
+            };
+            block_mean.push(block_mean_j);
+        }
+        block_mean
     }
 
     fn calculate_error(&self, method: ErrorMetric, mind: &[f64], maxd: &[f64], _prob: f64) -> f64 {
@@ -256,6 +325,11 @@ impl QuadTree {
         } else {
             self.divided = false;
             self.maxerror = Some(maxerror);
+            if !self.data.is_empty() {
+                self.positions = self.points.iter().map(DatalessPoint::from_point).collect();
+                self.data = self.block_data_repr(method);
+                self.points.clear();
+            }
         }
         maxerror
     }
