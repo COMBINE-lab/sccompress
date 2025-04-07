@@ -1,10 +1,11 @@
-use bincode::{config, BorrowDecode, Decode, Encode};
+use bincode::{BorrowDecode, Decode, Encode, config};
+use clap::Parser;
 use csv::ReaderBuilder;
-use flate2::{write::GzEncoder, Compression};
+use flate2::{Compression, write::GzEncoder};
 use std::fs::File;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::info;
-use tracing_subscriber::{filter::LevelFilter, fmt, prelude::*, EnvFilter};
+use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, prelude::*};
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -398,6 +399,14 @@ fn tree_from_csv<T: AsRef<Path>>(
     //}
 }
 
+/// Build a quadtree representation of spatial transcriptomics data
+#[derive(Debug, Parser)]
+#[command(version, about, long_about = None)]
+struct CmdArgs {
+    /// Input csv
+    input: PathBuf,
+}
+
 fn main() -> anyhow::Result<()> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -414,9 +423,8 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    use std::env;
-    let args: Vec<String> = env::args().collect();
-    let file_path = Path::new(&args[1]);
+    let args = CmdArgs::parse();
+    let file_path = args.input;
     let (_maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 0.5, ErrorMetric::Mean, None, true);
 
     let config = bincode::config::standard()

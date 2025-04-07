@@ -1,12 +1,13 @@
 [package]
 name = "quadt_reg4"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 authors = ["Your Name <your.email@example.com>"]
 
 [dependencies]
 anyhow = "1.0.97"
 bincode = { version = "2.0.1", features = ["serde"] }
+clap = { version = "4.5.35", features = ["derive"] }
 csv = "1.2"
 flate2 = { version = "1.1.1", features = ["zlib-ng"] }
 ndarray = "0.15"
