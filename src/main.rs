@@ -1,11 +1,13 @@
 use bincode::{BorrowDecode, Decode, Encode};
 use clap::Parser;
 use csv::ReaderBuilder;
-use flate2::{Compression, write::GzEncoder};
+//use flate2::{Compression, write::GzEncoder};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, prelude::*};
+use bvrs::SparseArray;
+use sux::prelude::BitFieldVec;
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -14,44 +16,44 @@ pub enum ErrorMetric {
 }
 
 pub trait PointLike {
-    fn xpos(&self) -> f64;
-    fn ypos(&self) -> f64;
+    fn xpos(&self) -> f32;
+    fn ypos(&self) -> f32;
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 struct Point {
-    x: f64,
-    y: f64,
-    data: Vec<f64>,
+    x: f32,
+    y: f32,
+    data: Vec<f32>,
 }
 
 impl Point {
     #[inline(always)]
-    const fn new(x: f64, y: f64, data: Vec<f64>) -> Self {
+    const fn new(x: f32, y: f32, data: Vec<f32>) -> Self {
         Self { x, y, data }
     }
 }
 
 impl PointLike for Point {
     #[inline(always)]
-    fn xpos(&self) -> f64 {
+    fn xpos(&self) -> f32 {
         self.x
     }
     #[inline(always)]
-    fn ypos(&self) -> f64 {
+    fn ypos(&self) -> f32 {
         self.y
     }
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 struct DatalessPoint {
-    x: f64,
-    y: f64,
+    x: f32,
+    y: f32,
 }
 
 impl DatalessPoint {
     #[inline(always)]
-    const fn new(x: f64, y: f64) -> Self {
+    const fn new(x: f32, y: f32) -> Self {
         Self { x, y }
     }
     #[inline(always)]
@@ -65,30 +67,30 @@ impl DatalessPoint {
 
 impl PointLike for DatalessPoint {
     #[inline(always)]
-    fn xpos(&self) -> f64 {
+    fn xpos(&self) -> f32 {
         self.x
     }
     #[inline(always)]
-    fn ypos(&self) -> f64 {
+    fn ypos(&self) -> f32 {
         self.y
     }
 }
 
 #[derive(Debug, Clone)]
 struct Rect {
-    cx: f64,
-    cy: f64,
-    w: f64,
-    h: f64,
-    west_edge: f64,
-    east_edge: f64,
-    north_edge: f64,
-    south_edge: f64,
+    cx: f32,
+    cy: f32,
+    w: f32,
+    h: f32,
+    west_edge: f32,
+    east_edge: f32,
+    north_edge: f32,
+    south_edge: f32,
 }
 
 impl Rect {
     #[inline(always)]
-    const fn new(cx: f64, cy: f64, w: f64, h: f64) -> Self {
+    const fn new(cx: f32, cy: f32, w: f32, h: f32) -> Self {
         Self {
             cx,
             cy,
@@ -158,17 +160,34 @@ impl<'de, Context> BorrowDecode<'de, Context> for Rect {
 }
 
 #[derive(Debug, Encode, Decode)]
+struct BitFieldQuadTree {
+    boundary: Rect,
+    sarray: SparseArray,
+    bit_field: BitFieldVec,
+    divided: bool,
+    nw: Option<Box<BitFieldQuadTree>>,
+    ne: Option<Box<BitFieldQuadTree>>,
+    se: Option<Box<BitFieldQuadTree>>,
+    sw: Option<Box<BitFieldQuadTree>>,
+    positions: Vec<DatalessPoint>,
+}
+
+impl BitFieldQuadTree {
+    // Implementation methods here
+}
+
+#[derive(Debug, Encode, Decode)]
 struct QuadTree {
     boundary: Rect,
     points: Vec<Point>,
     depth: usize,
     divided: bool,
-    maxerror: Option<f64>,
+    maxerror: Option<f32>,
     nw: Option<Box<Self>>,
     ne: Option<Box<Self>>,
     se: Option<Box<Self>>,
     sw: Option<Box<Self>>,
-    data: Vec<f64>,
+    data: Vec<f32>,
     positions: Vec<DatalessPoint>,
 }
 
@@ -216,26 +235,27 @@ impl QuadTree {
             }
         }
     }
-
-    fn block_data_repr(&self, method: ErrorMetric) -> Vec<f64> {
-        let mut block_mean = Vec::<f64>::with_capacity(self.points[0].data.len());
+/*
+    fn block_data_repr(&self, method: ErrorMetric) -> Vec<f32> {
+        let mut block_mean = Vec::<f32>::with_capacity(self.points[0].data.len());
         for j in 0..self.points[0].data.len() {
             let block_mean_j = match method {
                 ErrorMetric::Median => {
-                    let mut values: Vec<f64> = self.points.iter().map(|p| p.data[j]).collect();
+                    let mut values: Vec<f32> = self.points.iter().map(|p| p.data[j]).collect();
                     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     values[values.len() / 2]
                 }
                 ErrorMetric::Mean => {
-                    self.points.iter().map(|p| p.data[j]).sum::<f64>() / self.points.len() as f64
+                    self.points.iter().map(|p| p.data[j]).sum::<f32>() / self.points.len() as f32
                 }
             };
             block_mean.push(block_mean_j);
         }
         block_mean
     }
+*/
 
-    fn calculate_error(&self, method: ErrorMetric, mind: &[f64], maxd: &[f64], _prob: f64) -> f64 {
+    fn calculate_error(&self, method: ErrorMetric, mind: &[f32], maxd: &[f32], _prob: f32) -> f32 {
         let mut found_points = Vec::new();
         self.query(&self.boundary, &mut found_points);
 
@@ -247,36 +267,36 @@ impl QuadTree {
         for j in 0..found_points[0].data.len() {
             let block_mean = match method {
                 ErrorMetric::Median => {
-                    let mut values: Vec<f64> = found_points.iter().map(|p| p.data[j]).collect();
+                    let mut values: Vec<f32> = found_points.iter().map(|p| p.data[j]).collect();
                     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     values[values.len() / 2]
                 }
                 ErrorMetric::Mean => {
-                    found_points.iter().map(|p| p.data[j]).sum::<f64>() / found_points.len() as f64
+                    found_points.iter().map(|p| p.data[j]).sum::<f32>() / found_points.len() as f32
                 }
             };
 
             let maxerror = found_points
                 .iter()
                 .map(|p| (p.data[j] - block_mean).abs())
-                .collect::<Vec<f64>>();
+                .collect::<Vec<f32>>();
 
             let maxerror =
-                maxerror.iter().fold(0.0, |a, &b| f64::max(a, b)) / (maxd[j] - mind[j] + 0.01);
+                maxerror.iter().fold(0.0, |a, &b| f32::max(a, b)) / (maxd[j] - mind[j] + 0.01);
             maxerrors.push(maxerror);
         }
 
-        maxerrors.iter().fold(0.0, |a, &b| f64::max(a, b))
+        maxerrors.iter().fold(0.0, |a, &b| f32::max(a, b))
     }
 
     fn divide(
         &mut self,
-        threshold: f64,
+        threshold: f32,
         method: ErrorMetric,
-        mind: &[f64],
-        maxd: &[f64],
-        maxerrors: &mut Vec<f64>,
-    ) -> f64 {
+        mind: &[f32],
+        maxd: &[f32],
+        maxerrors: &mut Vec<f32>,
+    ) -> f32 {
         let maxerror = self.calculate_error(method, mind, maxd, 1.0);
         maxerrors.push(maxerror);
 
@@ -397,6 +417,101 @@ impl QuadTree {
         }
         npoints
     }
+
+    fn block_data_to_sarray(&self, sparse: bool) -> (SparseArray, BitFieldVec) {
+        let block_mean_j = match sparse {
+            true => {
+                let mut sarray = SparseArray::new(self.points[0].data.len());
+                for j in 0..self.points[0].data.len() {
+                    let mut values: Vec<f32> = self.points.iter().map(|p| p.data[j]).collect();
+                    // Collect non-zero values for this column
+                    let mut column_values = Vec::new();
+                    for v in values {
+                        if v != 0.0 {
+                            column_values.push(v as u16);
+                        }
+                    }
+                    //values.sort_by(|a, b| a.partial_cmp(b).unwrap()); //for float type
+                    column_values.sort_unstable();
+                    // Find median with no ties (using lower middle value if even)
+                    let median = if column_values.len() % 2 == 1 {
+                        column_values[column_values.len() / 2]
+                    } else {
+                        column_values[column_values.len() / 2 - 1]
+                    };
+                    if median != 0 {
+                        sarray.append(median, j as u16);
+                    // Calculate differences from median for each value
+                        let mut differences = Vec::new();
+                        for &value in &column_values {
+                            let diff = value - median;
+                            differences.push(diff);
+                        }
+                        // Find the minimum value to determine shift needed to make all values non-negative
+                        let min_value = differences.iter().min().unwrap_or(&0);
+                        
+                        // Calculate shift - if min value is negative, we'll add its absolute value to all values
+                        let shift_value = if min_value < &0 { min_value.unsigned_abs() } else { 0 };
+        
+                        // Apply the shift and find the maximum value to determine bit width
+                        let shifted_values: Vec<u16> = differences.iter()
+                            .map(|&x| (x + shift_value) as u16)
+                            .collect();
+
+                    // Find max difference to determine bit width needed
+                        let max_diff = shifted_values.iter().max().copied().unwrap_or(0);
+                        let bit_width = if max_diff == 0 { 1 } else { (max_diff as u32).ilog2() as usize + 1 };
+
+                    // Create bit field vector
+                        let mut bit_field = BitFieldVec::new(bit_width, differences.len());
+                        for (i, &diff) in shifted_values.iter().enumerate() {
+                            bit_field.set(i, diff as u16);
+                        }
+                    }
+                }
+            }
+            false => {
+                eprintln!("Dense case not implemented yet");
+            }
+        };
+        (sarray, bit_field)
+    }
+
+    /// Traverses the quadtree and computes median bit representations at each leaf node
+    /// Returns a tree structure of bit fields
+    pub fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
+        let (sarray, bit_field) = self.block_data_to_sarray(true);///!!!! CHANGE to sparse
+        // Create node data
+        let mut node = BitFieldQuadTree {
+            boundary: self.boundary,
+            sarray,
+            bit_field,
+            divided: self.divided,
+            nw: None,
+            ne: None,
+            se: None,
+            sw: None,
+            positions: Vec::new(),
+        };
+        
+        // If the node is divided, recursively process children
+        if self.divided {
+            // Process children (if they exist)
+            if let Some(ref ne) = self.ne {
+                node.ne = Some(Box::new(ne.compute_quadtree_bit_fields()));
+            }
+            if let Some(ref nw) = self.nw {
+                node.nw = Some(Box::new(nw.compute_quadtree_bit_fields()));
+            }
+            if let Some(ref se) = self.se {
+                node.se = Some(Box::new(se.compute_quadtree_bit_fields()));
+            }
+            if let Some(ref sw) = self.sw {
+                node.sw = Some(Box::new(sw.compute_quadtree_bit_fields()));
+            }
+        }
+        node
+    }
 }
 
 fn tree_from_csv<T: AsRef<Path>>(
@@ -404,13 +519,13 @@ fn tree_from_csv<T: AsRef<Path>>(
     idx_x: usize,
     idx_y: usize,
     idx_cell: usize,
-    //threshold: f64,
-    step: f64,
+    //threshold: f32,
+    step: f32,
     //loop_flag: bool,
     method: ErrorMetric,
     endpt: Option<usize>,
     allgenes: bool,
-) -> (Vec<f64>, QuadTree) {
+) -> (Vec<f32>, QuadTree) {
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -424,16 +539,16 @@ fn tree_from_csv<T: AsRef<Path>>(
 
     for result in rdr.records() {
         let record = result.expect("Failed to read record");
-        let x: f64 = record[idx_x].parse().unwrap();
-        let y: f64 = record[idx_y].parse().unwrap();
+        let x: f32 = record[idx_x].parse().unwrap();
+        let y: f32 = record[idx_y].parse().unwrap();
         xs.push(x);
         ys.push(y);
 
         let mut cells = Vec::new();
         let end = endpt.unwrap_or(if allgenes { record.len() } else { idx_cell + 1 });
         for i in idx_cell..end {
-            let value: f64 = record[i].parse().unwrap();
-            cells.push(value);
+            let value: u16 = record[i].parse().unwrap();
+            cells.push(value as f32);
             if mind.len() <= i - idx_cell {
                 mind.push(value);
                 maxd.push(value);
@@ -445,10 +560,10 @@ fn tree_from_csv<T: AsRef<Path>>(
         coords.push(Point::new(x, y, cells));
     }
 
-    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
-    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let minx = xs.iter().cloned().fold(f32::INFINITY, f32::min) - 1.0;
+    let miny = ys.iter().cloned().fold(f32::INFINITY, f32::min) - 1.0;
+    let maxx = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max) + 1.0;
+    let maxy = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max) + 1.0;
     let w = maxx - minx;
     let h = maxy - miny;
 
@@ -456,7 +571,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut qtree = QuadTree::new(domain, coords, 1);
     /*
     if loop_flag {
-        let sequence: Vec<f64> = (0..).map(|x| x as f64 * step).take_while(|&x| x < threshold).collect();
+        let sequence: Vec<f32> = (0..).map(|x| x as f32 * step).take_while(|&x| x < threshold).collect();
         let mut y_points = Vec::new();
         let mut maxerrorsl = Vec::new();
 
@@ -470,6 +585,7 @@ fn tree_from_csv<T: AsRef<Path>>(
      */
     let mut maxerrors = Vec::new();
     let _maxerrorl = qtree.divide(step, method, &mind, &maxd, &mut maxerrors);
+    let bit_field_tree = qtree.compute_quadtree_bit_fields();
     (maxerrors, qtree)
     //}
 }
@@ -503,14 +619,15 @@ fn main() -> anyhow::Result<()> {
     let args = CmdArgs::parse();
     let file_path = args.input;
     let (_maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 0.5, ErrorMetric::Mean, None, true);
-
+    
+    // You can decide whether to serialize the original tree or the bit fields or both
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
     let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
     let file = File::create(ofname).unwrap();
-    let mut encoder = GzEncoder::new(file, Compression::default());
-    bincode::encode_into_std_write(&qtree, &mut encoder, config).unwrap();
+    //let mut encoder = GzEncoder::new(file, Compression::default());
+    bincode::encode_into_std_write(&qtree, &mut file, config).unwrap();
     //info!("Max Errors: {:?}", maxerrorl);
     info!(
         "QuadTree Blocks: {} (non-zero blocks: {})",
