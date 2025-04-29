@@ -281,9 +281,12 @@ impl QuadTree {
                 maxerror.iter().fold(0.0, |a, &b| f32::max(a, b)) / ((maxd[j] as f32) - (mind[j] as f32) + 0.01);
             maxerrors.push(maxerror);
         }
-
         maxerrors.iter().fold(0.0, |a, &b| f32::max(a, b))
     }
+
+//    fn calculate_expense(&self) -> bool {
+//        let mut expense_divde = sum(self.());
+//    }   
 
     fn divide(
         &mut self,
@@ -482,53 +485,45 @@ impl QuadTree {
     }
 }
 
-/*
-// First, create a serializable version of your quadtree that doesn't use references
-#[derive(Debug, Encode, Decode)]
-struct SerializableQuadTree {
-    boundary: Rect,
-    // Store the raw components of SparseArray
-    sarray_data: Vec<u16>,
-    sarray_positions: Vec<usize>,
-    // Store the raw components of BitFieldVec
-    bit_field_data: Vec<u64>,
-    bit_field_width: usize,
-    bit_field_len: usize,
-    divided: bool,
-    // Recursive children
-    nw: Option<Box<SerializableQuadTree>>,
-    ne: Option<Box<SerializableQuadTree>>,
-    se: Option<Box<SerializableQuadTree>>,
-    sw: Option<Box<SerializableQuadTree>>,
-    positions: Vec<DatalessPoint>,
+struct BitField {
+    data: Vec<u16>,
+    width: u16,
+    len: u16,
 }
 
-// Implement conversion from your original QuadTree to the serializable version
-impl<'a> From<BitFieldQuadTree<'a>> for SerializableQuadTree {
-    fn from(qt: BitFieldQuadTree<'a>) -> Self {
-        // Extract data from SparseArray
-        let (sarray_data, sarray_positions) = qt.sarray;
-        
-        // Extract data from BitFieldVec
-        let (bit_field_data, bit_field_width, bit_field_len) = qt.bit_field.into_raw_parts();
-
-        SerializableQuadTree {
-            boundary: qt.boundary,
-            sarray_data,
-            sarray_positions,
-            bit_field_data,
-            bit_field_width,
-            bit_field_len,
-            divided: qt.divided,
-            nw: qt.nw.map(|node| Box::new(SerializableQuadTree::from(*node))),
-            ne: qt.ne.map(|node| Box::new(SerializableQuadTree::from(*node))),
-            se: qt.se.map(|node| Box::new(SerializableQuadTree::from(*node))),
-            sw: qt.sw.map(|node| Box::new(SerializableQuadTree::from(*node))),
-            positions: qt.positions,
-        }
+impl BitField {
+    fn new(bit_field: BitFieldVec) -> Self {
+        let (bit_field_data, bit_field_width, bit_field_len) = bit_field.into_raw_parts();
+        Self { data: bit_field_data, width: bit_field_width, len: bit_field_len }
     }
 }
-*/
+
+impl Encode for BitField {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        Encode::encode(&self.data, encoder)?;
+        Encode::encode(&self.width, encoder)?;
+        Encode::encode(&self.len, encoder)?;
+        Ok(())
+    }
+}
+
+impl Decode for BitField {
+    fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<BitFieldVec, bincode::error::DecodeError> {
+        let data = Decode::decode(decoder)?;
+        let width = Decode::decode(decoder)?;
+        let len = Decode::decode(decoder)?;
+        Ok(BitField::new(BitFieldVec::new(width, len, data)))
+    }
+}
+
+impl<'de> BorrowDecode<'de> for BitField {  
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
+        let data = BorrowDecode::borrow_decode(decoder)?;
+        let width = BorrowDecode::borrow_decode(decoder)?;
+        let len = BorrowDecode::borrow_decode(decoder)?;
+        Ok(Self { data, width, len })
+    }
+}
 
 fn tree_from_csv<T: AsRef<Path>>(
     file_path: T,
