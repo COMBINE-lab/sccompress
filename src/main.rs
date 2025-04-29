@@ -278,7 +278,7 @@ impl QuadTree {
                 .collect::<Vec<f32>>();
 
             let maxerror =
-                maxerror.iter().fold(0.0, |a, &b| f32::max(a, b)) / (maxd[j] - mind[j] + 0.01);
+                maxerror.iter().fold(0.0, |a, &b| f32::max(a, b)) / ((maxd[j] as f32) - (mind[j] as f32) + 0.01);
             maxerrors.push(maxerror);
         }
 
@@ -289,8 +289,8 @@ impl QuadTree {
         &mut self,
         threshold: f32,
         method: ErrorMetric,
-        mind: &[f32],
-        maxd: &[f32],
+        mind: &[u16],
+        maxd: &[u16],
         maxerrors: &mut Vec<f32>,
     ) -> f32 {
         let maxerror = self.calculate_error(method, mind, maxd, 1.0);
@@ -436,7 +436,7 @@ impl QuadTree {
                         // Calculate and store differences
                         for (i, &value) in values.iter().enumerate() {
                             let diff = value.wrapping_sub(median);
-                            bit_field.set(i, diff);
+                            bit_field.set(i, diff as usize);
                         }
                     }
                 }
@@ -482,6 +482,7 @@ impl QuadTree {
     }
 }
 
+/*
 // First, create a serializable version of your quadtree that doesn't use references
 #[derive(Debug, Encode, Decode)]
 struct SerializableQuadTree {
@@ -527,6 +528,7 @@ impl<'a> From<BitFieldQuadTree<'a>> for SerializableQuadTree {
         }
     }
 }
+*/
 
 fn tree_from_csv<T: AsRef<Path>>(
     file_path: T,
@@ -600,8 +602,8 @@ fn tree_from_csv<T: AsRef<Path>>(
      */
     let mut maxerrors = Vec::new();
     let mind: Vec<u16> = mind.iter().map(|&x| x as u16).collect();
-    let maxd_f32: Vec<f32> = maxd.iter().map(|&x| x as f32).collect();
-    let _maxerrorl = qtree.divide(step, method, &mind_f32, &maxd_f32, &mut maxerrors);
+    let maxd: Vec<u16> = maxd.iter().map(|&x| x as u16).collect();
+    let _maxerrorl = qtree.divide(step, method, &mind, &maxd, &mut maxerrors);
     let bit_field_tree = qtree.compute_quadtree_bit_fields();
     (maxerrors, bit_field_tree)
     //}
