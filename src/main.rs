@@ -1,13 +1,14 @@
 use bincode::{BorrowDecode, Decode, Encode};
 use clap::Parser;
 use csv::ReaderBuilder;
-//use flate2::{Compression, write::GzEncoder};
+use flate2::{Compression, write::GzEncoder};
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, prelude::*};
 use bvrs::SparseArray;
 use sux::prelude::BitFieldVec;
+use sux::traits::BitFieldSliceMut;
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -160,20 +161,16 @@ impl<'de, Context> BorrowDecode<'de, Context> for Rect {
 }
 
 #[derive(Debug, Encode, Decode)]
-struct BitFieldQuadTree {
+struct BitFieldQuadTree<'a> {
     boundary: Rect,
-    sarray: SparseArray,
+    sarray: SparseArray<'a, u16>,
     bit_field: BitFieldVec,
     divided: bool,
-    nw: Option<Box<BitFieldQuadTree>>,
-    ne: Option<Box<BitFieldQuadTree>>,
-    se: Option<Box<BitFieldQuadTree>>,
-    sw: Option<Box<BitFieldQuadTree>>,
+    nw: Option<Box<BitFieldQuadTree<'a>>>,
+    ne: Option<Box<BitFieldQuadTree<'a>>>,
+    se: Option<Box<BitFieldQuadTree<'a>>>,
+    sw: Option<Box<BitFieldQuadTree<'a>>>,
     positions: Vec<DatalessPoint>,
-}
-
-impl BitFieldQuadTree {
-    // Implementation methods here
 }
 
 #[derive(Debug, Encode, Decode)]
@@ -235,7 +232,7 @@ impl QuadTree {
             }
         }
     }
-/*
+
     fn block_data_repr(&self, method: ErrorMetric) -> Vec<f32> {
         let mut block_mean = Vec::<f32>::with_capacity(self.points[0].data.len());
         for j in 0..self.points[0].data.len() {
@@ -253,9 +250,8 @@ impl QuadTree {
         }
         block_mean
     }
-*/
 
-    fn calculate_error(&self, method: ErrorMetric, mind: &[f32], maxd: &[f32], _prob: f32) -> f32 {
+    fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f32) -> f32 {
         let mut found_points = Vec::new();
         self.query(&self.boundary, &mut found_points);
 
@@ -418,62 +414,36 @@ impl QuadTree {
         npoints
     }
 
-    fn block_data_to_sarray(&self, sparse: bool) -> (SparseArray, BitFieldVec) {
-        let block_mean_j = match sparse {
-            true => {
-                let mut sarray = SparseArray::new(self.points[0].data.len());
-                for j in 0..self.points[0].data.len() {
-                    let mut values: Vec<f32> = self.points.iter().map(|p| p.data[j]).collect();
-                    // Collect non-zero values for this column
-                    let mut column_values = Vec::new();
-                    for v in values {
-                        if v != 0.0 {
-                            column_values.push(v as u16);
-                        }
-                    }
-                    //values.sort_by(|a, b| a.partial_cmp(b).unwrap()); //for float type
-                    column_values.sort_unstable();
-                    // Find median with no ties (using lower middle value if even)
-                    let median = if column_values.len() % 2 == 1 {
-                        column_values[column_values.len() / 2]
-                    } else {
-                        column_values[column_values.len() / 2 - 1]
-                    };
+    fn block_data_to_sarray(&self, sparse: bool) -> (SparseArray<'_, u16>, BitFieldVec) {
+        let mut sarray = SparseArray::new(self.points[0].data.len());
+        let mut bit_field = BitFieldVec::new(16, self.points[0].data.len());
+
+        if sparse {
+            for j in 0..self.points[0].data.len() {
+                let values: Vec<u16> = self.points.iter()
+                    .map(|p| p.data[j] as u16)
+                    .filter(|&v| v != 0)
+                    .collect();
+
+                if !values.is_empty() {
+                    let mut sorted_values = values.clone();
+                    sorted_values.sort_unstable();
+                    let median = sorted_values[sorted_values.len() / 2];
+                    
                     if median != 0 {
-                        sarray.append(median, j as u16);
-                    // Calculate differences from median for each value
-                        let mut differences = Vec::new();
-                        for &value in &column_values {
-                            let diff = value - median;
-                            differences.push(diff);
-                        }
-                        // Find the minimum value to determine shift needed to make all values non-negative
-                        let min_value = differences.iter().min().unwrap_or(&0);
+                        sarray.append(median, j);
                         
-                        // Calculate shift - if min value is negative, we'll add its absolute value to all values
-                        let shift_value = if min_value < &0 { min_value.unsigned_abs() } else { 0 };
-        
-                        // Apply the shift and find the maximum value to determine bit width
-                        let shifted_values: Vec<u16> = differences.iter()
-                            .map(|&x| (x + shift_value) as u16)
-                            .collect();
-
-                    // Find max difference to determine bit width needed
-                        let max_diff = shifted_values.iter().max().copied().unwrap_or(0);
-                        let bit_width = if max_diff == 0 { 1 } else { (max_diff as u32).ilog2() as usize + 1 };
-
-                    // Create bit field vector
-                        let mut bit_field = BitFieldVec::new(bit_width, differences.len());
-                        for (i, &diff) in shifted_values.iter().enumerate() {
-                            bit_field.set(i, diff as u16);
+                        // Calculate and store differences
+                        for (i, &value) in values.iter().enumerate() {
+                            let diff = value.wrapping_sub(median);
+                            bit_field.set(i, diff);
                         }
                     }
                 }
             }
-            false => {
-                eprintln!("Dense case not implemented yet");
-            }
-        };
+        } else {
+            eprintln!("Dense case not implemented yet");
+        }
         (sarray, bit_field)
     }
 
@@ -483,7 +453,7 @@ impl QuadTree {
         let (sarray, bit_field) = self.block_data_to_sarray(true);///!!!! CHANGE to sparse
         // Create node data
         let mut node = BitFieldQuadTree {
-            boundary: self.boundary,
+            boundary: self.boundary.clone(),
             sarray,
             bit_field,
             divided: self.divided,
@@ -494,9 +464,7 @@ impl QuadTree {
             positions: Vec::new(),
         };
         
-        // If the node is divided, recursively process children
         if self.divided {
-            // Process children (if they exist)
             if let Some(ref ne) = self.ne {
                 node.ne = Some(Box::new(ne.compute_quadtree_bit_fields()));
             }
@@ -514,6 +482,52 @@ impl QuadTree {
     }
 }
 
+// First, create a serializable version of your quadtree that doesn't use references
+#[derive(Debug, Encode, Decode)]
+struct SerializableQuadTree {
+    boundary: Rect,
+    // Store the raw components of SparseArray
+    sarray_data: Vec<u16>,
+    sarray_positions: Vec<usize>,
+    // Store the raw components of BitFieldVec
+    bit_field_data: Vec<u64>,
+    bit_field_width: usize,
+    bit_field_len: usize,
+    divided: bool,
+    // Recursive children
+    nw: Option<Box<SerializableQuadTree>>,
+    ne: Option<Box<SerializableQuadTree>>,
+    se: Option<Box<SerializableQuadTree>>,
+    sw: Option<Box<SerializableQuadTree>>,
+    positions: Vec<DatalessPoint>,
+}
+
+// Implement conversion from your original QuadTree to the serializable version
+impl<'a> From<BitFieldQuadTree<'a>> for SerializableQuadTree {
+    fn from(qt: BitFieldQuadTree<'a>) -> Self {
+        // Extract data from SparseArray
+        let (sarray_data, sarray_positions) = qt.sarray;
+        
+        // Extract data from BitFieldVec
+        let (bit_field_data, bit_field_width, bit_field_len) = qt.bit_field.into_raw_parts();
+
+        SerializableQuadTree {
+            boundary: qt.boundary,
+            sarray_data,
+            sarray_positions,
+            bit_field_data,
+            bit_field_width,
+            bit_field_len,
+            divided: qt.divided,
+            nw: qt.nw.map(|node| Box::new(SerializableQuadTree::from(*node))),
+            ne: qt.ne.map(|node| Box::new(SerializableQuadTree::from(*node))),
+            se: qt.se.map(|node| Box::new(SerializableQuadTree::from(*node))),
+            sw: qt.sw.map(|node| Box::new(SerializableQuadTree::from(*node))),
+            positions: qt.positions,
+        }
+    }
+}
+
 fn tree_from_csv<T: AsRef<Path>>(
     file_path: T,
     idx_x: usize,
@@ -525,7 +539,8 @@ fn tree_from_csv<T: AsRef<Path>>(
     method: ErrorMetric,
     endpt: Option<usize>,
     allgenes: bool,
-) -> (Vec<f32>, QuadTree) {
+    lossless: bool,
+) -> (Vec<f32>, BitFieldQuadTree) {
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -584,9 +599,11 @@ fn tree_from_csv<T: AsRef<Path>>(
     } else {
      */
     let mut maxerrors = Vec::new();
-    let _maxerrorl = qtree.divide(step, method, &mind, &maxd, &mut maxerrors);
+    let mind: Vec<u16> = mind.iter().map(|&x| x as u16).collect();
+    let maxd_f32: Vec<f32> = maxd.iter().map(|&x| x as f32).collect();
+    let _maxerrorl = qtree.divide(step, method, &mind_f32, &maxd_f32, &mut maxerrors);
     let bit_field_tree = qtree.compute_quadtree_bit_fields();
-    (maxerrors, qtree)
+    (maxerrors, bit_field_tree)
     //}
 }
 
@@ -618,14 +635,14 @@ fn main() -> anyhow::Result<()> {
 
     let args = CmdArgs::parse();
     let file_path = args.input;
-    let (_maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 0.5, ErrorMetric::Mean, None, true);
+    let (_maxerrorl, qtree) = tree_from_csv(file_path, 5, 6, 9, 0.5, ErrorMetric::Mean, None, true,true);
     
     // You can decide whether to serialize the original tree or the bit fields or both
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
     let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-    let file = File::create(ofname).unwrap();
+    let mut file = File::create(ofname).unwrap();
     //let mut encoder = GzEncoder::new(file, Compression::default());
     bincode::encode_into_std_write(&qtree, &mut file, config).unwrap();
     //info!("Max Errors: {:?}", maxerrorl);
