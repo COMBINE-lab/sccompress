@@ -160,6 +160,44 @@ impl<'de, Context> BorrowDecode<'de, Context> for Rect {
     }
 }
 
+struct BitField {
+    bit_field: BitFieldVec,
+}
+
+impl BitField {
+    fn new(bit_field: BitFieldVec) -> Self {
+        Self { bit_field }
+    }
+}
+
+impl Encode for BitField {
+    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
+        let (data, width, len) = self.bit_field.into_raw_parts();
+        Encode::encode(&data, encoder)?;
+        Encode::encode(&width, encoder)?;
+        Encode::encode(&len, encoder)?;
+        Ok(())
+    }
+}
+
+impl Decode for BitField {
+    fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<BitFieldVec, bincode::error::DecodeError> {
+        let data = Decode::decode(decoder)?;
+        let width = Decode::decode(decoder)?;
+        let len = Decode::decode(decoder)?;
+        Ok(BitField::new(BitFieldVec::new(width, len, data)))
+    }
+}
+
+impl<'de> BorrowDecode<'de> for BitField {  
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(decoder: &mut D) -> Result<BitFieldVec, bincode::error::DecodeError> {
+        let data = BorrowDecode::borrow_decode(decoder)?;
+        let width = BorrowDecode::borrow_decode(decoder)?;
+        let len = BorrowDecode::borrow_decode(decoder)?;
+        Ok(BitField::new(BitFieldVec::new(width, len, data)))
+    }
+}
+
 #[derive(Debug, Encode, Decode)]
 struct BitFieldQuadTree<'a> {
     boundary: Rect,
@@ -482,46 +520,6 @@ impl QuadTree {
             }
         }
         node
-    }
-}
-
-struct BitField {
-    data: Vec<u16>,
-    width: u16,
-    len: u16,
-}
-
-impl BitField {
-    fn new(bit_field: BitFieldVec) -> Self {
-        let (bit_field_data, bit_field_width, bit_field_len) = bit_field.into_raw_parts();
-        Self { data: bit_field_data, width: bit_field_width, len: bit_field_len }
-    }
-}
-
-impl Encode for BitField {
-    fn encode<E: bincode::enc::Encoder>(&self, encoder: &mut E) -> Result<(), bincode::error::EncodeError> {
-        Encode::encode(&self.data, encoder)?;
-        Encode::encode(&self.width, encoder)?;
-        Encode::encode(&self.len, encoder)?;
-        Ok(())
-    }
-}
-
-impl Decode for BitField {
-    fn decode<D: bincode::de::Decoder>(decoder: &mut D) -> Result<BitFieldVec, bincode::error::DecodeError> {
-        let data = Decode::decode(decoder)?;
-        let width = Decode::decode(decoder)?;
-        let len = Decode::decode(decoder)?;
-        Ok(BitField::new(BitFieldVec::new(width, len, data)))
-    }
-}
-
-impl<'de> BorrowDecode<'de> for BitField {  
-    fn borrow_decode<D: bincode::de::BorrowDecoder<'de>>(decoder: &mut D) -> Result<Self, bincode::error::DecodeError> {
-        let data = BorrowDecode::borrow_decode(decoder)?;
-        let width = BorrowDecode::borrow_decode(decoder)?;
-        let len = BorrowDecode::borrow_decode(decoder)?;
-        Ok(Self { data, width, len })
     }
 }
 
