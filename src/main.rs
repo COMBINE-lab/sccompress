@@ -305,9 +305,10 @@ impl QuadTree {
         }
     }
 
-    fn query(&self, boundary: &Rect, found_points: &mut Vec<Point>) {
+    fn query(&self, boundary: &Rect) -> Vec<Point> {
+        let mut found_points = Vec::new();
         if !self.boundary.intersects(boundary) {
-            return;
+            return found_points;
         }
 
         for point in &self.points {
@@ -318,18 +319,19 @@ impl QuadTree {
 
         if self.divided {
             if let Some(ref nw) = self.nw {
-                nw.query(boundary, found_points);
+                found_points.extend(nw.query(boundary));
             }
             if let Some(ref ne) = self.ne {
-                ne.query(boundary, found_points);
+                found_points.extend(ne.query(boundary));
             }
             if let Some(ref se) = self.se {
-                se.query(boundary, found_points);
+                found_points.extend(se.query(boundary));
             }
             if let Some(ref sw) = self.sw {
-                sw.query(boundary, found_points);
+                found_points.extend(sw.query(boundary));
             }
         }
+        found_points
     }
 
     fn block_data_repr(&self, method: ErrorMetric) -> Vec<f32> {
@@ -353,10 +355,10 @@ impl QuadTree {
         }
         block_mean
     }
-
+/* 
     fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f32) -> f32 {
         let mut found_points = Vec::new();
-        self.query(&self.boundary, &mut found_points);
+        self.query(&self.boundary);
 
         if found_points.is_empty() {
             return 0.0;
@@ -386,77 +388,93 @@ impl QuadTree {
         }
         maxerrors.iter().fold(0.0, |a, &b| f32::max(a, b))
     }  
+*/
 
     fn divide(
         &mut self,
-        threshold: f32,
         method: ErrorMetric,
         mind: &[u16],
         maxd: &[u16],
-        maxerrors: &mut Vec<f32>,
-    ) -> f32 {
-        let maxerror = self.calculate_error(method, mind, maxd, 1.0);
-        maxerrors.push(maxerror);
-
+    ) {
         info!("Processing node with {} points", self.points.len());
+        // Store the current points' positions before clearing them
+        let positions: Vec<DatalessPoint> = self.points.iter()
+            .map(|p| DatalessPoint::new(p.x, p.y))
+            .collect();
 
-        if maxerror > threshold && self.points.len() > 1 {
-            let cx = self.boundary.cx;
-            let cy = self.boundary.cy;
-            let w = self.boundary.w / 2.0;
-            let h = self.boundary.h / 2.0;
+        // Calculate block data and convert to bit fields
+        let (medians, diffs) = self.block_data_to_sarray(true);
 
-            let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
-            let mut nw_points = Vec::new();
-            self.query(&nw_boundary, &mut nw_points);
-            info!("NW quadrant has {} points", nw_points.len());
-            self.nw = Some(Box::new(Self::new(nw_boundary, nw_points, self.depth + 1)));
+        // Convert current node to BitFieldQuadTree to calculate expense
+        let current_bit_tree = self.compute_quadtree_bit_fields();
+        let current_expense = current_bit_tree.calculate_expense();
 
-            let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
-            let mut ne_points = Vec::new();
-            self.query(&ne_boundary, &mut ne_points);
-            info!("NE quadrant has {} points", ne_points.len());
-            self.ne = Some(Box::new(Self::new(ne_boundary, ne_points, self.depth + 1)));
+        // Find the children of the current node
+        let cx = self.boundary.cx;
+        let cy = self.boundary.cy;
+        let w = self.boundary.w / 2.0;
+        let h = self.boundary.h / 2.0;
 
-            let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
-            let mut se_points = Vec::new();
-            self.query(&se_boundary, &mut se_points);
-            info!("SE quadrant has {} points", se_points.len());
-            self.se = Some(Box::new(Self::new(se_boundary, se_points, self.depth + 1)));
+        let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
+        let nw_points = self.query(&nw_boundary);
+        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
 
-            let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
-            let mut sw_points = Vec::new();
-            self.query(&sw_boundary, &mut sw_points);
-            info!("SW quadrant has {} points", sw_points.len());
-            self.sw = Some(Box::new(Self::new(sw_boundary, sw_points, self.depth + 1)));
+        let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
+        let ne_points = self.query(&ne_boundary);
+        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
 
+        let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
+        let se_points = self.query(&se_boundary);
+        let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
+
+        let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
+        let sw_points = self.query(&sw_boundary);
+        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
+
+        // Convert children to BitFieldQuadTree to calculate their expenses
+        let nw_bit_tree = nw.compute_quadtree_bit_fields();
+        let ne_bit_tree = ne.compute_quadtree_bit_fields();
+        let se_bit_tree = se.compute_quadtree_bit_fields();
+        let sw_bit_tree = sw.compute_quadtree_bit_fields();
+
+        let nw_expense = nw_bit_tree.calculate_expense();
+        let ne_expense = ne_bit_tree.calculate_expense();
+        let se_expense = se_bit_tree.calculate_expense();
+        let sw_expense = sw_bit_tree.calculate_expense();
+
+        let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
+
+        if total_expense < current_expense {
             self.divided = true;
+            // Convert BitFieldQuadTree back to QuadTree and assign children
+            self.nw = Some(Box::new(nw_bit_tree.to_quad_tree()));
+            self.ne = Some(Box::new(ne_bit_tree.to_quad_tree()));
+            self.se = Some(Box::new(se_bit_tree.to_quad_tree()));
+            self.sw = Some(Box::new(sw_bit_tree.to_quad_tree()));
             // At this stage, every point has been inserted in one of the subtrees, so we can drop the vector to avoid duplicating data.
             self.points = Vec::new();
-
+        
             if let Some(ref mut nw) = self.nw {
-                nw.divide(threshold, method, mind, maxd, maxerrors);
+                nw.divide(method, mind, maxd);
             }
             if let Some(ref mut ne) = self.ne {
-                ne.divide(threshold, method, mind, maxd, maxerrors);
+                ne.divide(method, mind, maxd);
             }
             if let Some(ref mut se) = self.se {
-                se.divide(threshold, method, mind, maxd, maxerrors);
+                se.divide(method, mind, maxd);
             }
             if let Some(ref mut sw) = self.sw {
-                sw.divide(threshold, method, mind, maxd, maxerrors);
+                sw.divide(method, mind, maxd);
             }
         } else {
             self.divided = false;
-            self.maxerror = Some(maxerror);
             if !self.points.is_empty() {
                 info!("Leaf node with {} points", self.points.len());
-                self.positions = self.points.iter().map(DatalessPoint::from_point).collect();
+                self.positions = positions; // Use the stored positions
                 self.data = self.block_data_repr(method);
-                self.points.clear();
+                // Don't clear points here, they're needed for the bit field representation
             }
         }
-        maxerror
     }
 
     #[allow(dead_code)]
@@ -528,7 +546,6 @@ impl QuadTree {
     fn block_data_to_sarray(&self, sparse: bool) -> (Vec<u16>, Vec<BitField>) {
         let mut sarray = Vec::new();
         let mut diffs = Vec::new();
-        let _min_diff = 0;  // Prefix with underscore to indicate intentionally unused
 
         if self.points.is_empty() {
             println!("empty");
@@ -538,8 +555,7 @@ impl QuadTree {
         for j in 0..self.points[0].data.len() {
             let values: Vec<u16> = self.points.iter()
                 .map(|p| p.data[j] as u16)
-                .filter(|&v| v != 0)
-                .collect();
+                .collect(); // Keep all values, including zeros
 
             if !values.is_empty() {
                 let mut sorted_values = values.clone();
@@ -623,7 +639,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     method: ErrorMetric,
    // allgenes: bool,
     _lossless: bool,
-) -> anyhow::Result<(Vec<f32>, QuadTree)> {
+) -> anyhow::Result<QuadTree> {
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -654,7 +670,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     }
 
     // Get the number of columns from the first record
-    let first_record = records.next().ok_or_else(|| anyhow::anyhow!("No records in file"))??;
+    let first_record = rdr.records().next().ok_or_else(|| anyhow::anyhow!("No records in file"))??;
     let num_columns = first_record.len();
     let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
     println!("num_columns: {}", num_columns);
@@ -711,11 +727,10 @@ fn tree_from_csv<T: AsRef<Path>>(
 
     let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
     let mut qtree = QuadTree::new(domain, coords, 1);
-    let mut maxerrors = Vec::new();
     let mind: Vec<u16> = mind.iter().map(|&x| x as u16).collect();
     let maxd: Vec<u16> = maxd.iter().map(|&x| x as u16).collect();
-    let _maxerrorl = qtree.divide(step, method, &mind, &maxd, &mut maxerrors);
-    Ok((maxerrors, qtree))
+    qtree.divide(method, &mind, &maxd);
+    Ok(qtree)
 }
 
 /// Build a quadtree representation of spatial transcriptomics data
@@ -752,7 +767,7 @@ fn main() -> anyhow::Result<()> {
     let args = CmdArgs::parse();
     let file_path = args.input;
     let file_path_pos = args.input_pos;
-    let (_maxerrorl, qtree) = tree_from_csv(
+    let qtree = tree_from_csv(
         file_path,
         file_path_pos,
         5,  // idx_x
