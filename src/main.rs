@@ -2,7 +2,12 @@ use bincode::{BorrowDecode, Decode, Encode};
 use clap::Parser;
 use csv::ReaderBuilder;
 use flate2::{Compression, write::GzEncoder};
-use std::fs::File;
+use hdf5::{File, Result as H5Result};
+use hdf5::types::VarLenArray;
+use hdf5::types::FixedAscii;
+use ndarray::{Array1, Array2};
+use std::collections::HashMap;
+use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, prelude::*};
@@ -733,19 +738,149 @@ fn tree_from_csv<T: AsRef<Path>>(
     Ok(qtree)
 }
 
+fn tree_from_10x<T: AsRef<Path>>(
+    h5_path: T,
+    spatial_path: T,
+    method: ErrorMetric,
+    _lossless: bool,
+) -> anyhow::Result<QuadTree> {
+    // Read spatial coordinates from CSV
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .from_path(spatial_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open spatial file: {}", e))?;
+    
+    let mut spatial_coords = HashMap::new();
+    let mut spatial_count = 0;
+    for result in rdr.records() {
+        let record = result?;
+        let barcode = record[1].to_string();  // barcode is in column 1
+        let x: f32 = record[5].parse()?;  // pxl_col_in_fullres
+        let y: f32 = record[4].parse()?;  // pxl_row_in_fullres
+        spatial_coords.insert(barcode.clone(), (x, y));
+        spatial_count += 1;
+        if spatial_count <= 5 {
+            info!("Sample spatial barcode: {}", barcode);
+        }
+    }
+    info!("Read {} spatial coordinates", spatial_count);
+
+    // Read HDF5 file
+    let file = File::open(h5_path)?;
+    
+    // Read barcodes
+    let barcodes_dataset = file.dataset("matrix/barcodes")?;
+    let barcodes_array: Array1<FixedAscii<32>> = barcodes_dataset.read()?;
+    let barcodes: Vec<String> = barcodes_array.iter()
+        .map(|s| s.as_str().trim_end_matches('\0').to_string())
+        .collect();
+    info!("Read {} barcodes", barcodes.len());
+    
+    // Print sample barcodes from HDF5
+    for (i, barcode) in barcodes.iter().take(5).enumerate() {
+        info!("Sample HDF5 barcode {}: {}", i, barcode);
+    }
+    
+    // Read features (gene names)
+    let features_dataset = file.dataset("matrix/features/name")?;
+    let features_array: Array1<FixedAscii<32>> = features_dataset.read()?;
+    let features: Vec<String> = features_array.iter()
+        .map(|s| s.as_str().trim_end_matches('\0').to_string())
+        .collect();
+    info!("Read {} features", features.len());
+    
+    // Read sparse matrix data
+    let data_dataset = file.dataset("matrix/data")?;
+    let indices_dataset = file.dataset("matrix/indices")?;
+    let indptr_dataset = file.dataset("matrix/indptr")?;
+    let shape_dataset = file.dataset("matrix/shape")?;
+    
+    let data_array: Array1<f32> = data_dataset.read()?;
+    let indices_array: Array1<usize> = indices_dataset.read()?;
+    let indptr_array: Array1<usize> = indptr_dataset.read()?;
+    let shape_array: Array1<usize> = shape_dataset.read()?;
+    
+    let data: Vec<f32> = data_array.to_vec();
+    let indices: Vec<usize> = indices_array.to_vec();
+    let indptr: Vec<usize> = indptr_array.to_vec();
+    let shape: Vec<usize> = shape_array.to_vec();
+    
+    info!("Matrix shape: {:?}", shape);
+    info!("Number of non-zero elements: {}", data.len());
+    
+    // Create points with coordinates and gene expression
+    let mut points = Vec::new();
+    let num_genes = shape[1];
+    let mut matched_count = 0;
+    
+    for (cell_idx, barcode) in barcodes.iter().enumerate() {
+        if let Some(&(x, y)) = spatial_coords.get(barcode) {
+            // Initialize gene expression vector with zeros
+            let mut gene_expr = vec![0.0; num_genes];
+            
+            // Fill in non-zero values from sparse matrix
+            let start = indptr[cell_idx];
+            let end = indptr[cell_idx + 1];
+            for i in start..end {
+                let gene_idx = indices[i];
+                gene_expr[gene_idx] = data[i];
+            }
+            
+            points.push(Point::new(x, y, gene_expr));
+            matched_count += 1;
+        }
+    }
+    info!("Matched {} barcodes with spatial coordinates", matched_count);
+    info!("Created {} points", points.len());
+
+    // Calculate boundaries
+    let minx = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min) - 1.0;
+    let miny = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - 1.0;
+    let maxx = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max) + 1.0;
+    let maxy = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max) + 1.0;
+    let w = maxx - minx;
+    let h = maxy - miny;
+
+    // Create quadtree
+    let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
+    let mut qtree = QuadTree::new(domain, points.clone(), 1);
+
+    // Calculate min/max values for each gene
+    let mut mind = Vec::new();
+    let mut maxd = Vec::new();
+    if !points.is_empty() {
+        for j in 0..points[0].data.len() {
+            let mut min_val = f32::INFINITY;
+            let mut max_val = f32::NEG_INFINITY;
+            for point in &points {
+                min_val = min_val.min(point.data[j]);
+                max_val = max_val.max(point.data[j]);
+            }
+            mind.push(min_val as u16);
+            maxd.push(max_val as u16);
+        }
+    }
+
+    qtree.divide(method, &mind, &maxd);
+    Ok(qtree)
+}
+
 /// Build a quadtree representation of spatial transcriptomics data
 #[derive(Debug, Parser)]
 #[command(version, about, long_about = None)]
 struct CmdArgs {
-    /// Input CSV file for gene expression data
+    /// Input file (CSV or HDF5)
     #[arg(short = 'i', long)]
     input: PathBuf,
-    /// Input CSV file for position data
+    /// Input CSV file for position data (only needed for CSV input)
     #[arg(short = 'p', long)]
-    input_pos: PathBuf,
+    input_pos: Option<PathBuf>,
     /// Output file (default "output.bin.gz")
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
+    /// Input file format (csv or hdf5)
+    #[arg(short = 'f', long, default_value = "csv")]
+    format: String,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -766,28 +901,45 @@ fn main() -> anyhow::Result<()> {
 
     let args = CmdArgs::parse();
     let file_path = args.input;
-    let file_path_pos = args.input_pos;
-    let qtree = tree_from_csv(
-        file_path,
-        file_path_pos,
-        5,  // idx_x
-        6,  // idx_y
-        1,  // idx_gene_start
-        None,  // idx_gene_end (will use all remaining columns)
-        ErrorMetric::Mean,
-        true
-    )?;
+    let qtree = match args.format.as_str() {
+        "csv" => {
+            let file_path_pos = args.input_pos.ok_or_else(|| {
+                anyhow::anyhow!("Position file required for CSV format")
+            })?;
+            tree_from_csv(
+                file_path,
+                file_path_pos,
+                5,  // idx_x
+                6,  // idx_y
+                1,  // idx_gene_start
+                None,  // idx_gene_end (will use all remaining columns)
+                ErrorMetric::Mean,
+                true
+            )?
+        }
+        "hdf5" => {
+            let file_path_pos = args.input_pos.ok_or_else(|| {
+                anyhow::anyhow!("Position file required for HDF5 format")
+            })?;
+            tree_from_10x(
+                file_path,
+                file_path_pos,
+                ErrorMetric::Mean,
+                true
+            )?
+        }
+        _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format)),
+    };
     
     // You can decide whether to serialize the original tree or the bit fields or both
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
     let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-    let mut file = File::create(ofname).unwrap();
+    let mut file = StdFile::create(ofname).unwrap();
     //let mut encoder = GzEncoder::new(file, Compression::default());
     let bit_field_tree = qtree.compute_quadtree_bit_fields();
     bincode::encode_into_std_write(&bit_field_tree, &mut file, config).unwrap();
-    //info!("Max Errors: {:?}", maxerrorl);
     info!(
         "QuadTree Blocks: {} (non-zero blocks: {})",
         qtree.blocks(),
