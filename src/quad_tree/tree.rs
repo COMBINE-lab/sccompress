@@ -1,17 +1,7 @@
 use bincode::{BorrowDecode, Decode, Encode};
-use ndarray::Array1;
-use std::collections::HashMap;
-use std::error::Error;
-use std::fs::File as StdFile;
-use std::path::{Path, PathBuf};
-use std::time::Instant;
 use sux::prelude::BitFieldVec;
 use sux::traits::BitFieldSliceMut;
-use tracing::{info, warn};
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt;
-use tracing_subscriber::prelude::*;
-use tracing_subscriber::EnvFilter;
+use tracing::info;
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -61,6 +51,7 @@ impl DatalessPoint {
         Self { x, y }
     }
     #[inline(always)]
+    #[allow(dead_code)]
     fn from_point(o: &Point) -> Self {
         Self {
             x: o.xpos(),
@@ -164,7 +155,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for Rect {
 }
 
 #[derive(Clone)]
-struct BitField {
+pub struct BitField {
     bit_field: BitFieldVec,
 }
 
@@ -195,8 +186,8 @@ impl<Context> Decode<Context> for BitField {
         let width = Decode::decode(decoder)?;
         let len = Decode::decode(decoder)?;
         let mut bit_field = BitFieldVec::new(width, len);
-        for i in 0..len {
-            bit_field.set(i, data[i] as usize);
+        for (i, item) in data.iter().enumerate().take(len) {
+            bit_field.set(i, *item as usize);
         }
         Ok(BitField::new(bit_field))
     }
@@ -210,8 +201,8 @@ impl<'de, Context> BorrowDecode<'de, Context> for BitField {
         let width = BorrowDecode::borrow_decode(decoder)?;
         let len = BorrowDecode::borrow_decode(decoder)?;
         let mut bit_field = BitFieldVec::new(width, len);
-        for i in 0..len {
-            bit_field.set(i, data[i] as usize);
+        for (i, item) in data.iter().enumerate().take(len) {
+            bit_field.set(i, *item as usize);
         }
         Ok(BitField::new(bit_field))
     }
@@ -274,11 +265,10 @@ impl BitFieldQuadTree {
         quadtree.data = self
             .data
             .iter()
-            .map(|bf| {
+            .flat_map(|bf| {
                 let (data, _, _) = bf.bit_field.clone().into_raw_parts();
                 data.iter().map(|&x| x as f32).collect::<Vec<f32>>()
             })
-            .flatten()
             .collect();
         quadtree.positions = self.positions.clone();
         if quadtree.divided {

@@ -1,20 +1,15 @@
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 pub mod quad_tree;
-use bincode::{BorrowDecode, Decode, Encode};
 use clap::Parser;
 use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;
 use hdf5::File;
 use ndarray::Array1;
 use std::collections::HashMap;
-use std::env;
 use std::error::Error;
 use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
-use sux::prelude::BitFieldVec;
-use sux::traits::BitFieldSliceMut;
-use tracing::{info, warn};
+use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -54,7 +49,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
     println!("num_columns: {}", num_columns);
     // Process all records
-    for (i, record) in records.iter().enumerate() {
+    for record in records.iter() {
         //println!("i: {:?}", i);
         // Read coordinates
         let x: f32 = record[idx_x].parse().map_err(|e| {
@@ -71,7 +66,7 @@ fn tree_from_csv<T: AsRef<Path>>(
         for j in idx_gene_start..idx_gene_end {
             let value: u16 = match record[j].parse::<f32>() {
                 Ok(v) => v as u16,
-                Err(e) => 0,
+                Err(_e) => 0,
             };
             cells.push(value);
             // println!("cells: {:?}", cells);
@@ -103,10 +98,11 @@ fn tree_from_csv<T: AsRef<Path>>(
     Ok(qtree)
 }
 
+#[allow(dead_code)]
 fn tree_from_h5<T: AsRef<Path>>(
     h5_path: T,
     spatial_path: T,
-    method: ErrorMetric,
+    _method: ErrorMetric,
     _lossless: bool,
     seq_type: &str,
 ) -> anyhow::Result<QuadTree> {
@@ -284,7 +280,7 @@ fn tree_from_h5<T: AsRef<Path>>(
     for (cell_idx, barcode) in barcodes.iter().enumerate() {
         if let Some(&(x, y)) = spatial_coords.get(barcode) {
             // Initialize gene expression vector with zeros
-            let mut gene_expr = vec![0 as u16; num_genes];
+            let mut gene_expr = vec![0_u16; num_genes];
 
             // Fill in non-zero values from sparse matrix
             let start = indptr[cell_idx];
