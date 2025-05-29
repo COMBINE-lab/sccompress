@@ -1,7 +1,7 @@
 use bincode::{BorrowDecode, Decode, Encode};
 use sux::prelude::BitFieldVec;
 use sux::traits::BitFieldSliceMut;
-use tracing::info;
+use tracing::{debug, info};
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -472,7 +472,8 @@ impl QuadTree {
 
     pub fn divide(&mut self) {
         info!("Processing node with {} points", self.points.len());
-        println!("self.points.len(): {}", self.points.len());
+
+        debug!("self.points.len(): {}", self.points.len());
         if !self.points.is_empty() {
             println!("Initial number of genes: {}", self.points[0].data.len());
         }
@@ -635,27 +636,26 @@ impl QuadTree {
         let mut diffs = Vec::new();
 
         if self.points.is_empty() {
-            println!("Empty points array in block_data_to_sarray");
+            debug!("Empty points array in block_data_to_sarray");
             return (sarray, diffs);
         }
 
-        println!(
+        debug!(
             "Processing {} points in block_data_to_sarray",
             self.points.len()
         );
-        println!("Number of genes: {}", self.points[0].data.len());
+        debug!("Number of genes: {}", self.points[0].data.len());
 
         for j in 0..self.points[0].data.len() {
             // for each gene
-            let values: Vec<u16> = self
+            let nz_values: Vec<u16> = self
                 .points
                 .iter()
-                .map(|p| p.data[j])
-                .filter(|&v| v != 0)
+                .filter_map(|p| if p.data[j] > 0 { Some(p.data[j]) } else { None })
                 .collect(); // Keep only non-zero values
 
-            let median = if !values.is_empty() {
-                let mut sorted_values = values.clone();
+            let median = if !nz_values.is_empty() {
+                let mut sorted_values = nz_values.clone();
                 sorted_values.sort_unstable();
                 sorted_values[sorted_values.len() / 2] //median of the expressed values
             } else {
@@ -668,7 +668,7 @@ impl QuadTree {
                 let mut min_diff = 0;
 
                 // Find min and max diffs
-                for &value in &values {
+                for &value in &nz_values {
                     let diff = value.wrapping_sub(median);
                     min_diff = min_diff.min(diff as usize);
                     max_diff = max_diff.max(diff as usize);
@@ -678,9 +678,9 @@ impl QuadTree {
                 //println!("Gene {}: median={}, bit_width={}, min_diff={}, max_diff={}",
                 //    j, median, bit_width, min_diff, max_diff);
 
-                let mut bit_field = BitFieldVec::new(bit_width, values.len());
+                let mut bit_field = BitFieldVec::new(bit_width, nz_values.len());
                 // Calculate and store differences
-                for (i, &value) in values.iter().enumerate() {
+                for (i, &value) in nz_values.iter().enumerate() {
                     let diff = value.wrapping_sub(median);
                     bit_field.set(i, diff as usize);
                 }
@@ -698,19 +698,19 @@ impl QuadTree {
     }
 
     pub fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
-        println!(
+        debug!(
             "Computing bit fields - points available: {}",
             self.points.len()
         );
         if !self.points.is_empty() {
-            println!(
+            debug!(
                 "Computing bit fields - genes per point: {}",
                 self.points[0].data.len()
             );
         }
 
         let (medians, diffs) = self.block_data_to_sarray(true);
-        println!(
+        debug!(
             "Generated medians: {}, diffs: {}",
             medians.len(),
             diffs.len()
