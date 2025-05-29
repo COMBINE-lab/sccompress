@@ -1,20 +1,22 @@
 use bincode::{BorrowDecode, Decode, Encode};
 use clap::Parser;
 use csv::ReaderBuilder;
-use flate2::{Compression, write::GzEncoder};
-use hdf5::{File, Result as H5Result};
-use hdf5::types::VarLenArray;
+use hdf5::File;
 use hdf5::types::FixedAscii;
-use ndarray::{Array1, Array2};
+use ndarray::Array1;
 use std::collections::HashMap;
-use std::fs::File as StdFile;
 use std::path::{Path, PathBuf};
-use tracing::info;
-use tracing_subscriber::{EnvFilter, filter::LevelFilter, fmt, prelude::*};
-//use bvrs::SparseArray;
+use tracing::{info, warn};
 use sux::prelude::BitFieldVec;
 use sux::traits::BitFieldSliceMut;
-use std::time::{Instant, Duration};
+use std::error::Error;
+use std::env;
+use std::time::Instant;
+use tracing_subscriber::fmt;
+use tracing_subscriber::EnvFilter;
+use tracing_subscriber::filter::LevelFilter;
+use std::fs::File as StdFile;
+use tracing_subscriber::prelude::*;
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -31,12 +33,12 @@ pub trait PointLike {
 struct Point {
     x: f32,
     y: f32,
-    data: Vec<f32>,
+    data: Vec<u16>,
 }
 
 impl Point {
     #[inline(always)]
-    const fn new(x: f32, y: f32, data: Vec<f32>) -> Self {
+    const fn new(x: f32, y: f32, data: Vec<u16>) -> Self {
         Self { x, y, data }
     }
 }
@@ -243,12 +245,20 @@ impl BitFieldQuadTree {
 
     fn calculate_expense(&self) -> u32 {
         let mut expense: u32 = 0;
-        for bitfield in &self.data {    
+        info!("Calculating expense for BitFieldQuadTree node with {} medians and {} bitfields", 
+            self.medians.len(), self.data.len());
+        
+        for (i, bitfield) in self.data.iter().enumerate() {    
             let (_, width, len) = bitfield.bit_field.clone().into_raw_parts();
-            expense += width as u32 * len as u32;
+            let bit_expense = width as u32 * len as u32;
+            expense += bit_expense;
+            info!("Bitfield {}: width={}, len={}, expense={}", 
+                i, width, len, bit_expense);
         }
+        
+        info!("Total node expense: {}", expense);
         expense
-    } 
+    }
 
     fn to_quad_tree(&self) -> QuadTree {
         let mut quadtree = QuadTree::new(self.boundary.clone(), Vec::new(), 0);
@@ -406,12 +416,12 @@ impl QuadTree {
         for j in 0..self.points[0].data.len() {
             let block_mean_j = match method {
                 ErrorMetric::Median => {
-                    let mut values: Vec<f32> = self.points.iter().map(|p| p.data[j]).collect();
+                    let mut values: Vec<f32> = self.points.iter().map(|p| p.data[j] as f32).collect();
                     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     values[values.len() / 2]
                 }
                 ErrorMetric::Mean => {
-                    self.points.iter().map(|p| p.data[j]).sum::<f32>() / self.points.len() as f32
+                    self.points.iter().map(|p| p.data[j] as f32).sum::<f32>() / self.points.len() as f32
                 }
             };
             block_mean.push(block_mean_j);
@@ -431,18 +441,18 @@ impl QuadTree {
         for j in 0..found_points[0].data.len() {
             let block_mean = match method {
                 ErrorMetric::Median => {
-                    let mut values: Vec<f32> = found_points.iter().map(|p| p.data[j]).collect();
+                    let mut values: Vec<f32> = found_points.iter().map(|p| p.data[j] as f32).collect();
                     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     values[values.len() / 2]
                 }
                 ErrorMetric::Mean => {
-                    found_points.iter().map(|p| p.data[j]).sum::<f32>() / found_points.len() as f32
+                    found_points.iter().map(|p| p.data[j] as f32).sum::<f32>() / found_points.len() as f32
                 }
             };
 
             let maxerror = found_points
                 .iter()
-                .map(|p| (p.data[j] - block_mean).abs())
+                .map(|p| (p.data[j] as f32 - block_mean).abs())
                 .collect::<Vec<f32>>();
 
             let maxerror =
@@ -453,23 +463,21 @@ impl QuadTree {
     }  
 */
 
-    fn divide(
-        &mut self,
-        method: ErrorMetric,
-        mind: &[u16],
-        maxd: &[u16],
-    ) {
-        //info!("Processing node with {} points", self.points.len());
+    fn divide(&mut self) {
+        info!("Processing node with {} points", self.points.len());
+        println!("self.points.len(): {}", self.points.len());
+        if !self.points.is_empty() {
+            println!("Initial number of genes: {}", self.points[0].data.len());
+        }
+        
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self.points.iter()
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
 
-        // Calculate block data and convert to bit fields
-        let (medians, diffs) = self.block_data_to_sarray(true);
-
         // Convert current node to BitFieldQuadTree to calculate expense
         let current_bit_tree = self.compute_quadtree_bit_fields();
+        println!("current_bit_tree.medians.len(): {}", current_bit_tree.medians.len());
         let current_expense = current_bit_tree.calculate_expense();
 
         // Find the children of the current node
@@ -480,18 +488,30 @@ impl QuadTree {
 
         let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
         let nw_points = self.query(&nw_boundary);
+        println!("NW points: {}, genes per point: {}", 
+            nw_points.len(), 
+            if !nw_points.is_empty() { nw_points[0].data.len() } else { 0 });
         let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
 
         let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
         let ne_points = self.query(&ne_boundary);
+        println!("NE points: {}, genes per point: {}", 
+            ne_points.len(), 
+            if !ne_points.is_empty() { ne_points[0].data.len() } else { 0 });
         let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
 
         let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
         let se_points = self.query(&se_boundary);
+        println!("SE points: {}, genes per point: {}", 
+            se_points.len(), 
+            if !se_points.is_empty() { se_points[0].data.len() } else { 0 });
         let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
 
         let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
         let sw_points = self.query(&sw_boundary);
+        println!("SW points: {}, genes per point: {}", 
+            sw_points.len(), 
+            if !sw_points.is_empty() { sw_points[0].data.len() } else { 0 });
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
 
         // Convert children to BitFieldQuadTree to calculate their expenses
@@ -501,85 +521,51 @@ impl QuadTree {
         let sw_bit_tree = sw.compute_quadtree_bit_fields();
 
         let nw_expense = nw_bit_tree.calculate_expense();
+        println!("NW expense: {}", nw_expense);
         let ne_expense = ne_bit_tree.calculate_expense();
+        println!("NE expense: {}", ne_expense);
         let se_expense = se_bit_tree.calculate_expense();
+        println!("SE expense: {}", se_expense);
         let sw_expense = sw_bit_tree.calculate_expense();
+        println!("SW expense: {}", sw_expense);
 
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
 
         if total_expense < current_expense {
-            println!("current_expense {} total_expense {}", current_expense, total_expense);
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
             self.nw = Some(Box::new(nw_bit_tree.to_quad_tree()));
             self.ne = Some(Box::new(ne_bit_tree.to_quad_tree()));
             self.se = Some(Box::new(se_bit_tree.to_quad_tree()));
             self.sw = Some(Box::new(sw_bit_tree.to_quad_tree()));
-            // At this stage, every point has been inserted in one of the subtrees, so we can drop the vector to avoid duplicating data.
+            
+            // Only clear points after we've used them for all necessary operations
             self.points = Vec::new();
         
             if let Some(ref mut nw) = self.nw {
-                nw.divide(method, mind, maxd);
+                nw.divide();
             }
             if let Some(ref mut ne) = self.ne {
-                ne.divide(method, mind, maxd);
+                ne.divide();
             }
             if let Some(ref mut se) = self.se {
-                se.divide(method, mind, maxd);
+                se.divide();
             }
             if let Some(ref mut sw) = self.sw {
-                sw.divide(method, mind, maxd);
+                sw.divide();
             }
         } else {
             self.divided = false;
             if !self.points.is_empty() {
                 info!("Leaf node with {} points", self.points.len());
+                println!("Leaf node - points: {}, genes: {}", 
+                    self.points.len(), 
+                    self.points[0].data.len());
                 self.positions = positions; // Use the stored positions
-                self.data = self.block_data_repr(method);
-                // Don't clear points here, they're needed for the bit field representation
+                // Keep the points for bit field representation
             }
-        }
-    }
-
-    #[allow(dead_code)]
-    fn len(&self) -> usize {
-        let mut npoints = self.points.len();
-        if self.divided {
-            if let Some(ref nw) = self.nw {
-                npoints += nw.len();
-            }
-            if let Some(ref ne) = self.ne {
-                npoints += ne.len();
-            }
-            if let Some(ref se) = self.se {
-                npoints += se.len();
-            }
-            if let Some(ref sw) = self.sw {
-                npoints += sw.len();
-            }
-        }
-        npoints
-    }
-
-    fn blocks(&self) -> usize {
-        if !self.divided {
-            1
-        } else {
-            let mut npoints = 0;
-            if let Some(ref nw) = self.nw {
-                npoints += nw.blocks();
-            }
-            if let Some(ref ne) = self.ne {
-                npoints += ne.blocks();
-            }
-            if let Some(ref se) = self.se {
-                npoints += se.blocks();
-            }
-            if let Some(ref sw) = self.sw {
-                npoints += sw.blocks();
-            }
-            npoints
-        }
+        }    
+        println!("self.depth: {}", self.depth);
     }
 
     fn non_zero_blocks(&self) -> usize {
@@ -604,27 +590,29 @@ impl QuadTree {
         }
         npoints
     }
-
     
   /* This is simply a bit vector across genes for each block */
-    fn block_data_to_sarray(&self, sparse: bool) -> (Vec<u16>, Vec<BitField>) {
+    fn block_data_to_sarray(&self, _sparse: bool) -> (Vec<u16>, Vec<BitField>) {
         let mut sarray = Vec::new();
         let mut diffs = Vec::new();
 
         if self.points.is_empty() {
-            println!("empty");
+            println!("Empty points array in block_data_to_sarray");
             return (sarray, diffs);
         }
 
-        for j in 0..self.points[0].data.len() {
-            let values: Vec<u16> = self.points.iter()
-                .map(|p| p.data[j] as u16)
-                .collect(); // Keep all values, including zeros
+        println!("Processing {} points in block_data_to_sarray", self.points.len());
+        println!("Number of genes: {}", self.points[0].data.len());
 
+        for j in 0..self.points[0].data.len() { // for each gene
+            let values: Vec<u16> = self.points.iter()
+                .filter(|&v| v != 0)
+                .map(|p| p.data[j])
+                .collect(); // Keep only non-zero values
             if !values.is_empty() {
                 let mut sorted_values = values.clone();
                 sorted_values.sort_unstable();
-                let median = sorted_values[sorted_values.len() / 2]; //not bitfieldvec yet
+                let median = sorted_values[sorted_values.len() / 2]; //median of the expressed values
                 
                 if median != 0 {
                     sarray.push(median);  // Use push instead of append
@@ -638,7 +626,10 @@ impl QuadTree {
                         max_diff = max_diff.max(diff as usize);
                     }
 
-                    let bit_width = (max_diff as f64).log2().ceil() as usize + 1;
+                    let bit_width = (max_diff as u16).ilog2() as usize + 1;
+                    //println!("Gene {}: median={}, bit_width={}, min_diff={}, max_diff={}", 
+                    //    j, median, bit_width, min_diff, max_diff);
+                    
                     let mut bit_field = BitFieldVec::new(bit_width, values.len());
                     // Calculate and store differences
                     for (i, &value) in values.iter().enumerate() {
@@ -648,21 +639,24 @@ impl QuadTree {
                     
                     diffs.push(BitField::new(bit_field));
                 }
+            }else{
+                median = 0;
             }
         }
 
-        if sparse {
-            println!("sparse");
-        } else {
-            println!("not sparse");
-        }
+        info!("Generated {} medians and {} diffs", sarray.len(), diffs.len());
         (sarray, diffs)
     }
-    
-    /// Traverses the quadtree and computes median bit representations at each leaf node
-    /// Returns a tree structure of bit fields
+
     fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
+        println!("Computing bit fields - points available: {}", self.points.len());
+        if !self.points.is_empty() {
+            println!("Computing bit fields - genes per point: {}", self.points[0].data.len());
+        }
+        
         let (medians, diffs) = self.block_data_to_sarray(true);
+        println!("Generated medians: {}, diffs: {}", medians.len(), diffs.len());
+        
         let mut node = BitFieldQuadTree {
             boundary: self.boundary.clone(),
             medians,
@@ -676,6 +670,7 @@ impl QuadTree {
         };
         
         if self.divided {
+            info!("Node is divided, computing children bit fields");
             if let Some(ref ne) = self.ne {
                 node.ne = Some(Box::new(ne.compute_quadtree_bit_fields()));
             }
@@ -691,57 +686,6 @@ impl QuadTree {
         }
         node
     }
-
-    fn calculate_size(&self) -> (usize, usize) {
-        let mut total_points = self.points.len();
-        let mut total_data_size = self.data.len() * std::mem::size_of::<f32>();
-        
-        if self.divided {
-            if let Some(ref nw) = self.nw {
-                let (points, data) = nw.calculate_size();
-                total_points += points;
-                total_data_size += data;
-            }
-            if let Some(ref ne) = self.ne {
-                let (points, data) = ne.calculate_size();
-                total_points += points;
-                total_data_size += data;
-            }
-            if let Some(ref se) = self.se {
-                let (points, data) = se.calculate_size();
-                total_points += points;
-                total_data_size += data;
-            }
-            if let Some(ref sw) = self.sw {
-                let (points, data) = sw.calculate_size();
-                total_points += points;
-                total_data_size += data;
-            }
-        }
-        
-        (total_points, total_data_size)
-    }
-
-    fn print_size_info(&self, depth: usize) {
-        let indent = "  ".repeat(depth);
-        let (points, data_size) = self.calculate_size();
-        info!("{}Level {}: {} points, {} bytes", indent, depth, points, data_size);
-        
-        if self.divided {
-            if let Some(ref nw) = self.nw {
-                nw.print_size_info(depth + 1);
-            }
-            if let Some(ref ne) = self.ne {
-                ne.print_size_info(depth + 1);
-            }
-            if let Some(ref se) = self.se {
-                se.print_size_info(depth + 1);
-            }
-            if let Some(ref sw) = self.sw {
-                sw.print_size_info(depth + 1);
-            }
-        }
-    }
 }
 
 fn tree_from_csv<T: AsRef<Path>>(
@@ -750,14 +694,14 @@ fn tree_from_csv<T: AsRef<Path>>(
     idx_y: usize,
     idx_gene_start: usize,
     idx_gene_end: Option<usize>,
-    method: ErrorMetric,
+    _method: ErrorMetric,
     _lossless: bool,
 ) -> anyhow::Result<QuadTree> {
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    let mut mind = Vec::new();
-    let mut maxd = Vec::new();
+    //let mut mind = Vec::new();
+    //let mut maxd = Vec::new();
 
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)  // Set to true to skip the header row
@@ -776,9 +720,9 @@ fn tree_from_csv<T: AsRef<Path>>(
     let num_columns = records[0].len();
     let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
     println!("num_columns: {}", num_columns);
-
     // Process all records
     for (i, record) in records.iter().enumerate() {
+        //println!("i: {:?}", i);
         // Read coordinates
         let x: f32 = record[idx_x].parse().map_err(|e| {
             anyhow::anyhow!("Failed to parse x coordinate at column {}: {}", idx_x, e)
@@ -790,23 +734,17 @@ fn tree_from_csv<T: AsRef<Path>>(
         ys.push(y);
 
         // Read gene expression data
-       // if record.len() <= idx_gene_end {
-         //   info!("Skipping record {}: insufficient columns (need {}, got {})", 
-           //       i, idx_gene_end + 1, record.len());
-            //  continue;
-        //}
-
         let mut cells = Vec::new();
         for j in idx_gene_start..idx_gene_end {
-            //check for NaN , set to max u16, THIS NEED TO BE CHANGED TO <NonMax16>
             let value: u16 = match record[j].parse::<f32>() {
                 Ok(v) => v as u16,
                 Err(e) => {
-                 //   info!("Found NaN at column {} with value '{}', replacing with u16::MAX", j, record[j].to_string());
                     0
                 }
             };
-            cells.push(value as f32);
+            cells.push(value);
+           // println!("cells: {:?}", cells);
+            /*
             if mind.len() <= j - idx_gene_start {
                 mind.push(value);
                 maxd.push(value);
@@ -814,6 +752,7 @@ fn tree_from_csv<T: AsRef<Path>>(
                 mind[j - idx_gene_start] = mind[j - idx_gene_start].min(value);
                 maxd[j - idx_gene_start] = maxd[j - idx_gene_start].max(value);
             }
+            */
         }
         coords.push(Point::new(x, y, cells));
     }
@@ -826,10 +765,10 @@ fn tree_from_csv<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 1);
-    let mind: Vec<u16> = mind.iter().map(|&x| x as u16).collect();
-    let maxd: Vec<u16> = maxd.iter().map(|&x| x as u16).collect();
-    qtree.divide(method, &mind, &maxd);
+    
+    // No need to convert since we're already using u16
+    let mut qtree = QuadTree::new(domain, coords, 0);
+    qtree.divide();
     Ok(qtree)
 }
 
@@ -843,23 +782,83 @@ fn tree_from_h5<T: AsRef<Path>>(
     // Read spatial coordinates from CSV
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
+        .flexible(true)  // Allow varying number of fields
         .from_path(spatial_path)
         .map_err(|e| anyhow::anyhow!("Failed to open spatial file: {}", e))?;
     
     let mut spatial_coords = HashMap::new();
     let mut spatial_count = 0;
+    let mut line_number = 0;
+    
+    // Print header row for debugging
+    if let Ok(header) = rdr.headers() {
+        info!("CSV Headers: {:?}", header);
+        info!("Number of columns in header: {}", header.len());
+    }
+    
     for result in rdr.records() {
-        let record = result?;
+        line_number += 1;
+        let record = result.map_err(|e| {
+            anyhow::anyhow!("Failed to read record at line {}: {}", line_number, e)
+        })?;
+        
+        // Print first few records for debugging
+        if line_number <= 5 {
+            info!("Record {}: {:?}", line_number, record);
+            info!("Number of fields in record: {}", record.len());
+        }
+        
+        if record.len() < 3 {
+            return Err(anyhow::anyhow!(
+                "Record at line {} has insufficient fields (need 3, got {})", 
+                line_number, record.len()
+            ));
+        }
+        
         let barcode = record[0].to_string();  // barcode is in first column
-        let x: f32 = record[1].parse()?;  // x coordinate
-        let y: f32 = record[2].parse()?;  // y coordinate
+        
+        // Debug print the raw values before parsing
+        if line_number <= 5 {
+            info!("Raw values for barcode {}: x='{}', y='{}'", 
+                barcode, record[1].to_string(), record[2].to_string());
+        }
+        
+        // Try to parse with more detailed error handling
+        let x_str = record[1].trim();
+        let y_str = record[2].trim();
+        
+        if x_str.is_empty() || y_str.is_empty() {
+            return Err(anyhow::anyhow!(
+                "Empty coordinate value at line {} for barcode {}: x='{}', y='{}'",
+                line_number, barcode, x_str, y_str
+            ));
+        }
+        
+        let x: f32 = x_str.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse x coordinate at line {} for barcode {}: '{}' - {}",
+                line_number, barcode, x_str, e
+            )
+        })?;
+        
+        let y: f32 = y_str.parse().map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to parse y coordinate at line {} for barcode {}: '{}' - {}",
+                line_number, barcode, y_str, e
+            )
+        })?;
+        
         spatial_coords.insert(barcode.clone(), (x, y));
         spatial_count += 1;
         if spatial_count <= 5 {
-            info!("Sample spatial barcode: {}", barcode);
+            info!("Successfully parsed barcode: {} at ({}, {})", barcode, x, y);
         }
     }
     info!("Read {} spatial coordinates", spatial_count);
+
+    if spatial_count == 0 {
+        return Err(anyhow::anyhow!("No valid coordinates found in the CSV file"));
+    }
 
     // Read H5AD file
     let file = File::open(h5_path)?;
@@ -937,16 +936,22 @@ fn tree_from_h5<T: AsRef<Path>>(
     for (cell_idx, barcode) in barcodes.iter().enumerate() {
         if let Some(&(x, y)) = spatial_coords.get(barcode) {
             // Initialize gene expression vector with zeros
-            let mut gene_expr = vec![0.0; num_genes];
+            let mut gene_expr = vec![0 as u16; num_genes];
             
             // Fill in non-zero values from sparse matrix
             let start = indptr[cell_idx];
             let end = indptr[cell_idx + 1];
             for i in start..end {
                 let gene_idx = indices[i];
-                gene_expr[gene_idx] = data[i];
+                if gene_idx >= num_genes {
+                    return Err(anyhow::anyhow!(
+                        "Gene index {} out of bounds (max: {}) for cell {}",
+                        gene_idx, num_genes - 1, cell_idx
+                    ));
+                }
+                gene_expr[gene_idx] = data[i] as u16;
             }
-            
+            println!("gene_expr: {:?}", gene_expr);
             points.push(Point::new(x, y, gene_expr));
             matched_count += 1;
             if matched_count <= 5 {
@@ -963,6 +968,10 @@ fn tree_from_h5<T: AsRef<Path>>(
     info!("Unmatched {} barcodes", unmatched_count);
     info!("Created {} points", points.len());
 
+    if points.is_empty() {
+        return Err(anyhow::anyhow!("No points were created - check if barcodes match between H5 and spatial files"));
+    }
+
     // Calculate boundaries
     let minx = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min) - 1.0;
     let miny = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - 1.0;
@@ -971,27 +980,12 @@ fn tree_from_h5<T: AsRef<Path>>(
     let w = maxx - minx;
     let h = maxy - miny;
 
+    info!("Spatial boundaries: x=[{}, {}], y=[{}, {}]", minx, maxx, miny, maxy);
+
     // Create quadtree
     let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
     let mut qtree = QuadTree::new(domain, points.clone(), 1);
-
-    // Calculate min/max values for each gene
-    let mut mind = Vec::new();
-    let mut maxd = Vec::new();
-    if !points.is_empty() {
-        for j in 0..points[0].data.len() {
-            let mut min_val = f32::INFINITY;
-            let mut max_val = f32::NEG_INFINITY;
-            for point in &points {
-                min_val = min_val.min(point.data[j]);
-                max_val = max_val.max(point.data[j]);
-            }
-            mind.push(min_val as u16);
-            maxd.push(max_val as u16);
-        }
-    }
-
-    qtree.divide(method, &mind, &maxd);
+    qtree.divide();
     Ok(qtree)
 }
 
@@ -1025,9 +1019,7 @@ struct CmdArgs {
     idx_gene_end: Option<usize>,
 }
 
-fn main() -> anyhow::Result<()> {
-    let start_time = Instant::now();
-    
+fn main() -> Result<(), Box<dyn Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
     // variable is not set then set the logging level to
@@ -1045,67 +1037,50 @@ fn main() -> anyhow::Result<()> {
 
     let args = CmdArgs::parse();
     let file_path = args.input;
-    
-    let read_start = Instant::now();
     let qtree = match args.format.as_str() {
         "csv" => {
+            // let file_path_pos = args.input_pos.ok_or_else(|| {
+            //    anyhow::anyhow!("Position file required for CSV format")
+            //})?;
             tree_from_csv(
                 file_path,
-                args.idx_x,
-                args.idx_y,
-                args.idx_gene_start,
-                args.idx_gene_end,
+                //file_path_pos,
+                5,  // idx_x
+                6,  // idx_y
+                1,  // idx_gene_start
+                None,  // idx_gene_end (will use all remaining columns)
                 ErrorMetric::Mean,
                 true
             )?
         }
-        "hdf5" => {
-            let file_path_pos = args.input_pos.ok_or_else(|| {
-                anyhow::anyhow!("Position file required for HDF5 format")
-            })?;
-            tree_from_h5(
-                file_path,
-                file_path_pos,
-                ErrorMetric::Mean,
-                true,
-                "10x"
-            )?
-        }
-        _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format)),
+       // "hdf5" => {
+           // let file_path_pos = args.input_pos.ok_or_else(|| {
+             //   anyhow::anyhow!("Position file required for HDF5 format")
+               //})?;
+            //tree_from_h5(
+              //  &args.input,
+                //file_path_pos,
+                //ErrorMetric::Mean,
+                //true,
+                //"10x"
+            //)?
+        //}
+        _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
     };
-    let read_duration = read_start.elapsed();
     
-    // Print size information for the original quadtree
-    info!("Original QuadTree size information:");
-    qtree.print_size_info(0);
-    info!("Time spent reading and building quadtree: {:?}", read_duration);
-    
-    let bitfield_start = Instant::now();
-    let bit_field_tree = qtree.compute_quadtree_bit_fields();
-    let bitfield_duration = bitfield_start.elapsed();
-    
-    // Print size information for the bit field tree
-    info!("BitField QuadTree size information:");
-    bit_field_tree.print_size_info(0);
-    info!("Time spent computing bit fields: {:?}", bitfield_duration);
-    
-    let write_start = Instant::now();
+    // You can decide whether to serialize the original tree or the bit fields or both
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
     let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
     let mut file = StdFile::create(ofname).unwrap();
+    //let mut encoder = GzEncoder::new(file, Compression::default());
+    let bit_field_tree = qtree.compute_quadtree_bit_fields();
     bincode::encode_into_std_write(&bit_field_tree, &mut file, config).unwrap();
-    let write_duration = write_start.elapsed();
-    info!("Time spent writing output: {:?}", write_duration);
-    
     info!(
-        "QuadTree Blocks: {} (non-zero blocks: {})",
-        qtree.blocks(),
+        "QuadTree Blocks: (non-zero blocks: {})",
+        //qtree.blocks(),
         qtree.non_zero_blocks()
     );
-    
-    let total_duration = start_time.elapsed();
-    info!("Total execution time: {:?}", total_duration);
     Ok(())
 }
