@@ -1,7 +1,231 @@
 use bincode::{BorrowDecode, Decode, Encode};
 use sux::prelude::BitFieldVec;
+use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info};
+
+#[derive(Clone)]
+pub struct EncodedDiffs {
+    pub gene_indices: BitFieldVec,
+    pub cell_indices: BitFieldVec,
+    pub diffs: BitFieldVec,
+    pub medians: BitFieldVec,
+}
+
+impl EncodedDiffs {
+    pub fn empty() -> Self {
+        EncodedDiffs {
+            gene_indices: BitFieldVec::with_capacity(0, 0),
+            cell_indices: BitFieldVec::with_capacity(0, 0),
+            diffs: BitFieldVec::with_capacity(0, 0),
+            medians: BitFieldVec::with_capacity(0, 0),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    pub fn num_medians(&self) -> usize {
+        self.medians.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.diffs.len()
+    }
+
+    pub fn bytes(&self) -> usize {
+        let diff_bits = self.diffs.len() * self.diffs.bit_width();
+        let ci_bits = self.cell_indices.len() * self.cell_indices.bit_width();
+        let gi_bits = self.gene_indices.len() * self.gene_indices.bit_width();
+        let m_bits = self.medians.len() * self.medians.bit_width();
+        (diff_bits + ci_bits + gi_bits + m_bits) / 8
+    }
+}
+
+// Manual implementation of de/serialization for `Rect`.
+// We don't need to store the edges since they can computed from the other fields.
+impl Encode for EncodedDiffs {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        let (b, w, l) = self.gene_indices.clone().into_raw_parts();
+        Encode::encode(&b, encoder)?;
+        Encode::encode(&w, encoder)?;
+        Encode::encode(&l, encoder)?;
+
+        let (b, w, l) = self.cell_indices.clone().into_raw_parts();
+        Encode::encode(&b, encoder)?;
+        Encode::encode(&w, encoder)?;
+        Encode::encode(&l, encoder)?;
+
+        let (b, w, l) = self.diffs.clone().into_raw_parts();
+        Encode::encode(&b, encoder)?;
+        Encode::encode(&w, encoder)?;
+        Encode::encode(&l, encoder)?;
+
+        let (b, w, l) = self.medians.clone().into_raw_parts();
+        Encode::encode(&b, encoder)?;
+        Encode::encode(&w, encoder)?;
+        Encode::encode(&l, encoder)?;
+        Ok(())
+    }
+}
+
+impl<Context> Decode<Context> for EncodedDiffs {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
+        let data = Decode::decode(decoder)?;
+        let w = Decode::decode(decoder)?;
+        let l = Decode::decode(decoder)?;
+        let gene_indices = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+
+        let data = Decode::decode(decoder)?;
+        let w = Decode::decode(decoder)?;
+        let l = Decode::decode(decoder)?;
+        let cell_indices = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+
+        let data = Decode::decode(decoder)?;
+        let w = Decode::decode(decoder)?;
+        let l = Decode::decode(decoder)?;
+        let diffs = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+
+        let data = Decode::decode(decoder)?;
+        let w = Decode::decode(decoder)?;
+        let l = Decode::decode(decoder)?;
+        let medians = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+
+        Ok(Self {
+            gene_indices,
+            cell_indices,
+            diffs,
+            medians,
+        })
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let data = BorrowDecode::borrow_decode(decoder)?;
+        let width = BorrowDecode::borrow_decode(decoder)?;
+        let len = BorrowDecode::borrow_decode(decoder)?;
+        let gene_indices = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+
+        let data = BorrowDecode::borrow_decode(decoder)?;
+        let width = BorrowDecode::borrow_decode(decoder)?;
+        let len = BorrowDecode::borrow_decode(decoder)?;
+        let cell_indices = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+
+        let data = BorrowDecode::borrow_decode(decoder)?;
+        let width = BorrowDecode::borrow_decode(decoder)?;
+        let len = BorrowDecode::borrow_decode(decoder)?;
+        let diffs = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+
+        let data = BorrowDecode::borrow_decode(decoder)?;
+        let width = BorrowDecode::borrow_decode(decoder)?;
+        let len = BorrowDecode::borrow_decode(decoder)?;
+        let medians = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+
+        Ok(Self {
+            gene_indices,
+            cell_indices,
+            diffs,
+            medians,
+        })
+    }
+}
+
+/// Takes a slice of points and applies delta encoding from the median value
+/// along the "gene" axis.  That is, each coordinate of the point is encoded
+/// with respect to the difference from the median of points amongst all points
+/// along that axis/coordinate.
+/// Returns a `Some(EncodedDiff)` struct representing the encoded differences or `None`
+/// if the slice is empty.
+pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
+    if points.is_empty() {
+        debug!("Empty points array in encode_subarray()");
+        return None;
+    }
+
+    let mut gene_indices = Vec::<u32>::new();
+    let mut cell_indices = Vec::<u32>::new();
+    let mut medians = Vec::<u16>::new();
+    let mut raw_diffs = Vec::<u32>::new();
+    let mut max_diff = 0_i32;
+
+    debug!("Processing {} points in encode_subarray()", points.len());
+    debug!("Number of genes: {}", points[0].data.len());
+
+    // for each gene
+    for j in 0..points[0].data.len() {
+        // get the non-zero values and the non-zero indices
+        let (nz_values, nz_inds): (Vec<u16>, Vec<u32>) = points
+            .iter()
+            .enumerate()
+            .filter_map(|(i, p)| {
+                if p.data[j] > 0 {
+                    Some((p.data[j], i as u32))
+                } else {
+                    None
+                }
+            })
+            .unzip(); // Keep only non-zero values
+
+        let median = if !nz_values.is_empty() {
+            let mut sorted_values = nz_values.clone();
+            sorted_values.sort_unstable();
+            sorted_values[sorted_values.len() / 2] //median of the expressed values
+        } else {
+            0
+        };
+
+        if median == 0 {
+            // all cells in this dataset had a 0 for this gene
+            continue;
+        } else {
+            gene_indices.push(cell_indices.len() as u32);
+            medians.push(median); // Use push instead of append
+
+            // Find min and max diffs
+            for (value, cell_ind) in nz_values.iter().zip(nz_inds.iter()) {
+                let diff = *value as i32 - median as i32;
+                let diff = if diff < 0 {
+                    (-2_i32 * diff) + 1
+                } else {
+                    2_i32 * diff
+                };
+                raw_diffs.push(diff as u32);
+                cell_indices.push(*cell_ind);
+                max_diff = max_diff.max(diff);
+            }
+        }
+    }
+    gene_indices.push(cell_indices.len() as u32);
+
+    let gene_indices = BitFieldVec::<usize>::from_slice(&gene_indices).expect("should fit");
+    let cell_indices = BitFieldVec::<usize>::from_slice(&cell_indices).expect("should fit");
+    let medians = BitFieldVec::<usize>::from_slice(&medians).expect("should fit");
+    let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
+
+    let enc_diffs = EncodedDiffs {
+        gene_indices,
+        cell_indices,
+        diffs,
+        medians,
+    };
+
+    info!(
+        "Generated {} medians and {} diffs in {} bytes",
+        enc_diffs.num_medians(),
+        enc_diffs.len(),
+        enc_diffs.bytes()
+    );
+    Some(enc_diffs)
+}
 
 #[derive(Debug, Copy, Clone)]
 pub enum ErrorMetric {
@@ -39,6 +263,8 @@ impl PointLike for Point {
     }
 }
 
+/// A point that has just its 2D coordinates, but does not
+/// carry with it any additional data.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct DatalessPoint {
     x: f32,
@@ -211,8 +437,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for BitField {
 #[derive(Encode, Decode, Clone)]
 pub struct BitFieldQuadTree {
     boundary: Rect,
-    medians: Vec<u16>,
-    data: Vec<BitField>,
+    encoded_diffs: EncodedDiffs,
     divided: bool,
     nw: Option<Box<BitFieldQuadTree>>,
     ne: Option<Box<BitFieldQuadTree>>,
@@ -225,8 +450,7 @@ impl BitFieldQuadTree {
     pub fn new(boundary: Rect) -> Self {
         Self {
             boundary,
-            medians: Vec::new(),
-            data: Vec::new(),
+            encoded_diffs: EncodedDiffs::empty(),
             divided: false,
             nw: None,
             ne: None,
@@ -236,28 +460,17 @@ impl BitFieldQuadTree {
         }
     }
 
-    pub fn calculate_expense(&self) -> u32 {
-        let mut expense: u32 = 0;
+    pub fn calculate_expense(&self) -> usize {
         info!(
-            "Calculating expense for BitFieldQuadTree node with {} medians and {} bitfields",
-            self.medians.len(),
-            self.data.len()
+            "Calculating expense for BitFieldQuadTree node with {} total points and size {} bytes",
+            self.encoded_diffs.len(),
+            self.encoded_diffs.bytes()
         );
-
-        for (i, bitfield) in self.data.iter().enumerate() {
-            let (_, width, len) = bitfield.bit_field.clone().into_raw_parts();
-            let bit_expense = width as u32 * len as u32;
-            expense += bit_expense;
-            info!(
-                "Bitfield {}: width={}, len={}, expense={}",
-                i, width, len, bit_expense
-            );
-        }
-
-        info!("Total node expense: {}", expense);
-        expense
+        info!("Total node expense: {}", self.encoded_diffs.bytes());
+        self.encoded_diffs.bytes()
     }
 
+    /*
     pub fn to_quad_tree(&self) -> QuadTree {
         let mut quadtree = QuadTree::new(self.boundary.clone(), Vec::new(), 0);
         quadtree.divided = self.divided;
@@ -287,17 +500,22 @@ impl BitFieldQuadTree {
         }
         quadtree
     }
+    */
 
     pub fn calculate_size(&self) -> (usize, usize) {
         let mut total_size = 0;
         let mut total_bitfields = 0;
 
         // Calculate size of current node's data
+        total_size += self.encoded_diffs.bytes();
+        total_bitfields += 1;
+        /*
         for bitfield in &self.data {
             let (_, width, len) = bitfield.bit_field.clone().into_raw_parts();
             total_size += width * len;
             total_bitfields += 1;
         }
+        */
 
         if self.divided {
             if let Some(ref nw) = self.nw {
@@ -395,6 +613,9 @@ impl QuadTree {
             }
         }
 
+        // we already include the points above, why query
+        // the children (which we already contain)?
+        /*
         if self.divided {
             if let Some(ref nw) = self.nw {
                 found_points.extend(nw.query(boundary));
@@ -409,6 +630,7 @@ impl QuadTree {
                 found_points.extend(sw.query(boundary));
             }
         }
+        */
         found_points
     }
 
@@ -478,6 +700,11 @@ impl QuadTree {
             println!("Initial number of genes: {}", self.points[0].data.len());
         }
 
+        // nothing to do if this subtree is empty
+        if self.points.is_empty() {
+            return;
+        }
+
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self
             .points
@@ -486,12 +713,18 @@ impl QuadTree {
             .collect();
 
         // Convert current node to BitFieldQuadTree to calculate expense
-        let current_bit_tree = self.compute_quadtree_bit_fields();
-        println!(
-            "current_bit_tree.medians.len(): {}",
-            current_bit_tree.medians.len()
+        info!(
+            "calling compute_quadtree_bit_fields on a tree with {} points",
+            self.points.len()
         );
-        let current_expense = current_bit_tree.calculate_expense();
+
+        /*println!(
+            "current_bit_tree.medians.len(): {}",
+            current_bit_tree.encoded_diffs.num_medians()
+        );
+        */
+        let current_expense = encode_subarray(&self.points).map_or(0, |x| x.bytes());
+        info!("expense of current node is {}", current_expense);
 
         // Find the children of the current node
         let cx = self.boundary.cx;
@@ -552,18 +785,14 @@ impl QuadTree {
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
 
         // Convert children to BitFieldQuadTree to calculate their expenses
-        let nw_bit_tree = nw.compute_quadtree_bit_fields();
-        let ne_bit_tree = ne.compute_quadtree_bit_fields();
-        let se_bit_tree = se.compute_quadtree_bit_fields();
-        let sw_bit_tree = sw.compute_quadtree_bit_fields();
+        let nw_expense = encode_subarray(&nw.points).map_or(0, |x| x.bytes());
+        let ne_expense = encode_subarray(&ne.points).map_or(0, |x| x.bytes());
+        let se_expense = encode_subarray(&se.points).map_or(0, |x| x.bytes());
+        let sw_expense = encode_subarray(&sw.points).map_or(0, |x| x.bytes());
 
-        let nw_expense = nw_bit_tree.calculate_expense();
         println!("NW expense: {}", nw_expense);
-        let ne_expense = ne_bit_tree.calculate_expense();
         println!("NE expense: {}", ne_expense);
-        let se_expense = se_bit_tree.calculate_expense();
         println!("SE expense: {}", se_expense);
-        let sw_expense = sw_bit_tree.calculate_expense();
         println!("SW expense: {}", sw_expense);
 
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
@@ -571,10 +800,26 @@ impl QuadTree {
         if total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
-            self.nw = Some(Box::new(nw_bit_tree.to_quad_tree()));
-            self.ne = Some(Box::new(ne_bit_tree.to_quad_tree()));
-            self.se = Some(Box::new(se_bit_tree.to_quad_tree()));
-            self.sw = Some(Box::new(sw_bit_tree.to_quad_tree()));
+            self.nw = if !nw.points.is_empty() {
+                Some(Box::new(nw))
+            } else {
+                None
+            };
+            self.ne = if !ne.points.is_empty() {
+                Some(Box::new(ne))
+            } else {
+                None
+            };
+            self.se = if !se.points.is_empty() {
+                Some(Box::new(se))
+            } else {
+                None
+            };
+            self.sw = if !sw.points.is_empty() {
+                Some(Box::new(sw))
+            } else {
+                None
+            };
 
             // Only clear points after we've used them for all necessary operations
             self.points = Vec::new();
@@ -709,17 +954,18 @@ impl QuadTree {
             );
         }
 
-        let (medians, diffs) = self.block_data_to_sarray(true);
+        /*
         debug!(
             "Generated medians: {}, diffs: {}",
             medians.len(),
             diffs.len()
         );
-
+        */
         let mut node = BitFieldQuadTree {
             boundary: self.boundary.clone(),
-            medians,
-            data: diffs,
+            encoded_diffs: EncodedDiffs::empty(),
+            //medians,
+            //data: diffs,
             divided: self.divided,
             nw: None,
             ne: None,
@@ -742,6 +988,8 @@ impl QuadTree {
             if let Some(ref sw) = self.sw {
                 node.sw = Some(Box::new(sw.compute_quadtree_bit_fields()));
             }
+        } else {
+            node.encoded_diffs = encode_subarray(&self.points).expect("nonempty");
         }
         node
     }
