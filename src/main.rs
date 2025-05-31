@@ -476,9 +476,10 @@ impl QuadTree {
             .collect();
 
         // Convert current node to BitFieldQuadTree to calculate expense
-        let current_bit_tree = self.compute_quadtree_bit_fields();
-        println!("current_bit_tree.medians.len(): {}", current_bit_tree.medians.len());
-        let current_expense = current_bit_tree.calculate_expense();
+       // let current_bit_tree = self.compute_quadtree_bit_fields();
+        //println!("current_bit_tree.medians.len(): {}", current_bit_tree.medians.len());
+       // let current_expense = current_bit_tree.calculate_expense();
+        let current_expense = self.calculate_expense();
 
         // Find the children of the current node
         let cx = self.boundary.cx;
@@ -515,57 +516,55 @@ impl QuadTree {
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
 
         // Convert children to BitFieldQuadTree to calculate their expenses
-        let nw_bit_tree = nw.compute_quadtree_bit_fields();
-        let ne_bit_tree = ne.compute_quadtree_bit_fields();
-        let se_bit_tree = se.compute_quadtree_bit_fields();
-        let sw_bit_tree = sw.compute_quadtree_bit_fields();
+        //let nw_bit_tree = nw.compute_quadtree_bit_fields();
+        //let ne_bit_tree = ne.compute_quadtree_bit_fields();
+        //let se_bit_tree = se.compute_quadtree_bit_fields();
+        //let sw_bit_tree = sw.compute_quadtree_bit_fields();
 
-        let nw_expense = nw_bit_tree.calculate_expense();
-        println!("NW expense: {}", nw_expense);
-        let ne_expense = ne_bit_tree.calculate_expense();
-        println!("NE expense: {}", ne_expense);
-        let se_expense = se_bit_tree.calculate_expense();
-        println!("SE expense: {}", se_expense);
-        let sw_expense = sw_bit_tree.calculate_expense();
-        println!("SW expense: {}", sw_expense);
+        //let nw_expense = nw_bit_tree.calculate_expense();
+        //println!("NW expense: {}", nw_expense);
+        //let ne_expense = ne_bit_tree.calculate_expense();
+        //println!("NE expense: {}", ne_expense);
+        //let se_expense = se_bit_tree.calculate_expense();
+        //println!("SE expense: {}", se_expense);
+        //let sw_expense = sw_bit_tree.calculate_expense();
+        //println!("SW expense: {}", sw_expense);
 
+        let nw_expense = nw.calculate_expense();
+        let ne_expense = ne.calculate_expense();
+        let se_expense = se.calculate_expense();
+        let sw_expense = sw.calculate_expense();
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
 
         if total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
-            self.nw = Some(Box::new(nw_bit_tree.to_quad_tree()));
-            self.ne = Some(Box::new(ne_bit_tree.to_quad_tree()));
-            self.se = Some(Box::new(se_bit_tree.to_quad_tree()));
-            self.sw = Some(Box::new(sw_bit_tree.to_quad_tree()));
-            
+            //self.nw = Some(Box::new(nw_bit_tree.to_quad_tree()));
+            //self.ne = Some(Box::new(ne_bit_tree.to_quad_tree()));
+            //self.se = Some(Box::new(se_bit_tree.to_quad_tree()));
+            //self.sw = Some(Box::new(sw_bit_tree.to_quad_tree()));
+            self.nw = Some(Box::new(nw));
+            self.ne = Some(Box::new(ne));
+            self.se = Some(Box::new(se));
+            self.sw = Some(Box::new(sw));
+            self.nw.as_mut().unwrap().divide();
+            self.ne.as_mut().unwrap().divide();
+            self.se.as_mut().unwrap().divide();
+            self.sw.as_mut().unwrap().divide();
             // Only clear points after we've used them for all necessary operations
             self.points = Vec::new();
-        
-            if let Some(ref mut nw) = self.nw {
-                nw.divide();
-            }
-            if let Some(ref mut ne) = self.ne {
-                ne.divide();
-            }
-            if let Some(ref mut se) = self.se {
-                se.divide();
-            }
-            if let Some(ref mut sw) = self.sw {
-                sw.divide();
-            }
+            println!("self.depth: {}", self.depth);
         } else {
             self.divided = false;
             if !self.points.is_empty() {
-                info!("Leaf node with {} points", self.points.len());
-                println!("Leaf node - points: {}, genes: {}", 
+                //  info!("Leaf node with {} points", self.points.len());
+                println!("DO NOT DIVIDELeaf node - points: {}, genes: {}", 
                     self.points.len(), 
                     self.points[0].data.len());
                 self.positions = positions; // Use the stored positions
                 // Keep the points for bit field representation
             }
         }    
-        println!("self.depth: {}", self.depth);
     }
 
     fn non_zero_blocks(&self) -> usize {
@@ -613,7 +612,6 @@ impl QuadTree {
                 0
             };
             
-            sarray.push(median); 
             let mut max_diff = 0;
                 
             // Find min and max diffs
@@ -626,7 +624,6 @@ impl QuadTree {
             let bit_expense = bit_width as u32 * values.len() as u32;
             expense += bit_expense;
             // expense for index also needed 
-            }
         }
         println!("expense: {}", expense);
         expense
