@@ -693,7 +693,7 @@ impl QuadTree {
             }
         }
 
-        info!("Generated {} medians and {} diffs", sarray.len(), diffs.len());
+        //info!("Generated {} medians and {} diffs", sarray.len(), diffs.len());
         (sarray, diffs)
     }
 
@@ -719,7 +719,7 @@ impl QuadTree {
         };
         
         if self.divided {
-            info!("Node is divided, computing children bit fields");
+            //info!("Node is divided, computing children bit fields");
             if let Some(ref ne) = self.ne {
                 node.ne = Some(Box::new(ne.compute_quadtree_bit_fields()));
             }
@@ -842,7 +842,7 @@ fn tree_from_h5<T: AsRef<Path>>(
     
     // Print header row for debugging
     if let Ok(header) = rdr.headers() {
-        info!("CSV Headers: {:?}", header);
+       // info!("CSV Headers: {:?}", header);
         info!("Number of columns in header: {}", header.len());
     }
     
@@ -853,7 +853,7 @@ fn tree_from_h5<T: AsRef<Path>>(
         })?;
         
         // Print first few records for debugging
-        if line_number <= 5 {
+        if line_number <= 3 {
             info!("Record {}: {:?}", line_number, record);
             info!("Number of fields in record: {}", record.len());
         }
