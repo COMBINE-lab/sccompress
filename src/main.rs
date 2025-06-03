@@ -462,15 +462,12 @@ impl QuadTree {
         maxerrors.iter().fold(0.0, |a, &b| f32::max(a, b))
     }  
 */
-
+//smt wrong with depth, it is decreasing and begins with 20
     fn divide(&mut self) {
-        info!("Processing node with {} points", self.points.len());
-        println!("self.points.len(): {}", self.points.len());
+        //info!("Processing node with {} points", self.points.len());
         if !self.points.is_empty() {
-            println!("Initial number of genes: {}", self.points[0].data.len());
-        }else{
-
-        
+            println!("self.points.len(): {}", self.points.len());
+            //println!("Non-empty points array in divide");
         
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self.points.iter()
@@ -491,30 +488,24 @@ impl QuadTree {
 
         let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
         let nw_points = self.query(&nw_boundary);
-        println!("NW points: {}, genes per point: {}", 
-            nw_points.len(), 
-            if !nw_points.is_empty() { nw_points[0].data.len() } else { 0 });
+        //println!("NW points: {}, genes per point: {}", nw_points.len(), if !nw_points.is_empty() { nw_points[0].data.len() } else { 0 });
         let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
 
         let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
         let ne_points = self.query(&ne_boundary);
-        println!("NE points: {}, genes per point: {}", 
-            ne_points.len(), 
-            if !ne_points.is_empty() { ne_points[0].data.len() } else { 0 });
+        //println!("NE points: {}, genes per point: {}", ne_points.len(), if !ne_points.is_empty() { ne_points[0].data.len() } else { 0 });
         let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
 
         let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
         let se_points = self.query(&se_boundary);
-        println!("SE points: {}, genes per point: {}", 
-            se_points.len(), 
-            if !se_points.is_empty() { se_points[0].data.len() } else { 0 });
+        //println!("SE points: {}, genes per point: {}", se_points.len(), if !se_points.is_empty() { se_points[0].data.len() } else { 0 });
         let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
 
         let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
         let sw_points = self.query(&sw_boundary);
-        println!("SW points: {}, genes per point: {}", 
-            sw_points.len(), 
-            if !sw_points.is_empty() { sw_points[0].data.len() } else { 0 });
+       //println!("SW points: {}, genes per point: {}", 
+        //    sw_points.len(), 
+        //    if !sw_points.is_empty() { sw_points[0].data.len() } else { 0 });
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
 
         // Convert children to BitFieldQuadTree to calculate their expenses
@@ -537,8 +528,10 @@ impl QuadTree {
         let se_expense = se.calculate_expense();
         let sw_expense = sw.calculate_expense();
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
-        
+        //println!("total_expense: {}", total_expense);
+        //println!("current_expense: {}", current_expense);
         if total_expense < current_expense {
+            //println!("Dividing node with total expense: {}", total_expense);
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
             //self.nw = Some(Box::new(nw_bit_tree.to_quad_tree()));
@@ -560,9 +553,7 @@ impl QuadTree {
             self.divided = false;
             if !self.points.is_empty() {
                 //  info!("Leaf node with {} points", self.points.len());
-                println!("DO NOT DIVIDELeaf node - points: {}, genes: {}", 
-                    self.points.len(), 
-                    self.points[0].data.len());
+                //println!("DO NOT DIVIDELeaf node - points: {}, genes: {}", self.points.len(), self.points[0].data.len());
                 self.positions = positions; // Use the stored positions
                 // Keep the points for bit field representation
             }
@@ -595,6 +586,7 @@ impl QuadTree {
 
     fn calculate_expense(&self) -> u32 {
         let mut expense: u32 = 0;
+        if !self.points.is_empty() {
         for j in 0..self.points[0].data.len() { // for each gene
             // Collect non-zero values and find max difference in a single pass
             let mut values = Vec::with_capacity(self.points.len());
@@ -622,7 +614,7 @@ impl QuadTree {
             if median != 0 {
             // Find min and max diffs
                 let mut min_diff = 0;
-                let mut max_diff = 0;
+                let mut max_diff = median as i32;
                 for &value in &values {
                     let diff = (value as i32).wrapping_sub(median as i32);
                     min_diff = min_diff.min(diff);
@@ -630,14 +622,15 @@ impl QuadTree {
                 }
             //println!("median: {}", median);
             //println!("max_diff: {}", max_diff);
-                let bit_width = (max_diff as u32).ilog2() as usize + 1;
+                let bit_width = (max_diff as u16).ilog2() + 1;
             //println!("bit_width: {}", bit_width);
                 let bit_expense = bit_width as u32 * values.len() as u32;
                 expense += bit_expense; 
             }
             // expense for index also needed 
         }
-        println!("expense: {}", expense);
+            //println!("expense: {}", expense);
+        }
         expense
     }
     
@@ -647,12 +640,12 @@ impl QuadTree {
         let mut diffs = Vec::new();
 
         if self.points.is_empty() {
-            println!("Empty points array in block_data_to_sarray");
+           // println!("Empty points array in block_data_to_sarray");
             return (sarray, diffs);
         }
 
-        println!("Processing {} points in block_data_to_sarray", self.points.len());
-        println!("Number of genes: {}", self.points[0].data.len());
+        //println!("Processing {} points in block_data_to_sarray", self.points.len());
+        //println!("Number of genes: {}", self.points[0].data.len());
 
         for j in 0..self.points[0].data.len() { // for each gene
             let values: Vec<u16> = self.points.iter()
@@ -676,16 +669,16 @@ impl QuadTree {
             
             if median != 0 { // this is not needed if only non-zero values are considered
                 sarray.push(median);  
-                let mut max_diff = 0;
+                let mut max_diff = median as i32;
                 let mut min_diff = 0;
                 // Find min and max diffs and shift the values to have non-negative values
                 for &value in &values {
                     let diff = value.wrapping_sub(median);
-                    min_diff = min_diff.min(diff as usize);
-                    max_diff = max_diff.max(diff as usize);
+                    min_diff = min_diff.min(diff as i32);
+                    max_diff = max_diff.max(diff as i32);
                 }
 
-                let bit_width = (max_diff as u16).ilog2() as usize + 1;
+                let bit_width = max_diff.ilog2() as usize + 1;
                 //println!("Gene {}: median={}, bit_width={}, min_diff={}, max_diff={}", 
                 //    j, median, bit_width, min_diff, max_diff);
                 
@@ -705,13 +698,13 @@ impl QuadTree {
     }
 
     fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
-        println!("Computing bit fields - points available: {}", self.points.len());
+        //println!("Computing bit fields - points available: {}", self.points.len());
         if !self.points.is_empty() {
-            println!("Computing bit fields - genes per point: {}", self.points[0].data.len());
+            //println!("Computing bit fields - genes per point: {}", self.points[0].data.len());
         }
         
         let (medians, diffs) = self.block_data_to_sarray(true);
-        println!("Generated medians: {}, diffs: {}", medians.len(), diffs.len());
+        //println!("Generated medians: {}, diffs: {}", medians.len(), diffs.len());
         
         let mut node = BitFieldQuadTree {
             boundary: self.boundary.clone(),
@@ -770,12 +763,12 @@ fn tree_from_csv<T: AsRef<Path>>(
     let records: Vec<_> = rdr.records().collect::<Result<Vec<_>, _>>()
         .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?;
     
-    println!("Total records read: {}", records.len());
+    //println!("Total records read: {}", records.len());
 
     // Get the number of columns from the first record
     let num_columns = records[0].len();
     let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
-    println!("num_columns: {}", num_columns);
+    //println!("num_columns: {}", num_columns);
     // Process all records
     for (i, record) in records.iter().enumerate() {
         //println!("i: {:?}", i);
@@ -824,6 +817,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     
     // No need to convert since we're already using u16
     let mut qtree = QuadTree::new(domain, coords, 0);
+    //println!("Dividing tree");
     qtree.divide();
     Ok(qtree)
 }
@@ -1007,7 +1001,7 @@ fn tree_from_h5<T: AsRef<Path>>(
                 }
                 gene_expr[gene_idx] = data[i] as u16;
             }
-            println!("gene_expr: {:?}", gene_expr);
+            //println!("gene_expr: {:?}", gene_expr);
             points.push(Point::new(x, y, gene_expr));
             matched_count += 1;
             if matched_count <= 5 {
@@ -1098,6 +1092,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             // let file_path_pos = args.input_pos.ok_or_else(|| {
             //    anyhow::anyhow!("Position file required for CSV format")
             //})?;
+            println!("Reading CSV file: {}", file_path.display());
             tree_from_csv(
                 file_path,
                 //file_path_pos,
