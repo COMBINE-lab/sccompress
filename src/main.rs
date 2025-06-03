@@ -468,7 +468,9 @@ impl QuadTree {
         println!("self.points.len(): {}", self.points.len());
         if !self.points.is_empty() {
             println!("Initial number of genes: {}", self.points[0].data.len());
-        }
+        }else{
+
+        
         
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self.points.iter()
@@ -535,7 +537,7 @@ impl QuadTree {
         let se_expense = se.calculate_expense();
         let sw_expense = sw.calculate_expense();
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
-
+        
         if total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
@@ -565,6 +567,7 @@ impl QuadTree {
                 // Keep the points for bit field representation
             }
         }    
+        }
     }
 
     fn non_zero_blocks(&self) -> usize {
@@ -593,10 +596,14 @@ impl QuadTree {
     fn calculate_expense(&self) -> u32 {
         let mut expense: u32 = 0;
         for j in 0..self.points[0].data.len() { // for each gene
-            let values: Vec<u16> = self.points.iter()
-                .map(|p| p.data[j])
-                .filter(|&v| v != 0)
-                .collect(); // Keep only non-zero values
+            // Collect non-zero values and find max difference in a single pass
+            let mut values = Vec::with_capacity(self.points.len());
+            for point in &self.points {
+                let val = point.data[j];
+                if val != 0 {
+                    values.push(val);
+                }
+            }
 
             let median = if !values.is_empty() {
                 let mut sorted_values = values.clone();
@@ -611,18 +618,23 @@ impl QuadTree {
             } else {
                 0
             };
-            
-            let mut max_diff = 0;
-                
-            // Find min and max diffs
-            for &value in &values {
-                let diff = value.wrapping_sub(median);
-                max_diff = max_diff.max(diff as usize);
-            }
 
-            let bit_width = (max_diff as u16).ilog2() as usize + 1;
-            let bit_expense = bit_width as u32 * values.len() as u32;
-            expense += bit_expense;
+            if median != 0 {
+            // Find min and max diffs
+                let mut min_diff = 0;
+                let mut max_diff = 0;
+                for &value in &values {
+                    let diff = (value as i32).wrapping_sub(median as i32);
+                    min_diff = min_diff.min(diff);
+                    max_diff = max_diff.max(diff);
+                }
+            //println!("median: {}", median);
+            //println!("max_diff: {}", max_diff);
+                let bit_width = (max_diff as u32).ilog2() as usize + 1;
+            //println!("bit_width: {}", bit_width);
+                let bit_expense = bit_width as u32 * values.len() as u32;
+                expense += bit_expense; 
+            }
             // expense for index also needed 
         }
         println!("expense: {}", expense);
@@ -663,12 +675,13 @@ impl QuadTree {
             };
             
             if median != 0 { // this is not needed if only non-zero values are considered
-                sarray.push(median);  // Use push instead of append
+                sarray.push(median);  
                 let mut max_diff = 0;
-                
-                // Find min and max diffs
+                let mut min_diff = 0;
+                // Find min and max diffs and shift the values to have non-negative values
                 for &value in &values {
                     let diff = value.wrapping_sub(median);
+                    min_diff = min_diff.min(diff as usize);
                     max_diff = max_diff.max(diff as usize);
                 }
 
