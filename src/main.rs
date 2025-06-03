@@ -242,26 +242,9 @@ impl BitFieldQuadTree {
             positions: Vec::new(),
         }
     }
-
-    fn calculate_expense(&self) -> u32 {
-        let mut expense: u32 = 0;
-        info!("Calculating expense for BitFieldQuadTree node with {} medians and {} bitfields", 
-            self.medians.len(), self.data.len());
-        
-        for (i, bitfield) in self.data.iter().enumerate() {    
-            let (_, width, len) = bitfield.bit_field.clone().into_raw_parts();
-            let bit_expense = width as u32 * len as u32;
-            expense += bit_expense;
-            info!("Bitfield {}: width={}, len={}, expense={}", 
-                i, width, len, bit_expense);
-        }
-        
-        info!("Total node expense: {}", expense);
-        expense
-    }
     
     fn to_quad_tree(&self) -> QuadTree {
-        let mut quadtree = QuadTree::new(self.boundary.clone(), Vec::new(), 0);
+        let mut quadtree = QuadTree::new(self.boundary.clone(), Vec::new());
         quadtree.divided = self.divided;
         // Convert the raw parts into f32 values to meet the QuadTree requirements
         quadtree.data = self.data.iter().map(|bf| {
@@ -349,9 +332,9 @@ impl BitFieldQuadTree {
 struct QuadTree {
     boundary: Rect,
     points: Vec<Point>,
-    depth: usize,
+   // depth: usize,
     divided: bool,
-    maxerror: Option<f32>,
+    //maxerror: Option<f32>,
     nw: Option<Box<Self>>,
     ne: Option<Box<Self>>,
     se: Option<Box<Self>>,
@@ -362,13 +345,13 @@ struct QuadTree {
 
 impl QuadTree {
     #[inline(always)]
-    const fn new(boundary: Rect, points: Vec<Point>, depth: usize) -> Self {
+    const fn new(boundary: Rect, points: Vec<Point>) -> Self {
         Self {
             boundary,
             points,
-            depth,
+            //depth,
             divided: false,
-            maxerror: None,
+            //maxerror: None,
             nw: None,
             ne: None,
             se: None,
@@ -489,24 +472,24 @@ impl QuadTree {
         let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
         let nw_points = self.query(&nw_boundary);
         //println!("NW points: {}, genes per point: {}", nw_points.len(), if !nw_points.is_empty() { nw_points[0].data.len() } else { 0 });
-        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
+        let nw = QuadTree::new(nw_boundary, nw_points);
 
         let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
         let ne_points = self.query(&ne_boundary);
         //println!("NE points: {}, genes per point: {}", ne_points.len(), if !ne_points.is_empty() { ne_points[0].data.len() } else { 0 });
-        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
+        let ne = QuadTree::new(ne_boundary, ne_points);
 
         let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
         let se_points = self.query(&se_boundary);
         //println!("SE points: {}, genes per point: {}", se_points.len(), if !se_points.is_empty() { se_points[0].data.len() } else { 0 });
-        let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
+        let se = QuadTree::new(se_boundary, se_points);
 
         let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
         let sw_points = self.query(&sw_boundary);
        //println!("SW points: {}, genes per point: {}", 
         //    sw_points.len(), 
         //    if !sw_points.is_empty() { sw_points[0].data.len() } else { 0 });
-        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
+        let sw = QuadTree::new(sw_boundary, sw_points);
 
         // Convert children to BitFieldQuadTree to calculate their expenses
         //let nw_bit_tree = nw.compute_quadtree_bit_fields();
@@ -548,7 +531,7 @@ impl QuadTree {
             self.sw.as_mut().unwrap().divide();
             // Only clear points after we've used them for all necessary operations
             self.points = Vec::new();
-            println!("self.depth: {}", self.depth);
+            //println!("self.depth: {}", self.depth);
         } else {
             self.divided = false;
             if !self.points.is_empty() {
@@ -622,8 +605,11 @@ impl QuadTree {
                 }
             //println!("median: {}", median);
             //println!("max_diff: {}", max_diff);
-                let bit_width = (max_diff as u16).ilog2() + 1;
-            //println!("bit_width: {}", bit_width);
+                if min_diff < 0 {   
+                    let max_diff = max_diff - min_diff;
+                   // println!("bit_width: {}", bit_width);
+                } 
+                let bit_width = max_diff.ilog2() as usize + 1;
                 let bit_expense = bit_width as u32 * values.len() as u32;
                 expense += bit_expense; 
             }
@@ -634,7 +620,7 @@ impl QuadTree {
         expense
     }
     
-  /* This is simply a bit vector across genes for each block */
+  /* This generates medians for each gene, non-zero diffs and indexes across all points/cells */
     fn block_data_to_sarray(&self, _sparse: bool) -> (Vec<u16>, Vec<BitField>) {
         let mut sarray = Vec::new();
         let mut diffs = Vec::new();
@@ -650,9 +636,20 @@ impl QuadTree {
         for j in 0..self.points[0].data.len() { // for each gene
             let values: Vec<u16> = self.points.iter()
                 .map(|p| p.data[j])
-                .filter(|&v| v != 0)
+                .filter(|v| *v != 0)
                 .collect(); // Keep only non-zero values
 
+            let indexes: Vec<usize> = self.points.iter()
+                .enumerate()
+                .filter(|(_, p)| p.data[j] != 0)
+                .map(|(i, _)| i)
+                .collect(); // Keep only indexes of non-zero values 
+
+            let sparsity = values.len() as f32 / self.points.len() as f32;
+            if sparsity > 0.5 {
+                println!("values.len(): {}, total: {}, sparsity: {:.2}%", values.len(), self.points.len(), sparsity * 100.0);
+            }
+            
             let median = if !values.is_empty() {
                 let mut sorted_values = values.clone();
                 sorted_values.sort_unstable();
@@ -667,7 +664,7 @@ impl QuadTree {
                 0
             };
             
-            if median != 0 { // this is not needed if only non-zero values are considered
+            if median != 0 { 
                 sarray.push(median);  
                 let mut max_diff = median as i32;
                 let mut min_diff = 0;
@@ -677,7 +674,10 @@ impl QuadTree {
                     min_diff = min_diff.min(diff as i32);
                     max_diff = max_diff.max(diff as i32);
                 }
-
+                if min_diff < 0 {   
+                    let max_diff = max_diff - min_diff;
+                   // println!("bit_width: {}", bit_width);
+                } 
                 let bit_width = max_diff.ilog2() as usize + 1;
                 //println!("Gene {}: median={}, bit_width={}, min_diff={}, max_diff={}", 
                 //    j, median, bit_width, min_diff, max_diff);
@@ -816,7 +816,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
     
     // No need to convert since we're already using u16
-    let mut qtree = QuadTree::new(domain, coords, 0);
+    let mut qtree = QuadTree::new(domain, coords);
     //println!("Dividing tree");
     qtree.divide();
     Ok(qtree)
@@ -1034,7 +1034,7 @@ fn tree_from_h5<T: AsRef<Path>>(
 
     // Create quadtree
     let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
-    let mut qtree = QuadTree::new(domain, points.clone(), 1);
+    let mut qtree = QuadTree::new(domain, points.clone());
     qtree.divide();
     Ok(qtree)
 }
@@ -1087,6 +1087,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let args = CmdArgs::parse();
     let file_path = args.input;
+    // Record start time
+    let start_time = std::time::Instant::now();
     let qtree = match args.format.as_str() {
         "csv" => {
             // let file_path_pos = args.input_pos.ok_or_else(|| {
@@ -1118,7 +1120,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         //}
         _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
     };
-    
+    let end_time = std::time::Instant::now();
+    let duration = end_time.duration_since(start_time);
+    info!("Time taken for tree construction: {:?}", duration);
     // You can decide whether to serialize the original tree or the bit fields or both
     let config = bincode::config::standard()
         .with_little_endian()
@@ -1126,12 +1130,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
     let mut file = StdFile::create(ofname).unwrap();
     //let mut encoder = GzEncoder::new(file, Compression::default());
-    let bit_field_tree = qtree.compute_quadtree_bit_fields();
-    bincode::encode_into_std_write(&bit_field_tree, &mut file, config).unwrap();
     info!(
         "QuadTree Blocks: (non-zero blocks: {})",
         //qtree.blocks(),
         qtree.non_zero_blocks()
     );
+    let start_time = std::time::Instant::now();
+    let bit_field_tree = qtree.compute_quadtree_bit_fields();
+    let end_time = std::time::Instant::now();
+    let duration = end_time.duration_since(start_time);
+    info!("Time taken for serialization: {:?}", duration);
+    bincode::encode_into_std_write(&bit_field_tree, &mut file, config).unwrap();
     Ok(())
 }
