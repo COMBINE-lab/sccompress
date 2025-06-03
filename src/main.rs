@@ -219,6 +219,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for BitField {
 struct BitFieldQuadTree {
     boundary: Rect,
     medians: Vec<u16>,
+    indexes: Vec<usize>, // indexes of non-zero cells for each gene
     data: Vec<BitField>,
     divided: bool,
     nw: Option<Box<BitFieldQuadTree>>,
@@ -233,6 +234,7 @@ impl BitFieldQuadTree {
         Self {
             boundary,
             medians: Vec::new(),
+            indexes: Vec::new(), // indexes of non-zero cells for each gene
             data: Vec::new(),
             divided: false,
             nw: None,
@@ -449,7 +451,7 @@ impl QuadTree {
     fn divide(&mut self) {
         //info!("Processing node with {} points", self.points.len());
         if !self.points.is_empty() {
-            println!("self.points.len(): {}", self.points.len());
+           // println!("self.points.len(): {}", self.points.len());
             //println!("Non-empty points array in divide");
         
         // Store the current points' positions before clearing them
@@ -621,13 +623,14 @@ impl QuadTree {
     }
     
   /* This generates medians for each gene, non-zero diffs and indexes across all points/cells */
-    fn block_data_to_sarray(&self, _sparse: bool) -> (Vec<u16>, Vec<BitField>) {
+    fn block_data_to_sarray(&self, _sparse: bool) -> (Vec<u16>, Vec<BitField>, Vec<usize>) {
         let mut sarray = Vec::new();
         let mut diffs = Vec::new();
+        let mut indexes = Vec::new();
 
         if self.points.is_empty() {
            // println!("Empty points array in block_data_to_sarray");
-            return (sarray, diffs);
+            return (sarray, diffs, indexes);
         }
 
         //println!("Processing {} points in block_data_to_sarray", self.points.len());
@@ -685,7 +688,10 @@ impl QuadTree {
                 let mut bit_field = BitFieldVec::new(bit_width, values.len());
                 // Calculate and store differences
                 for (i, &value) in values.iter().enumerate() {
-                    let diff = value.wrapping_sub(median);
+                    let mut diff = value.wrapping_sub(median);
+                    if min_diff < 0 {
+                        diff = diff.wrapping_sub(min_diff as u16);
+                    }
                     bit_field.set(i, diff as usize);
                 }
                 
@@ -694,7 +700,7 @@ impl QuadTree {
         }
 
         //info!("Generated {} medians and {} diffs", sarray.len(), diffs.len());
-        (sarray, diffs)
+        (sarray, diffs, indexes)
     }
 
     fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
@@ -703,12 +709,13 @@ impl QuadTree {
             //println!("Computing bit fields - genes per point: {}", self.points[0].data.len());
         }
         
-        let (medians, diffs) = self.block_data_to_sarray(true);
+        let (medians, diffs, indexes) = self.block_data_to_sarray(true);
         //println!("Generated medians: {}, diffs: {}", medians.len(), diffs.len());
         
         let mut node = BitFieldQuadTree {
             boundary: self.boundary.clone(),
-            medians,
+            medians:medians,
+            indexes:indexes,
             data: diffs,
             divided: self.divided,
             nw: None,
