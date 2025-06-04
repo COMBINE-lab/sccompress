@@ -52,10 +52,10 @@ fn tree_from_csv<T: AsRef<Path>>(
     for record in records.iter() {
         //println!("i: {:?}", i);
         // Read coordinates
-        let x: f32 = record[idx_x].parse().map_err(|e| {
+        let x: f64 = record[idx_x].parse().map_err(|e| {
             anyhow::anyhow!("Failed to parse x coordinate at column {}: {}", idx_x, e)
         })?;
-        let y: f32 = record[idx_y].parse().map_err(|e| {
+        let y: f64 = record[idx_y].parse().map_err(|e| {
             anyhow::anyhow!("Failed to parse y coordinate at column {}: {}", idx_y, e)
         })?;
         xs.push(x);
@@ -64,7 +64,7 @@ fn tree_from_csv<T: AsRef<Path>>(
         // Read gene expression data
         let mut cells = Vec::new();
         for j in idx_gene_start..idx_gene_end {
-            let value: u16 = match record[j].parse::<f32>() {
+            let value: u16 = match record[j].parse::<f64>() {
                 Ok(v) => v as u16,
                 Err(_e) => 0,
             };
@@ -83,14 +83,14 @@ fn tree_from_csv<T: AsRef<Path>>(
         coords.push(Point::new(x, y, cells));
     }
 
-    let minx = xs.iter().cloned().fold(f32::INFINITY, f32::min) - 1.0;
-    let miny = ys.iter().cloned().fold(f32::INFINITY, f32::min) - 1.0;
-    let maxx = xs.iter().cloned().fold(f32::NEG_INFINITY, f32::max) + 1.0;
-    let maxy = ys.iter().cloned().fold(f32::NEG_INFINITY, f32::max) + 1.0;
+    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
     let w = maxx - minx;
     let h = maxy - miny;
 
-    let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
+    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
 
     // No need to convert since we're already using u16
     let mut qtree = QuadTree::new(domain, coords, 0);
@@ -168,7 +168,7 @@ fn tree_from_h5<T: AsRef<Path>>(
             ));
         }
 
-        let x: f32 = x_str.parse().map_err(|e| {
+        let x: f64 = x_str.parse().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse x coordinate at line {} for barcode {}: '{}' - {}",
                 line_number,
@@ -178,7 +178,7 @@ fn tree_from_h5<T: AsRef<Path>>(
             )
         })?;
 
-        let y: f32 = y_str.parse().map_err(|e| {
+        let y: f64 = y_str.parse().map_err(|e| {
             anyhow::anyhow!(
                 "Failed to parse y coordinate at line {} for barcode {}: '{}' - {}",
                 line_number,
@@ -258,12 +258,12 @@ fn tree_from_h5<T: AsRef<Path>>(
         file.dataset("X/shape")?
     };
 
-    let data_array: Array1<f32> = data_dataset.read()?;
+    let data_array: Array1<f64> = data_dataset.read()?;
     let indices_array: Array1<usize> = indices_dataset.read()?;
     let indptr_array: Array1<usize> = indptr_dataset.read()?;
     let shape_array: Array1<usize> = shape_dataset.read()?;
 
-    let data: Vec<f32> = data_array.to_vec();
+    let data: Vec<f64> = data_array.to_vec();
     let indices: Vec<usize> = indices_array.to_vec();
     let indptr: Vec<usize> = indptr_array.to_vec();
     let shape: Vec<usize> = shape_array.to_vec();
@@ -324,10 +324,10 @@ fn tree_from_h5<T: AsRef<Path>>(
     }
 
     // Calculate boundaries
-    let minx = points.iter().map(|p| p.x).fold(f32::INFINITY, f32::min) - 1.0;
-    let miny = points.iter().map(|p| p.y).fold(f32::INFINITY, f32::min) - 1.0;
-    let maxx = points.iter().map(|p| p.x).fold(f32::NEG_INFINITY, f32::max) + 1.0;
-    let maxy = points.iter().map(|p| p.y).fold(f32::NEG_INFINITY, f32::max) + 1.0;
+    let minx = points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min) - 1.0;
+    let miny = points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min) - 1.0;
+    let maxx = points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let maxy = points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max) + 1.0;
     let w = maxx - minx;
     let h = maxy - miny;
 
@@ -337,7 +337,7 @@ fn tree_from_h5<T: AsRef<Path>>(
     );
 
     // Create quadtree
-    let domain = Rect::new(minx + w / 2.0, miny + h / 2.0, w, h);
+    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, points.clone(), 1);
     qtree.divide();
     Ok(qtree)

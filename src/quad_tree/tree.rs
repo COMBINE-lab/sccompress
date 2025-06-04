@@ -234,31 +234,31 @@ pub enum ErrorMetric {
 }
 
 pub trait PointLike {
-    fn xpos(&self) -> f32;
-    fn ypos(&self) -> f32;
+    fn xpos(&self) -> f64;
+    fn ypos(&self) -> f64;
 }
 
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct Point {
-    pub x: f32,
-    pub y: f32,
+    pub x: f64,
+    pub y: f64,
     pub data: Vec<u16>,
 }
 
 impl Point {
     #[inline(always)]
-    pub const fn new(x: f32, y: f32, data: Vec<u16>) -> Self {
+    pub const fn new(x: f64, y: f64, data: Vec<u16>) -> Self {
         Self { x, y, data }
     }
 }
 
 impl PointLike for Point {
     #[inline(always)]
-    fn xpos(&self) -> f32 {
+    fn xpos(&self) -> f64 {
         self.x
     }
     #[inline(always)]
-    fn ypos(&self) -> f32 {
+    fn ypos(&self) -> f64 {
         self.y
     }
 }
@@ -267,13 +267,13 @@ impl PointLike for Point {
 /// carry with it any additional data.
 #[derive(Debug, Clone, Encode, Decode)]
 pub struct DatalessPoint {
-    x: f32,
-    y: f32,
+    x: f64,
+    y: f64,
 }
 
 impl DatalessPoint {
     #[inline(always)]
-    const fn new(x: f32, y: f32) -> Self {
+    const fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
     #[inline(always)]
@@ -288,39 +288,39 @@ impl DatalessPoint {
 
 impl PointLike for DatalessPoint {
     #[inline(always)]
-    fn xpos(&self) -> f32 {
+    fn xpos(&self) -> f64 {
         self.x
     }
     #[inline(always)]
-    fn ypos(&self) -> f32 {
+    fn ypos(&self) -> f64 {
         self.y
     }
 }
 
 #[derive(Debug, Clone)]
 pub struct Rect {
-    cx: f32,
-    cy: f32,
-    w: f32,
-    h: f32,
-    west_edge: f32,
-    east_edge: f32,
-    north_edge: f32,
-    south_edge: f32,
+    cx: f64,
+    cy: f64,
+    w: f64,
+    h: f64,
+    west_edge: f64,
+    east_edge: f64,
+    north_edge: f64,
+    south_edge: f64,
 }
 
 impl Rect {
     #[inline(always)]
-    pub const fn new(cx: f32, cy: f32, w: f32, h: f32) -> Self {
+    pub const fn new(cx: f64, cy: f64, w: f64, h: f64) -> Self {
         Self {
             cx,
             cy,
             w,
             h,
-            west_edge: cx - w / 2.0,
-            east_edge: cx + w / 2.0,
-            north_edge: cy - h / 2.0,
-            south_edge: cy + h / 2.0,
+            west_edge: cx - w / 2.0_f64,
+            east_edge: cx + w / 2.0_f64,
+            north_edge: cy - h / 2.0_f64,
+            south_edge: cy + h / 2.0_f64,
         }
     }
 
@@ -474,13 +474,13 @@ impl BitFieldQuadTree {
     pub fn to_quad_tree(&self) -> QuadTree {
         let mut quadtree = QuadTree::new(self.boundary.clone(), Vec::new(), 0);
         quadtree.divided = self.divided;
-        // Convert the raw parts into f32 values to meet the QuadTree requirements
+        // Convert the raw parts into f64 values to meet the QuadTree requirements
         quadtree.data = self
             .data
             .iter()
             .flat_map(|bf| {
                 let (data, _, _) = bf.bit_field.clone().into_raw_parts();
-                data.iter().map(|&x| x as f32).collect::<Vec<f32>>()
+                data.iter().map(|&x| x as f64).collect::<Vec<f64>>()
             })
             .collect();
         quadtree.positions = self.positions.clone();
@@ -574,12 +574,12 @@ pub struct QuadTree {
     points: Vec<Point>,
     depth: usize,
     divided: bool,
-    maxerror: Option<f32>,
+    maxerror: Option<f64>,
     nw: Option<Box<Self>>,
     ne: Option<Box<Self>>,
     se: Option<Box<Self>>,
     sw: Option<Box<Self>>,
-    data: Vec<f32>,
+    data: Vec<f64>,
     positions: Vec<DatalessPoint>,
 }
 
@@ -634,23 +634,23 @@ impl QuadTree {
         found_points
     }
 
-    pub fn block_data_repr(&self, method: ErrorMetric) -> Vec<f32> {
+    pub fn block_data_repr(&self, method: ErrorMetric) -> Vec<f64> {
         if self.points.is_empty() {
             return Vec::new();
         }
 
-        let mut block_mean = Vec::<f32>::with_capacity(self.points[0].data.len());
+        let mut block_mean = Vec::<f64>::with_capacity(self.points[0].data.len());
         for j in 0..self.points[0].data.len() {
             let block_mean_j = match method {
                 ErrorMetric::Median => {
-                    let mut values: Vec<f32> =
-                        self.points.iter().map(|p| p.data[j] as f32).collect();
+                    let mut values: Vec<f64> =
+                        self.points.iter().map(|p| p.data[j] as f64).collect();
                     values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     values[values.len() / 2]
                 }
                 ErrorMetric::Mean => {
-                    self.points.iter().map(|p| p.data[j] as f32).sum::<f32>()
-                        / self.points.len() as f32
+                    self.points.iter().map(|p| p.data[j] as f64).sum::<f64>()
+                        / self.points.len() as f64
                 }
             };
             block_mean.push(block_mean_j);
@@ -658,7 +658,7 @@ impl QuadTree {
         block_mean
     }
     /*
-        pub fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f32) -> f32 {
+        pub fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f64) -> f64 {
             let mut found_points = Vec::new();
             self.query(&self.boundary);
 
@@ -670,30 +670,30 @@ impl QuadTree {
             for j in 0..found_points[0].data.len() {
                 let block_mean = match method {
                     ErrorMetric::Median => {
-                        let mut values: Vec<f32> = found_points.iter().map(|p| p.data[j] as f32).collect();
+                        let mut values: Vec<f64> = found_points.iter().map(|p| p.data[j] as f64).collect();
                         values.sort_by(|a, b| a.partial_cmp(b).unwrap());
                         values[values.len() / 2]
                     }
                     ErrorMetric::Mean => {
-                        found_points.iter().map(|p| p.data[j] as f32).sum::<f32>() / found_points.len() as f32
+                        found_points.iter().map(|p| p.data[j] as f64).sum::<f64>() / found_points.len() as f64
                     }
                 };
 
                 let maxerror = found_points
                     .iter()
-                    .map(|p| (p.data[j] as f32 - block_mean).abs())
-                    .collect::<Vec<f32>>();
+                    .map(|p| (p.data[j] as f64 - block_mean).abs())
+                    .collect::<Vec<f64>>();
 
                 let maxerror =
-                    maxerror.iter().fold(0.0, |a, &b| f32::max(a, b)) / ((maxd[j] as f32) - (mind[j] as f32) + 0.01);
+                    maxerror.iter().fold(0.0, |a, &b| f64::max(a, b)) / ((maxd[j] as f64) - (mind[j] as f64) + 0.01);
                 maxerrors.push(maxerror);
             }
-            maxerrors.iter().fold(0.0, |a, &b| f32::max(a, b))
+            maxerrors.iter().fold(0.0, |a, &b| f64::max(a, b))
         }
     */
 
     pub fn divide(&mut self) {
-        info!("Processing node with {} points", self.points.len());
+        info!("Processing block with {} points", self.points.len());
 
         debug!("self.points.len(): {}", self.points.len());
         if !self.points.is_empty() {
@@ -712,77 +712,41 @@ impl QuadTree {
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
 
-        // Convert current node to BitFieldQuadTree to calculate expense
-        info!(
-            "calling compute_quadtree_bit_fields on a tree with {} points",
-            self.points.len()
-        );
-
-        /*println!(
-            "current_bit_tree.medians.len(): {}",
-            current_bit_tree.encoded_diffs.num_medians()
-        );
-        */
+        // Compute the expense of encoding the current block
         let current_expense = encode_subarray(&self.points).map_or(0, |x| x.bytes());
-        info!("expense of current node is {}", current_expense);
+        info!(
+            "expense of current block consisting of {} points is {}",
+            self.points.len(),
+            current_expense
+        );
 
         // Find the children of the current node
         let cx = self.boundary.cx;
         let cy = self.boundary.cy;
-        let w = self.boundary.w / 2.0;
-        let h = self.boundary.h / 2.0;
+        let w = self.boundary.w / 2.0_f64;
+        let h = self.boundary.h / 2.0_f64;
 
-        let nw_boundary = Rect::new(cx - w / 2.0, cy - h / 2.0, w, h);
+        let nw_boundary = Rect::new(cx - w / 2.0_f64, cy - h / 2.0_f64, w, h);
         let nw_points = self.query(&nw_boundary);
-        println!(
-            "NW points: {}, genes per point: {}",
-            nw_points.len(),
-            if !nw_points.is_empty() {
-                nw_points[0].data.len()
-            } else {
-                0
-            }
-        );
         let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
 
-        let ne_boundary = Rect::new(cx + w / 2.0, cy - h / 2.0, w, h);
+        let ne_boundary = Rect::new(cx + w / 2.0_f64, cy - h / 2.0_f64, w, h);
         let ne_points = self.query(&ne_boundary);
-        println!(
-            "NE points: {}, genes per point: {}",
-            ne_points.len(),
-            if !ne_points.is_empty() {
-                ne_points[0].data.len()
-            } else {
-                0
-            }
-        );
         let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
 
-        let se_boundary = Rect::new(cx + w / 2.0, cy + h / 2.0, w, h);
+        let se_boundary = Rect::new(cx + w / 2.0_f64, cy + h / 2.0_f64, w, h);
         let se_points = self.query(&se_boundary);
-        println!(
-            "SE points: {}, genes per point: {}",
-            se_points.len(),
-            if !se_points.is_empty() {
-                se_points[0].data.len()
-            } else {
-                0
-            }
-        );
         let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
 
-        let sw_boundary = Rect::new(cx - w / 2.0, cy + h / 2.0, w, h);
+        let sw_boundary = Rect::new(cx - w / 2.0_f64, cy + h / 2.0_f64, w, h);
         let sw_points = self.query(&sw_boundary);
-        println!(
-            "SW points: {}, genes per point: {}",
-            sw_points.len(),
-            if !sw_points.is_empty() {
-                sw_points[0].data.len()
-            } else {
-                0
-            }
-        );
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
+
+        // make sure we're not losing any points
+        assert_eq!(
+            nw.points.len() + ne.points.len() + se.points.len() + sw.points.len(),
+            self.points.len()
+        );
 
         // Convert children to BitFieldQuadTree to calculate their expenses
         let nw_expense = encode_subarray(&nw.points).map_or(0, |x| x.bytes());
@@ -790,10 +754,10 @@ impl QuadTree {
         let se_expense = encode_subarray(&se.points).map_or(0, |x| x.bytes());
         let sw_expense = encode_subarray(&sw.points).map_or(0, |x| x.bytes());
 
-        println!("NW expense: {}", nw_expense);
-        println!("NE expense: {}", ne_expense);
-        println!("SE expense: {}", se_expense);
-        println!("SW expense: {}", sw_expense);
+        info!("NW expense: {}", nw_expense);
+        info!("NE expense: {}", ne_expense);
+        info!("SE expense: {}", se_expense);
+        info!("SW expense: {}", sw_expense);
 
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
 
