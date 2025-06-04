@@ -184,6 +184,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         };
 
         if median == 0 {
+            gene_indices.push(cell_indices.len() as u32);
             // all cells in this dataset had a 0 for this gene
             continue;
         } else {
@@ -299,18 +300,22 @@ impl PointLike for DatalessPoint {
 
 fn get_child_rects(parent: &Rect) -> (Rect, Rect, Rect, Rect) {
     // Find the children of the current node
-    let cx = parent.cx;
-    let cy = parent.cy;
-    let w = parent.w / 2.0_f64;
-    let h = parent.h / 2.0_f64;
 
-    let nw_boundary = Rect::new(cx - w / 2.0_f64, cy - h / 2.0_f64, w, h);
+    let north_child_north = parent.north_edge;
+    let west_child_west = parent.west_edge;
 
-    let ne_boundary = Rect::new(cx + w / 2.0_f64, cy - h / 2.0_f64, w, h);
+    let east_child_east = parent.east_edge;
+    let south_cild_south = parent.south_edge;
 
-    let se_boundary = Rect::new(cx + w / 2.0_f64, cy + h / 2.0_f64, w, h);
+    let center_x = parent.cx;
+    let center_y = parent.cy;
 
-    let sw_boundary = Rect::new(cx - w / 2.0_f64, cy + h / 2.0_f64, w, h);
+    // pub const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64)
+    let nw_boundary = Rect::new_from_bounds(west_child_west, center_x, north_child_north, center_y);
+    let ne_boundary = Rect::new_from_bounds(center_x, east_child_east, north_child_north, center_y);
+
+    let se_boundary = Rect::new_from_bounds(center_x, east_child_east, center_y, south_cild_south);
+    let sw_boundary = Rect::new_from_bounds(west_child_west, center_x, center_y, south_cild_south);
     (nw_boundary, ne_boundary, se_boundary, sw_boundary)
 }
 
@@ -318,8 +323,6 @@ fn get_child_rects(parent: &Rect) -> (Rect, Rect, Rect, Rect) {
 pub struct Rect {
     cx: f64,
     cy: f64,
-    w: f64,
-    h: f64,
     west_edge: f64,
     east_edge: f64,
     north_edge: f64,
@@ -332,8 +335,6 @@ impl Rect {
         Self {
             cx,
             cy,
-            w,
-            h,
             west_edge: cx - w / 2.0_f64,
             east_edge: cx + w / 2.0_f64,
             north_edge: cy - h / 2.0_f64,
@@ -341,6 +342,24 @@ impl Rect {
         }
     }
 
+    #[inline(always)]
+    pub const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64) -> Self {
+        let w = west - east;
+        let h = north - south;
+        let cx = west + (w / 2_f64);
+        let cy = south + (h / 2_f64);
+        Self {
+            cx,
+            cy,
+            west_edge: west,
+            east_edge: east,
+            north_edge: north,
+            south_edge: south,
+        }
+    }
+
+    // The rectangle is closed on the left (west) and top
+    // (north) and open on the right (east) and bottom (south).
     #[inline(always)]
     const fn contains(&self, point: &Point) -> bool {
         point.x >= self.west_edge
@@ -365,10 +384,10 @@ impl Encode for Rect {
         &self,
         encoder: &mut E,
     ) -> core::result::Result<(), bincode::error::EncodeError> {
-        Encode::encode(&self.cx, encoder)?;
-        Encode::encode(&self.cy, encoder)?;
-        Encode::encode(&self.w, encoder)?;
-        Encode::encode(&self.h, encoder)?;
+        Encode::encode(&self.west_edge, encoder)?;
+        Encode::encode(&self.east_edge, encoder)?;
+        Encode::encode(&self.north_edge, encoder)?;
+        Encode::encode(&self.south_edge, encoder)?;
         Ok(())
     }
 }
@@ -377,11 +396,11 @@ impl<Context> Decode<Context> for Rect {
     fn decode<D: bincode::de::Decoder<Context = Context>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let cx = Decode::decode(decoder)?;
-        let cy = Decode::decode(decoder)?;
-        let w = Decode::decode(decoder)?;
-        let h = Decode::decode(decoder)?;
-        Ok(Self::new(cx, cy, w, h))
+        let west = Decode::decode(decoder)?;
+        let east = Decode::decode(decoder)?;
+        let north = Decode::decode(decoder)?;
+        let south = Decode::decode(decoder)?;
+        Ok(Self::new_from_bounds(west, east, north, south))
     }
 }
 
@@ -389,11 +408,11 @@ impl<'de, Context> BorrowDecode<'de, Context> for Rect {
     fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let cx = BorrowDecode::borrow_decode(decoder)?;
-        let cy = BorrowDecode::borrow_decode(decoder)?;
-        let w = BorrowDecode::borrow_decode(decoder)?;
-        let h = BorrowDecode::borrow_decode(decoder)?;
-        Ok(Self::new(cx, cy, w, h))
+        let west = BorrowDecode::borrow_decode(decoder)?;
+        let east = BorrowDecode::borrow_decode(decoder)?;
+        let north = BorrowDecode::borrow_decode(decoder)?;
+        let south = BorrowDecode::borrow_decode(decoder)?;
+        Ok(Self::new_from_bounds(west, east, north, south))
     }
 }
 
@@ -773,29 +792,13 @@ impl QuadTree {
         if total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
-            self.nw = if !nw.points.is_empty() {
-                Some(Box::new(nw))
-            } else {
-                None
-            };
-            self.ne = if !ne.points.is_empty() {
-                Some(Box::new(ne))
-            } else {
-                None
-            };
-            self.se = if !se.points.is_empty() {
-                Some(Box::new(se))
-            } else {
-                None
-            };
-            self.sw = if !sw.points.is_empty() {
-                Some(Box::new(sw))
-            } else {
-                None
-            };
+            self.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
+            self.ne = (!ne.points.is_empty()).then_some(Box::new(ne));
+            self.se = (!se.points.is_empty()).then_some(Box::new(se));
+            self.sw = (!sw.points.is_empty()).then_some(Box::new(sw));
 
             // Only clear points after we've used them for all necessary operations
-            self.points = Vec::new();
+            self.points.clear();
 
             if let Some(ref mut nw) = self.nw {
                 nw.divide();
@@ -812,8 +815,7 @@ impl QuadTree {
         } else {
             self.divided = false;
             if !self.points.is_empty() {
-                info!("Leaf node with {} points", self.points.len());
-                println!(
+                info!(
                     "Leaf node - points: {}, genes: {}",
                     self.points.len(),
                     self.points[0].data.len()
@@ -822,7 +824,7 @@ impl QuadTree {
                                             // Keep the points for bit field representation
             }
         }
-        println!("self.depth: {}", self.depth);
+        info!("self.depth: {}", self.depth);
     }
 
     pub fn non_zero_blocks(&self) -> usize {
