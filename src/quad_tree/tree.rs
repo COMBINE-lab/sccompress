@@ -297,6 +297,23 @@ impl PointLike for DatalessPoint {
     }
 }
 
+fn get_child_rects(parent: &Rect) -> (Rect, Rect, Rect, Rect) {
+    // Find the children of the current node
+    let cx = parent.cx;
+    let cy = parent.cy;
+    let w = parent.w / 2.0_f64;
+    let h = parent.h / 2.0_f64;
+
+    let nw_boundary = Rect::new(cx - w / 2.0_f64, cy - h / 2.0_f64, w, h);
+
+    let ne_boundary = Rect::new(cx + w / 2.0_f64, cy - h / 2.0_f64, w, h);
+
+    let se_boundary = Rect::new(cx + w / 2.0_f64, cy + h / 2.0_f64, w, h);
+
+    let sw_boundary = Rect::new(cx - w / 2.0_f64, cy + h / 2.0_f64, w, h);
+    (nw_boundary, ne_boundary, se_boundary, sw_boundary)
+}
+
 #[derive(Debug, Clone)]
 pub struct Rect {
     cx: f64,
@@ -721,24 +738,16 @@ impl QuadTree {
         );
 
         // Find the children of the current node
-        let cx = self.boundary.cx;
-        let cy = self.boundary.cy;
-        let w = self.boundary.w / 2.0_f64;
-        let h = self.boundary.h / 2.0_f64;
-
-        let nw_boundary = Rect::new(cx - w / 2.0_f64, cy - h / 2.0_f64, w, h);
+        let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&self.boundary);
         let nw_points = self.query(&nw_boundary);
         let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
 
-        let ne_boundary = Rect::new(cx + w / 2.0_f64, cy - h / 2.0_f64, w, h);
         let ne_points = self.query(&ne_boundary);
         let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
 
-        let se_boundary = Rect::new(cx + w / 2.0_f64, cy + h / 2.0_f64, w, h);
         let se_points = self.query(&se_boundary);
         let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
 
-        let sw_boundary = Rect::new(cx - w / 2.0_f64, cy + h / 2.0_f64, w, h);
         let sw_points = self.query(&sw_boundary);
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
 
