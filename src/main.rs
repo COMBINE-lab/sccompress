@@ -1,13 +1,15 @@
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 pub mod quad_tree;
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;
 use hdf5::File;
 use ndarray::Array1;
+use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fs::File as StdFile;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
@@ -343,10 +345,38 @@ fn tree_from_h5<T: AsRef<Path>>(
     Ok(qtree)
 }
 
-/// Build a quadtree representation of spatial transcriptomics data
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(version, about, long_about = None)]
-struct CmdArgs {
+#[command(propagate_version = true)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    #[command(arg_required_else_help = true)]
+    Build(BuildCommand),
+    #[command(arg_required_else_help = true)]
+    Dump(DumpCommand),
+}
+
+/// Build a quadtree representation of spatial transcriptomics data
+#[derive(Debug, Args)]
+#[command(version, about, long_about = None)]
+struct DumpCommand {
+    /// the output serialized from build
+    #[arg(short = 'i', long)]
+    input: PathBuf,
+    /// Output file
+    #[arg(short = 'o', long)]
+    output: PathBuf,
+}
+
+/// Build a quadtree representation of spatial transcriptomics data
+#[derive(Debug, Args)]
+#[command(version, about, long_about = None)]
+struct BuildCommand {
     /// Input file (CSV or HDF5)
     #[arg(short = 'i', long)]
     input: PathBuf,
@@ -373,6 +403,22 @@ struct CmdArgs {
     idx_gene_end: Option<usize>,
 }
 
+struct Data {
+    pub data: Vec<EncodedDiffs>,
+    pub pos: Vec<DatalessPoint>,
+    pub sep: Vec<usize>,
+}
+
+impl Data {
+    pub fn new() -> Self {
+        Self {
+            data: Vec::new(),
+            pos: Vec::new(),
+            sep: Vec::new(),
+        }
+    }
+}
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -389,52 +435,101 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
-    let args = CmdArgs::parse();
-    let file_path = args.input;
-    let qtree = match args.format.as_str() {
-        "csv" => {
-            // let file_path_pos = args.input_pos.ok_or_else(|| {
-            //    anyhow::anyhow!("Position file required for CSV format")
-            //})?;
-            tree_from_csv(
-                file_path,
-                //file_path_pos,
-                5,    // idx_x
-                6,    // idx_y
-                1,    // idx_gene_start
-                None, // idx_gene_end (will use all remaining columns)
-                ErrorMetric::Mean,
-                true,
-            )?
-        }
-        // "hdf5" => {
-        // let file_path_pos = args.input_pos.ok_or_else(|| {
-        //   anyhow::anyhow!("Position file required for HDF5 format")
-        //})?;
-        //tree_from_h5(
-        //  &args.input,
-        //file_path_pos,
-        //ErrorMetric::Mean,
-        //true,
-        //"10x"
-        //)?
-        //}
-        _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
-    };
+    let cli_args = Cli::parse();
 
-    // You can decide whether to serialize the original tree or the bit fields or both
-    let config = bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding();
-    let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-    let mut file = StdFile::create(ofname).unwrap();
-    //let mut encoder = GzEncoder::new(file, Compression::default());
-    let bit_field_tree = qtree.compute_quadtree_bit_fields();
-    bincode::encode_into_std_write(&bit_field_tree, &mut file, config).unwrap();
-    info!(
-        "QuadTree Blocks: (non-zero blocks: {})",
-        //qtree.blocks(),
-        qtree.non_zero_blocks()
-    );
+    match cli_args.command {
+        Commands::Build(args) => {
+            let file_path = args.input;
+            let qtree = match args.format.as_str() {
+                "csv" => {
+                    // let file_path_pos = args.input_pos.ok_or_else(|| {
+                    //    anyhow::anyhow!("Position file required for CSV format")
+                    //})?;
+                    tree_from_csv(
+                        file_path,
+                        //file_path_pos,
+                        6,    // idx_x
+                        7,    // idx_y
+                        10,   // idx_gene_start
+                        None, // idx_gene_end (will use all remaining columns)
+                        ErrorMetric::Mean,
+                        true,
+                    )?
+                }
+                // "hdf5" => {
+                // let file_path_pos = args.input_pos.ok_or_else(|| {
+                //   anyhow::anyhow!("Position file required for HDF5 format")
+                //})?;
+                //tree_from_h5(
+                //  &args.input,
+                //file_path_pos,
+                //ErrorMetric::Mean,
+                //true,
+                //"10x"
+                //)?
+                //}
+                _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
+            };
+
+            // You can decide whether to serialize the original tree or the bit fields or both
+            let config = bincode::config::standard()
+                .with_little_endian()
+                .with_fixed_int_encoding();
+            let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
+            let mut file = StdFile::create(ofname).unwrap();
+            //let mut encoder = GzEncoder::new(file, Compression::default());
+            let bit_field_tree = qtree.compute_quadtree_bit_fields();
+            let mut d = Data::new();
+
+            let mut print_data = |n: &BitFieldQuadTree| {
+                println!("node payload_size {}", n.encoded_diffs.bytes());
+                if n.encoded_diffs.bytes() > 0 {
+                    d.data.push(n.encoded_diffs.clone());
+                    let l = d.pos.len();
+                    d.sep.push(l);
+                    d.pos.extend_from_slice(&n.positions);
+                }
+            };
+            bit_field_tree.visit(&mut print_data);
+            d.sep.push(d.pos.len());
+            info!(
+                "QuadTree Blocks: (non-zero blocks: {})",
+                //qtree.blocks(),
+                qtree.non_zero_blocks()
+            );
+            info!("Collected Encoded Diffs : {}", d.data.len());
+            bincode::encode_into_std_write(&d.data, &mut file, config).unwrap();
+            bincode::encode_into_std_write(&d.pos, &mut file, config).unwrap();
+            bincode::encode_into_std_write(&d.sep, &mut file, config).unwrap();
+        }
+        Commands::Dump(args) => {
+            let ifile = std::fs::File::open(args.input)?;
+            let mut ifile = std::io::BufReader::new(ifile);
+            let config = bincode::config::standard()
+                .with_little_endian()
+                .with_fixed_int_encoding();
+
+            let ofile = std::fs::File::create(args.output)?;
+            let mut ofile = std::io::BufWriter::new(ofile);
+            let mut d = Data::new();
+            d.data = bincode::decode_from_std_read(&mut ifile, config)?;
+            d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
+            d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
+            for (chunk_id, compressed_diffs) in d.data.iter().enumerate() {
+                let start = d.sep[chunk_id];
+                let stop = d.sep[chunk_id + 1];
+                let n = stop - start;
+                for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
+                    let expression = compressed_diffs
+                        .expression_vec(cell_id)
+                        .iter()
+                        .map(|x| x.to_string())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    writeln!(ofile, "{},{},{}", loc.xpos(), loc.ypos(), expression)?;
+                }
+            }
+        }
+    }
     Ok(())
 }
