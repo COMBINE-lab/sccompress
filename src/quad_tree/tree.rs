@@ -111,7 +111,7 @@ impl EncodedDiffs {
         let ci_bits = self.cell_indices.len() * self.cell_indices.bit_width();
         let gi_bits = self.gene_indices.len() * self.gene_indices.bit_width();
         let m_bits = self.medians.len() * self.medians.bit_width();
-        (diff_bits + ci_bits + gi_bits + m_bits) / 8
+        (4 * 24) + (diff_bits + ci_bits + gi_bits + m_bits) / 8
     }
 }
 
