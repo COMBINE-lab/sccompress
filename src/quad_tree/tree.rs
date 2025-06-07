@@ -1,5 +1,4 @@
 use bincode::{BorrowDecode, Decode, Encode};
-use sux::bits::bit_field_vec::BitFieldVecIterator;
 use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
@@ -237,17 +236,10 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
     for j in 0..points[0].data.len() {
         // get the non-zero values and the non-zero indices
-        let (nz_values, nz_inds): (Vec<u16>, Vec<u32>) = points
+        let nz_values: Vec<u16> = points
             .iter()
-            .enumerate()
-            .filter_map(|(i, p)| {
-                if p.data[j] > 0 {
-                    Some((p.data[j], i as u32))
-                } else {
-                    None
-                }
-            })
-            .unzip(); // Keep only non-zero values
+            .filter_map(|p| if p.data[j] > 0 { Some(p.data[j]) } else { None })
+            .collect();
 
         // nonzero median values
         let median = if !nz_values.is_empty() {
@@ -261,7 +253,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     }
 
     // for each cell
-    for (_cell_ind, gene_exp) in points.iter().enumerate() {
+    for gene_exp in points.iter() {
         cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
         for ((gene_ind, val), med_val) in gene_exp.data.iter().enumerate().zip(&medians) {
@@ -286,53 +278,6 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         }
     }
     cell_indices.push(gene_indices.len() as u32);
-    /*
-    for j in 0..points[0].data.len() {
-        // get the non-zero values and the non-zero indices
-        let (nz_values, nz_inds): (Vec<u16>, Vec<u32>) = points
-            .iter()
-            .enumerate()
-            .filter_map(|(i, p)| {
-                if p.data[j] > 0 {
-                    Some((p.data[j], i as u32))
-                } else {
-                    None
-                }
-            })
-            .unzip(); // Keep only non-zero values
-
-        let median = if !nz_values.is_empty() {
-            let mut sorted_values = nz_values.clone();
-            sorted_values.sort_unstable();
-            sorted_values[sorted_values.len() / 2] //median of the expressed values
-        } else {
-            0
-        };
-
-        if median == 0 {
-            gene_indices.push(cell_indices.len() as u32);
-            // all cells in this dataset had a 0 for this gene
-            continue;
-        } else {
-            gene_indices.push(cell_indices.len() as u32);
-            medians.push(median); // Use push instead of append
-
-            // Find min and max diffs
-            for (value, cell_ind) in nz_values.iter().zip(nz_inds.iter()) {
-                let diff = *value as i32 - median as i32;
-                let diff = if diff < 0 {
-                    (-2_i32 * diff) + 1
-                } else {
-                    2_i32 * diff
-                };
-                raw_diffs.push(diff as u32);
-                cell_indices.push(*cell_ind);
-                max_diff = max_diff.max(diff);
-            }
-        }
-    }
-    gene_indices.push(cell_indices.len() as u32);
-    */
 
     let gene_indices = BitFieldVec::<usize>::from_slice(&gene_indices).expect("should fit");
     let cell_indices = BitFieldVec::<usize>::from_slice(&cell_indices).expect("should fit");
@@ -347,9 +292,11 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     };
 
     // validate!
+    /*
     for (cell_ind, gene_exp) in points.iter().enumerate() {
         assert_eq!(enc_diffs.expression_vec(cell_ind), gene_exp.data);
     }
+    */
     info!(
         "Generated {} medians and {} diffs in {} bytes",
         enc_diffs.num_medians(),

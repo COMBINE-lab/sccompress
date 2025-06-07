@@ -390,13 +390,13 @@ struct BuildCommand {
     #[arg(short = 'f', long, default_value = "csv")]
     format: String,
     /// Index of x coordinate, default 5
-    #[arg(short = 'x', long, default_value = "6")]
+    #[arg(short = 'x', long, default_value_t = 6)]
     idx_x: usize,
     /// Index of y coordinate, default 6
-    #[arg(short = 'y', long, default_value = "7")]
+    #[arg(short = 'y', long, default_value_t = 7)]
     idx_y: usize,
     /// Index of gene start, default 1
-    #[arg(short = 's', long, default_value = "11")]
+    #[arg(short = 's', long, default_value_t = 11)]
     idx_gene_start: usize,
     /// Index of gene end, default all remaining columns
     #[arg(short = 'e', long)]
@@ -448,10 +448,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                     tree_from_csv(
                         file_path,
                         //file_path_pos,
-                        6,    // idx_x
-                        7,    // idx_y
-                        10,   // idx_gene_start
-                        None, // idx_gene_end (will use all remaining columns)
+                        args.idx_x,          // idx_x
+                        args.idx_y,          // idx_y
+                        args.idx_gene_start, // idx_gene_start
+                        args.idx_gene_end,   // idx_gene_end (will use all remaining columns)
                         ErrorMetric::Mean,
                         true,
                     )?
