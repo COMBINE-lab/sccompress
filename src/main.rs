@@ -481,26 +481,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             let bit_field_tree = qtree.compute_quadtree_bit_fields();
             let mut d = Data::new();
 
-            let mut print_data = |n: &BitFieldQuadTree| {
-                println!("node payload_size {}", n.encoded_diffs.bytes());
+            let mut collect_data = |n: &BitFieldQuadTree| {
                 if n.encoded_diffs.bytes() > 0 {
                     d.data.push(n.encoded_diffs.clone());
-                    let l = d.pos.len();
-                    d.sep.push(l);
                     d.pos.extend_from_slice(&n.positions);
                 }
             };
-            bit_field_tree.visit(&mut print_data);
-            d.sep.push(d.pos.len());
+            bit_field_tree.visit(&mut collect_data);
             info!(
                 "QuadTree Blocks: (non-zero blocks: {})",
-                //qtree.blocks(),
                 qtree.non_zero_blocks()
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
             bincode::encode_into_std_write(&d.data, &mut file, config).unwrap();
             bincode::encode_into_std_write(&d.pos, &mut file, config).unwrap();
-            bincode::encode_into_std_write(&d.sep, &mut file, config).unwrap();
         }
         Commands::Dump(args) => {
             let ifile = std::fs::File::open(args.input)?;
@@ -515,10 +509,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             d.data = bincode::decode_from_std_read(&mut ifile, config)?;
             d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
             d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
-            for (chunk_id, compressed_diffs) in d.data.iter().enumerate() {
-                let start = d.sep[chunk_id];
-                let stop = d.sep[chunk_id + 1];
-                let n = stop - start;
+            let mut start = 0;
+            for compressed_diffs in d.data.iter() {
+                let n = compressed_diffs.num_cells();
                 for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
                     let expression = compressed_diffs
                         .expression_vec(cell_id)
@@ -528,6 +521,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .join(",");
                     writeln!(ofile, "{},{},{}", loc.xpos(), loc.ypos(), expression)?;
                 }
+                start += n;
             }
         }
     }
