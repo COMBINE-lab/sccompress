@@ -11,6 +11,7 @@ use std::error::Error;
 use std::fs::File as StdFile;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use sux::traits::BitFieldSliceCore;
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
@@ -456,16 +457,16 @@ fn main() -> Result<(), Box<dyn Error>> {
                         true,
                     )?
                 }
-                // "hdf5" => {
-                // let file_path_pos = args.input_pos.ok_or_else(|| {
-                //   anyhow::anyhow!("Position file required for HDF5 format")
-                //})?;
+                //"hdf5" => {
+                  //  let file_path_pos = args.input_pos.ok_or_else(|| {
+                  //      anyhow::anyhow!("Position file required for HDF5 format")
+                  //  })?;
                 //tree_from_h5(
-                //  &args.input,
-                //file_path_pos,
-                //ErrorMetric::Mean,
-                //true,
-                //"10x"
+                //  file_path,
+                //  &file_path_pos,
+                //  ErrorMetric::Mean,
+                //  true,
+                  //  "10x"
                 //)?
                 //}
                 _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
@@ -493,6 +494,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 qtree.non_zero_blocks()
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
+            
+            let(total_diff_size, total_gene_indices, total_cell_indices) = bit_field_tree.calculate_size();
+            info!("{} bytes for diffs, {} bytes for gene indices, {} bytes for cell indices", total_diff_size, total_gene_indices, total_cell_indices);
+            
             bincode::encode_into_std_write(&d.data, &mut file, config).unwrap();
             bincode::encode_into_std_write(&d.pos, &mut file, config).unwrap();
         }
