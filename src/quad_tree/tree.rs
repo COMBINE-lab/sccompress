@@ -1,17 +1,17 @@
 use bincode::{BorrowDecode, Decode, Encode};
-use sux::prelude::{BitFieldSlice, BitFieldVec, CountBitVec};
+use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
 use sux::dict::elias_fano::{EliasFanoBuilder, EliasFano};
-use sux::traits::IndexedDict;
+use sux::bits::bit_vec::BitVec;
 use tracing::{debug, info};
 
-type MyEliasFano = EliasFano<CountBitVec<Vec<usize>>, BitFieldVec<usize, Vec<usize>>>;
+//type MyEliasFano = EliasFano<BitVec<Box<[usize]>>, SelectAdaptConst<BitVec<Box<[usize]>>, BitFieldVec<usize, Box<[usize]>>>>;
 
 #[derive(Clone)]
 pub struct EncodedDiffs {
-    pub gene_indices: MyEliasFano,
-    pub cell_indices: MyEliasFano,
+    pub gene_indices: EliasFano,
+    pub cell_indices: EliasFano,
     pub diffs: BitFieldVec,
     pub medians: BitFieldVec,
 }
@@ -36,9 +36,15 @@ impl<'a, W: sux::traits::Word, B: Clone> Iterator for ExpressionIter<'a, W, B> {
 
 impl EncodedDiffs {
     pub fn empty() -> Self {
+        let gene_builder = EliasFanoBuilder::new(0, 0);
+        let gene_indices = gene_builder.build();
+
+        let cell_builder = EliasFanoBuilder::new(0, 0);
+        let cell_indices = cell_builder.build();
+
         EncodedDiffs {
-            gene_indices: EliasFanoBuilder::new(0, 0).build(),
-            cell_indices: EliasFanoBuilder::new(0, 0).build(),
+            gene_indices,
+            cell_indices,
             diffs: BitFieldVec::with_capacity(0, 0),
             medians: BitFieldVec::with_capacity(0, 0),
         }
@@ -77,15 +83,15 @@ impl EncodedDiffs {
     */
 
     pub fn expression_vec(&self, cell_ind: usize) -> Vec<u16> {
-        let start = unsafe { self.cell_indices.get_unchecked(cell_ind) }; // inclusive
-        let stop = unsafe { self.cell_indices.get_unchecked(cell_ind + 1) }; // exclusive
+        let start = self.cell_indices.iter().nth(cell_ind).unwrap_or(0); // inclusive
+        let stop = self.cell_indices.iter().nth(cell_ind + 1).unwrap_or(0); // exclusive
         let n = stop - start;
         if n == 0 {
             return vec![0_u16; self.num_genes()];
         }
 
-        let mut diff_iter = self.diffs.into_iter_from(start).take(n);
-        let mut nz_ind_iter = self.gene_indices.into_iter_from(start).take(n);
+        let mut diff_iter = self.diffs.iter_from(start).take(n);
+        let mut nz_ind_iter = self.gene_indices.iter().skip(start).take(n);
 
         let mut expression = Vec::with_capacity(self.num_genes());
         let mut next_diff = diff_iter.next().expect("at least one");
@@ -100,8 +106,10 @@ impl EncodedDiffs {
                 } else {
                     -((next_diff as i32 - 1) / 2)
                 };
+                // Add the median back to get the actual value
                 let decoded_val = (diff + self.medians.get(gidx) as i32) as u16;
                 expression.push(decoded_val);
+                // Move to next non-zero gene
                 next_nz_ind = nz_ind_iter.next().unwrap_or(usize::MAX);
                 next_diff = diff_iter.next().unwrap_or(usize::MAX);
             }
@@ -112,10 +120,12 @@ impl EncodedDiffs {
 
     pub fn bytes(&self) -> usize {
         let diff_bits = self.diffs.len() * self.diffs.bit_width();
-        let (u1, n1, _, _, _) = self.cell_indices.clone().into_raw_parts();
-        let (u2, n2, _, _, _) = self.gene_indices.clone().into_raw_parts();
-        let ci_bits = MyEliasFano::estimate_size(u1, n1);
-        let gi_bits = MyEliasFano::estimate_size(u2, n2);
+        let n1 = self.cell_indices.len();
+        let u1 = self.cell_indices.iter().max().unwrap_or(0);
+        let n2 = self.gene_indices.len();
+        let u2 = self.gene_indices.iter().max().unwrap_or(0);
+        let ci_bits = EliasFano::<BitVec<Box<[usize]>>>::estimate_size(u1, n1);
+        let gi_bits = EliasFano::<BitVec<Box<[usize]>>>::estimate_size(u2, n2);
         let m_bits = self.medians.len() * self.medians.bit_width();
         (diff_bits + ci_bits + gi_bits + m_bits) / 8
     }
@@ -128,31 +138,11 @@ impl Encode for EncodedDiffs {
         &self,
         encoder: &mut E,
     ) -> core::result::Result<(), bincode::error::EncodeError> {
-        let (u, n, l, low_bits, high_bits) = self.gene_indices.clone().into_raw_parts();
-        let (low_data, low_width, high_len) = low_bits.into_raw_parts();
-        let (high_data, high_width, low_len) = high_bits.into_raw_parts();
-        Encode::encode(&low_data, encoder)?;
-        Encode::encode(&low_width, encoder)?;
-        Encode::encode(&high_data, encoder)?;
-        Encode::encode(&high_width, encoder)?;
-        Encode::encode(&n, encoder)?;
-        Encode::encode(&u, encoder)?;
-        Encode::encode(&l, encoder)?;
-        Encode::encode(&high_len, encoder)?;
-        Encode::encode(&low_len, encoder)?;
+        let gene_index = self.gene_indices.iter().into_iter().collect::<Vec<_>>();
+        let cell_index = self.cell_indices.iter().into_iter().collect::<Vec<_>>();
 
-        let (u, n, l, low_bits, high_bits) = self.cell_indices.clone().into_raw_parts();
-        let (low_data, low_width, high_len) = low_bits.into_raw_parts();
-        let (high_data, high_width, low_len) = high_bits.into_raw_parts();
-        Encode::encode(&low_data, encoder)?;
-        Encode::encode(&low_width, encoder)?;
-        Encode::encode(&high_data, encoder)?;
-        Encode::encode(&high_width, encoder)?;
-        Encode::encode(&high_len, encoder)?;
-        Encode::encode(&low_len, encoder)?;
-        Encode::encode(&n, encoder)?;
-        Encode::encode(&u, encoder)?;
-        Encode::encode(&l, encoder)?;
+        Encode::encode(&gene_index, encoder)?;
+        Encode::encode(&cell_index, encoder)?;
 
         let (b, w, l) = self.diffs.clone().into_raw_parts();
         Encode::encode(&b, encoder)?;
@@ -171,31 +161,20 @@ impl<Context> Decode<Context> for EncodedDiffs {
     fn decode<D: bincode::de::Decoder<Context = Context>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let low_data: Vec<usize> = Decode::decode(decoder)?;
-        let low_width: usize = Decode::decode(decoder)?;
-        let high_data: Vec<usize> = Decode::decode(decoder)?;
-        let high_width: usize = Decode::decode(decoder)?;
-        let high_len: usize = Decode::decode(decoder)?;
-        let low_len: usize = Decode::decode(decoder)?;
-        let low_bits = unsafe { BitFieldVec::from_raw_parts(low_data, low_width, low_len) };
-        let high_bits = unsafe { CountBitVec::from_raw_parts(high_data, high_width, high_len) };
-        let n: usize = Decode::decode(decoder)?;
-        let u: usize = Decode::decode(decoder)?;
-        let l: usize = Decode::decode(decoder)?;
-        let gene_indices: MyEliasFano = unsafe { EliasFano::from_raw_parts(u, n, l, low_bits, high_bits) };
+        let gene_index: Vec<usize> = Decode::decode(decoder)?;
+        let cell_index: Vec<usize> = Decode::decode(decoder)?;
 
-        let low_data: Vec<usize> = Decode::decode(decoder)?;
-        let low_width: usize = Decode::decode(decoder)?;
-        let high_data: Vec<usize> = Decode::decode(decoder)?;
-        let high_width: usize = Decode::decode(decoder)?;
-        let high_len: usize = Decode::decode(decoder)?;
-        let low_len: usize = Decode::decode(decoder)?;
-        let low_bits = unsafe { BitFieldVec::from_raw_parts(low_data, low_width, low_len) };
-        let high_bits = unsafe { CountBitVec::from_raw_parts(high_data, high_width, high_len) };
-        let n: usize = Decode::decode(decoder)?;
-        let u: usize = Decode::decode(decoder)?;
-        let l: usize = Decode::decode(decoder)?;
-        let cell_indices: MyEliasFano = unsafe { EliasFano::from_raw_parts(u, n, l, low_bits, high_bits) };
+        let mut gene_builder = EliasFanoBuilder::new(gene_index.len(), *gene_index.iter().max().unwrap_or(&0) as usize + 1);
+        for &idx in &gene_index {
+            gene_builder.push(idx);
+        }
+        let gene_indices = gene_builder.build() ;
+
+        let mut cell_builder = EliasFanoBuilder::new(cell_index.len(), *cell_index.iter().max().unwrap_or(&0) as usize + 1);
+        for &idx in &cell_index {
+            cell_builder.push(idx);
+        }
+        let cell_indices = cell_builder.build();
 
         let data = Decode::decode(decoder)?;
         let w = Decode::decode(decoder)?;
@@ -220,31 +199,20 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
     fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
         decoder: &mut D,
     ) -> Result<Self, bincode::error::DecodeError> {
-        let low_data: Vec<usize> = BorrowDecode::borrow_decode(decoder)?;
-        let low_width: usize = BorrowDecode::borrow_decode(decoder)?;
-        let high_data: Vec<usize> = BorrowDecode::borrow_decode(decoder)?;
-        let high_width: usize = BorrowDecode::borrow_decode(decoder)?;
-        let high_len: usize = BorrowDecode::borrow_decode(decoder)?;
-        let low_len: usize = BorrowDecode::borrow_decode(decoder)?;
-        let low_bits = unsafe { BitFieldVec::from_raw_parts(low_data, low_width, low_len) };
-        let high_bits = unsafe { CountBitVec::from_raw_parts(high_data, high_width, high_len) };
-        let n: usize = BorrowDecode::borrow_decode(decoder)?;
-        let u: usize = BorrowDecode::borrow_decode(decoder)?;
-        let l: usize = BorrowDecode::borrow_decode(decoder)?;
-        let gene_indices: MyEliasFano = unsafe { EliasFano::from_raw_parts(u, n, l, low_bits, high_bits) };
+        let gene_index: Vec<usize> = BorrowDecode::borrow_decode(decoder)?;
+        let cell_index: Vec<usize> = BorrowDecode::borrow_decode(decoder)?;
 
-        let low_data: Vec<usize> = BorrowDecode::borrow_decode(decoder)?;
-        let low_width: usize = BorrowDecode::borrow_decode(decoder)?;
-        let high_data: Vec<usize> = BorrowDecode::borrow_decode(decoder)?;
-        let high_width: usize = BorrowDecode::borrow_decode(decoder)?;
-        let high_len: usize = BorrowDecode::borrow_decode(decoder)?;
-        let low_len: usize = BorrowDecode::borrow_decode(decoder)?; 
-        let low_bits = unsafe { BitFieldVec::from_raw_parts(low_data, low_width, low_len) };
-        let high_bits = unsafe { CountBitVec::from_raw_parts(high_data, high_width, high_len) };
-        let n: usize = BorrowDecode::borrow_decode(decoder)?;
-        let u: usize = BorrowDecode::borrow_decode(decoder)?;
-        let l: usize = BorrowDecode::borrow_decode(decoder)?;
-        let cell_indices: MyEliasFano = unsafe { EliasFano::from_raw_parts(u, n, l, low_bits, high_bits) };
+        let mut gene_builder = EliasFanoBuilder::new(gene_index.len(), *gene_index.iter().max().unwrap_or(&0) as usize + 1);
+        for &idx in &gene_index {
+            gene_builder.push(idx);
+        }
+        let gene_indices = gene_builder.build();
+
+        let mut cell_builder = EliasFanoBuilder::new(cell_index.len(), *cell_index.iter().max().unwrap_or(&0) as usize + 1);
+        for &idx in &cell_index {
+            cell_builder.push(idx);
+        }
+        let cell_indices = cell_builder.build();
 
         let data = BorrowDecode::borrow_decode(decoder)?;
         let width = BorrowDecode::borrow_decode(decoder)?;
@@ -336,14 +304,14 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     gene_indices.sort(); // Sort before creating EliasFano
     let mut gene_builder = EliasFanoBuilder::new(gene_indices.len(), *gene_indices.iter().max().unwrap_or(&0) as usize + 1);
     for &idx in &gene_indices {
-        gene_builder.push(idx as usize).unwrap();
+        gene_builder.push(idx as usize);
     }
     let gene_indices = gene_builder.build();
 
     cell_indices.sort(); // Sort before creating EliasFano
     let mut cell_builder = EliasFanoBuilder::new(cell_indices.len(), *cell_indices.iter().max().unwrap_or(&0) as usize + 1);
     for &idx in &cell_indices {
-        cell_builder.push(idx as usize).unwrap();
+        cell_builder.push(idx as usize);
     }
     let cell_indices = cell_builder.build();
 
@@ -358,11 +326,11 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     };
 
     // validate!
-    /*
+    
     for (cell_ind, gene_exp) in points.iter().enumerate() {
         assert_eq!(enc_diffs.expression_vec(cell_ind), gene_exp.data);
     }
-    */
+    
     info!(
         "Generated {} medians and {} diffs in {} bytes",
         enc_diffs.num_medians(),
@@ -703,13 +671,15 @@ impl BitFieldQuadTree {
         let mut total_cell_indices = 0;
 
         let diff_bits = self.encoded_diffs.diffs.len() * self.encoded_diffs.diffs.bit_width();
-        let (u, n, _,_, _) = self.encoded_diffs.cell_indices.clone().into_raw_parts();
-        let ci_bits = MyEliasFano::estimate_size(u, n);
-        let (u, n, _,_, _) = self.encoded_diffs.gene_indices.clone().into_raw_parts();
-        let gi_bits = MyEliasFano::estimate_size(u, n);
+        let n1 = self.encoded_diffs.cell_indices.len();
+        let u1 = self.encoded_diffs.cell_indices.iter().max().unwrap_or(0);
+        let n2 = self.encoded_diffs.gene_indices.len();
+        let u2 = self.encoded_diffs.gene_indices.iter().max().unwrap_or(0);
+        let ci_bits = EliasFano::<BitVec<Box<[usize]>>>::estimate_size(u1, n1);
+        let gi_bits = EliasFano::<BitVec<Box<[usize]>>>::estimate_size(u2, n2);
         total_diff_size += diff_bits;
-        total_gene_indices += ci_bits;
-        total_cell_indices += gi_bits;
+        total_gene_indices += gi_bits;
+        total_cell_indices += ci_bits;
         /*
         for bitfield in &self.data {
             let (_, width, len) = bitfield.bit_field.clone().into_raw_parts();
