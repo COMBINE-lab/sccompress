@@ -11,12 +11,12 @@ use std::error::Error;
 use std::fs::File as StdFile;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use sux::traits::BitFieldSliceCore;
 use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use std::collections::HashSet;
 
 fn tree_from_csv<T: AsRef<Path>>(
     file_path: T,
@@ -101,6 +101,41 @@ fn tree_from_csv<T: AsRef<Path>>(
     Ok(qtree)
 }
 
+/* 
+#[allow(dead_code)]
+fn load_matched_coordinates<P: AsRef<Path>>(
+    h5_path: P,
+    parquet_path: P,
+) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    // Step 1: Read barcodes from HDF5
+    let file = File::open(h5_path)?;
+    let matrix_group = file.group("matrix")?;
+    let barcodes: Vec<String> = matrix_group.dataset("barcodes")?.read_1d()?;
+    let barcode_set: HashSet<&str> = barcodes.iter().map(|s| s.as_str()).collect();
+
+    // Step 2: Read coordinates from Parquet
+    let mut df = LazyFrame::scan_parquet(parquet_path.as_ref().to_str().unwrap(), Default::default())?
+        .collect()?;
+
+    // Step 3: Filter rows where "barcode" exists in HDF5 barcodes
+    if df.get_column_names().contains(&"barcode") {
+        let mask = df
+            .column("barcode")?
+            .utf8()?
+            .into_iter()
+            .map(|opt| opt.map(|s| barcode_set.contains(s)))
+            .collect::<Result<BooleanChunked, _>>()?;
+
+        df = df.filter(&mask)?;
+    } else {
+        return Err("Column 'barcode' not found in parquet file".into());
+    }
+
+    Ok(df)
+}
+*/
+
+
 #[allow(dead_code)]
 fn tree_from_h5<T: AsRef<Path>>(
     h5_path: T,
@@ -109,7 +144,6 @@ fn tree_from_h5<T: AsRef<Path>>(
     _lossless: bool,
     seq_type: &str,
 ) -> anyhow::Result<QuadTree> {
-    // Read spatial coordinates from CSV
     let mut rdr = ReaderBuilder::new()
         .has_headers(true)
         .flexible(true) // Allow varying number of fields
@@ -117,8 +151,8 @@ fn tree_from_h5<T: AsRef<Path>>(
         .map_err(|e| anyhow::anyhow!("Failed to open spatial file: {}", e))?;
 
     let mut spatial_coords = HashMap::new();
-    let mut spatial_count = 0;
-    let mut line_number = 0;
+    let mut spatial_count: u32 = 0;
+    let mut line_number: u32 = 0;
 
     // Print header row for debugging
     if let Ok(header) = rdr.headers() {
@@ -390,14 +424,14 @@ struct BuildCommand {
     /// Input file format (csv or hdf5)
     #[arg(short = 'f', long, default_value = "csv")]
     format: String,
-    /// Index of x coordinate, default 5
+    /// Index of x coordinate, default 6
     #[arg(short = 'x', long, default_value_t = 6)]
     idx_x: usize,
-    /// Index of y coordinate, default 6
+    /// Index of y coordinate, default 7
     #[arg(short = 'y', long, default_value_t = 7)]
     idx_y: usize,
-    /// Index of gene start, default 1
-    #[arg(short = 's', long, default_value_t = 11)]
+    /// Index of gene start, default 10
+    #[arg(short = 's', long, default_value_t = 10)]
     idx_gene_start: usize,
     /// Index of gene end, default all remaining columns
     #[arg(short = 'e', long)]
@@ -483,7 +517,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut d = Data::new();
 
             let mut collect_data = |n: &BitFieldQuadTree| {
+                info!("Node has {} bytes of encoded diffs", n.encoded_diffs.bytes());
                 if n.encoded_diffs.bytes() > 0 {
+                    info!("Collecting data for node with {} positions", n.positions.len());
                     d.data.push(n.encoded_diffs.clone());
                     d.pos.extend_from_slice(&n.positions);
                 }
@@ -494,9 +530,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                 qtree.non_zero_blocks()
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
+            info!("Collected Positions: {}", d.pos.len());
             
             let(total_diff_size, total_gene_indices, total_cell_indices) = bit_field_tree.calculate_size();
             info!("{} bytes for diffs, {} bytes for gene indices, {} bytes for cell indices", total_diff_size, total_gene_indices, total_cell_indices);
+            
+            if d.data.is_empty() {
+                return Err(anyhow::anyhow!("No data was collected during build process").into());
+            }
             
             bincode::encode_into_std_write(&d.data, &mut file, config).unwrap();
             bincode::encode_into_std_write(&d.pos, &mut file, config).unwrap();
@@ -513,7 +554,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut d = Data::new();
             d.data = bincode::decode_from_std_read(&mut ifile, config)?;
             d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
-            d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
+            //d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
