@@ -1,40 +1,98 @@
+use std::io::Cursor;
+
 use bincode::{BorrowDecode, Decode, Encode};
+use bitm;
 use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+type InnerEFVector = cseq::elias_fano::Sequence<bitm::BinaryRankSearch, bitm::BinaryRankSearch>;
+pub struct EFVector(InnerEFVector);
+
+impl EFVector {
+    pub fn empty() -> Self {
+        let e = Vec::<u64>::new();
+        Self(InnerEFVector::with_items_from_slice_s(&e))
+    }
+}
+
+impl Clone for EFVector {
+    // Required method
+    fn clone(&self) -> Self {
+        //if !self.0.is_empty() {
+        let mut c = Cursor::new(Vec::new());
+        self.0.write(&mut c);
+        //let v = self.0.iter().collect::<Vec<u64>>();
+        //let seq = InnerEFVector::with_items_from_slice_s(&v);
+        c.set_position(0);
+        let seq = InnerEFVector::read_s(&mut c).expect("works");
+        Self(seq)
+        //} else {
+        //let v = Vec::<u64>::new();
+        //Self(InnerEFVector::with_items_from_slice_s(&v))
+        //}
+    }
+}
+
+impl Encode for EFVector {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        let b = self.0.write_bytes();
+        let mut d = Cursor::new(Vec::<u8>::with_capacity(b));
+        self.0.write(&mut d).expect("can write to cursor");
+        d.set_position(0);
+        Encode::encode(&d.into_inner(), encoder)
+    }
+}
+
+impl<Context> Decode<Context> for EFVector {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
+        let d: Vec<u8> = Decode::decode(decoder)?;
+        let mut c = Cursor::new(d);
+        c.set_position(0);
+        let seq = InnerEFVector::read_s(&mut c).expect("valid EF sequence");
+        Ok(Self(seq))
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for EFVector {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        let d: Vec<u8> = BorrowDecode::borrow_decode(decoder)?;
+        let mut c = Cursor::new(d);
+        c.set_position(0);
+        let indices = InnerEFVector::read_s(&mut c).expect("valid EF sequence");
+        Ok(Self(indices))
+    }
+}
 
 #[derive(Clone)]
 pub struct EncodedDiffs {
-    pub gene_indices: BitFieldVec,
-    pub cell_indices: BitFieldVec,
+    pub indices: EFVector,
+    pub ncells: u32,
     pub diffs: BitFieldVec,
     pub medians: BitFieldVec,
 }
-/*
-pub struct ExpressionIter<'a, W: sux::traits::Word, B: Clone> {
-    diff_iter: std::iter::Take<BitFieldVecIterator<'a, W, B>>,
-    nz_exp_iter: std::iter::Take<BitFieldVecIterator<'a, W, B>>,
-    gene_ind: usize
-}
 
-impl<'a, W: sux::traits::Word, B: Clone> Iterator for ExpressionIter<'a, W, B> {
-    type Item = u32;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if let Some(d) = self.diff_iter.next() {
-
-        }
-        None
+fn decode_v(diff: i32) -> i32 {
+    if diff % 2 == 0 {
+        diff / 2
+    } else {
+        -((diff - 1) / 2)
     }
 }
-*/
 
 impl EncodedDiffs {
     pub fn empty() -> Self {
         EncodedDiffs {
-            gene_indices: BitFieldVec::with_capacity(0, 0),
-            cell_indices: BitFieldVec::with_capacity(0, 0),
+            indices: EFVector::empty(),
+            ncells: 0,
             diffs: BitFieldVec::with_capacity(0, 0),
             medians: BitFieldVec::with_capacity(0, 0),
         }
@@ -57,48 +115,53 @@ impl EncodedDiffs {
     }
 
     pub fn num_cells(&self) -> usize {
-        self.cell_indices.len() - 1
+        self.ncells as usize
     }
-
-    /*
-    pub fn expression_iter(&self, cell_ind: usize) -> ExpressionIter<usize, Vec<usize>> {
-        let start = self.cell_indices.get(cell_ind); // inclusive
-        let stop = self.cell_indices.get(cell_ind + 1); // exclusive
-        let n = (stop - start);
-        ExpressionIter {
-            diff_iter: self.diffs.iter_from(start).take(n),
-            nz_exp_iter: self.gene_indices.iter_from(start).take(n),
-        }
-    }
-    */
 
     pub fn expression_vec(&self, cell_ind: usize) -> Vec<u16> {
-        let start = self.cell_indices.get(cell_ind); // inclusive
-        let stop = self.cell_indices.get(cell_ind + 1); // exclusive
+        let first_idx = self.num_genes() * cell_ind;
+        let last_idx = first_idx + self.num_genes();
+        let start_cur = self.indices.0.geq_cursor(first_idx as u64);
+        let stop_cur = self.indices.0.geq_cursor(last_idx as u64);
+
+        let start = if !start_cur.is_valid() {
+            usize::MAX
+        } else {
+            start_cur.index()
+        };
+
+        let stop = if !stop_cur.is_valid() {
+            self.diffs.len()
+        } else {
+            stop_cur.index()
+        };
+        if start == usize::MAX {
+            warn!("SHOULD NOT HAPPEN!");
+        }
+        if start >= last_idx {
+            warn!("SHOULD NOT HAPPEN 2!");
+        }
+
         let n = stop - start;
         if n == 0 {
             return vec![0_u16; self.num_genes()];
         }
 
-        let mut diff_iter = self.diffs.iter_from(start).take(n);
-        let mut nz_ind_iter = self.gene_indices.iter_from(start).take(n);
+        let mut diff_iter = self.diffs.iter_from(start);
+        let mut nz_ind_iter = start_cur.clone();
 
         let mut expression = Vec::with_capacity(self.num_genes());
         let mut next_diff = diff_iter.next().expect("at least one");
-        let mut next_nz_ind = nz_ind_iter.next().expect("at least one");
+        let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
         for gidx in 0..self.num_genes() {
-            if gidx < next_nz_ind {
+            if gidx < next_nz_ind as usize {
                 expression.push(0);
             } else {
-                // even was positive
-                let diff = if next_diff % 2 == 0 {
-                    (next_diff / 2) as i32
-                } else {
-                    -((next_diff as i32 - 1) / 2)
-                };
-                let decoded_val = (diff + self.medians.get(gidx) as i32) as u16;
+                let ddiff = decode_v(next_diff as i32);
+                let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
                 expression.push(decoded_val);
-                next_nz_ind = nz_ind_iter.next().unwrap_or(usize::MAX);
+                let _more = nz_ind_iter.advance();
+                next_nz_ind = nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
                 next_diff = diff_iter.next().unwrap_or(usize::MAX);
             }
         }
@@ -108,10 +171,10 @@ impl EncodedDiffs {
 
     pub fn bytes(&self) -> usize {
         let diff_bits = self.diffs.len() * self.diffs.bit_width();
-        let ci_bits = self.cell_indices.len() * self.cell_indices.bit_width();
-        let gi_bits = self.gene_indices.len() * self.gene_indices.bit_width();
+        let ibits = self.indices.0.write_bytes() * 8;
+        let ncbits = 32;
         let m_bits = self.medians.len() * self.medians.bit_width();
-        (4 * 24) + (diff_bits + ci_bits + gi_bits + m_bits) / 8
+        (4 * 24) + (diff_bits + ibits + ncbits + m_bits) / 8
     }
 }
 
@@ -122,15 +185,9 @@ impl Encode for EncodedDiffs {
         &self,
         encoder: &mut E,
     ) -> core::result::Result<(), bincode::error::EncodeError> {
-        let (b, w, l) = self.gene_indices.clone().into_raw_parts();
-        Encode::encode(&b, encoder)?;
-        Encode::encode(&w, encoder)?;
-        Encode::encode(&l, encoder)?;
-
-        let (b, w, l) = self.cell_indices.clone().into_raw_parts();
-        Encode::encode(&b, encoder)?;
-        Encode::encode(&w, encoder)?;
-        Encode::encode(&l, encoder)?;
+        //Encode::encode(&self.indices, encoder)?;
+        Encode::encode(&self.indices, encoder)?;
+        Encode::encode(&self.ncells, encoder)?;
 
         let (b, w, l) = self.diffs.clone().into_raw_parts();
         Encode::encode(&b, encoder)?;
@@ -149,15 +206,9 @@ impl<Context> Decode<Context> for EncodedDiffs {
     fn decode<D: bincode::de::Decoder<Context = Context>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let data = Decode::decode(decoder)?;
-        let w = Decode::decode(decoder)?;
-        let l = Decode::decode(decoder)?;
-        let gene_indices = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+        let indices = Decode::decode(decoder)?;
 
-        let data = Decode::decode(decoder)?;
-        let w = Decode::decode(decoder)?;
-        let l = Decode::decode(decoder)?;
-        let cell_indices = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+        let ncells = Decode::decode(decoder)?;
 
         let data = Decode::decode(decoder)?;
         let w = Decode::decode(decoder)?;
@@ -170,8 +221,8 @@ impl<Context> Decode<Context> for EncodedDiffs {
         let medians = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
 
         Ok(Self {
-            gene_indices,
-            cell_indices,
+            indices,
+            ncells,
             diffs,
             medians,
         })
@@ -182,15 +233,8 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
     fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
         decoder: &mut D,
     ) -> Result<Self, bincode::error::DecodeError> {
-        let data = BorrowDecode::borrow_decode(decoder)?;
-        let width = BorrowDecode::borrow_decode(decoder)?;
-        let len = BorrowDecode::borrow_decode(decoder)?;
-        let gene_indices = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
-
-        let data = BorrowDecode::borrow_decode(decoder)?;
-        let width = BorrowDecode::borrow_decode(decoder)?;
-        let len = BorrowDecode::borrow_decode(decoder)?;
-        let cell_indices = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+        let indices = BorrowDecode::borrow_decode(decoder)?;
+        let ncells = BorrowDecode::borrow_decode(decoder)?;
 
         let data = BorrowDecode::borrow_decode(decoder)?;
         let width = BorrowDecode::borrow_decode(decoder)?;
@@ -203,8 +247,8 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
         let medians = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
 
         Ok(Self {
-            gene_indices,
-            cell_indices,
+            indices,
+            ncells,
             diffs,
             medians,
         })
@@ -223,14 +267,13 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         return None;
     }
 
-    let mut gene_indices = Vec::<u32>::new();
-    let mut cell_indices = Vec::<u32>::new();
+    let mut indices = Vec::<u64>::new();
     let mut medians = Vec::<u16>::new();
     let mut raw_diffs = Vec::<u32>::new();
     let mut max_diff = 0_i32;
-
+    let num_genes = points[0].data.len() as u32;
     debug!("Processing {} points in encode_subarray()", points.len());
-    debug!("Number of genes: {}", points[0].data.len());
+    debug!("Number of genes: {}", num_genes);
 
     // we'll make 2 passes, because we want to store the final results in
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
@@ -253,8 +296,9 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     }
 
     // for each cell
-    for gene_exp in points.iter() {
-        cell_indices.push(gene_indices.len() as u32);
+    for (cell_ind, gene_exp) in points.iter().enumerate() {
+        let index_offset = cell_ind * num_genes as usize;
+        // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
         for ((gene_ind, val), med_val) in gene_exp.data.iter().enumerate().zip(&medians) {
             // the median of **non-zero** expression values was zero, this
@@ -271,32 +315,35 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
                 } else {
                     2_i32 * diff
                 };
+                assert_eq!(*val as i32, decode_v(diff) + *med_val as i32);
                 raw_diffs.push(diff as u32);
-                gene_indices.push(gene_ind as u32);
+                let index = index_offset + gene_ind;
+                indices.push(index as u64);
+                //gene_indices.push(gene_ind as u32);
                 max_diff = max_diff.max(diff);
             }
         }
     }
-    cell_indices.push(gene_indices.len() as u32);
 
-    let gene_indices = BitFieldVec::<usize>::from_slice(&gene_indices).expect("should fit");
-    let cell_indices = BitFieldVec::<usize>::from_slice(&cell_indices).expect("should fit");
+    //let gene_indices = BitFieldVec::<usize>::from_slice(&gene_indices).expect("should fit");
+    //let cell_indices = BitFieldVec::<usize>::from_slice(&cell_indices).expect("should fit");
+    let indices = InnerEFVector::with_items_from_slice_s(&indices);
     let medians = BitFieldVec::<usize>::from_slice(&medians).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
+    assert_eq!(indices.len(), diffs.len());
 
     let enc_diffs = EncodedDiffs {
-        gene_indices,
-        cell_indices,
+        indices: EFVector(indices),
+        ncells: points.len() as u32,
         diffs,
         medians,
     };
 
     // validate!
-    /*
     for (cell_ind, gene_exp) in points.iter().enumerate() {
         assert_eq!(enc_diffs.expression_vec(cell_ind), gene_exp.data);
     }
-    */
+
     info!(
         "Generated {} medians and {} diffs in {} bytes",
         enc_diffs.num_medians(),

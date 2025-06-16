@@ -508,7 +508,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut d = Data::new();
             d.data = bincode::decode_from_std_read(&mut ifile, config)?;
             d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
-            d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
+            //d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
