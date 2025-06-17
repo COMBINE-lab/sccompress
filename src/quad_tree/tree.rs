@@ -16,6 +16,7 @@ pub struct EncodedDiffs {
     pub cell_indices: MyEliasFano,
     pub diffs: BitFieldVec,
     pub medians: BitFieldVec,
+    pub sparse_type: u8,
 }
 /*
 pub struct ExpressionIter<'a, W: sux::traits::Word, B: Clone> {
@@ -46,6 +47,7 @@ impl EncodedDiffs {
             cell_indices,
             diffs: BitFieldVec::with_capacity(0, 0),
             medians: BitFieldVec::with_capacity(0, 0),
+            sparse_type: 0,
         }
     }
 
@@ -82,42 +84,42 @@ impl EncodedDiffs {
     */
 
     pub fn expression_vec(&self, cell_ind: usize) -> Vec<u16> {
+        let mut expression = Vec::with_capacity(self.num_genes());
         let start = self.cell_indices.get(cell_ind); // inclusive
         let stop = self.cell_indices.get(cell_ind + 1); // exclusive
         let n = stop - start;
-        
         if n == 0 {
             return vec![0_u16; self.num_genes()];
         }
 
-        // Collect all gene indices and differences for debugging
-        let gene_indices: Vec<usize> = self.gene_indices.iter_from(start).take(n).collect();
-        let diffs: Vec<usize> = self.diffs.iter_from(start).take(n).collect();
+ //       if self.sparse_type != 1 {   
+            // Collect all gene indices and differences for debugging
+            let gene_indices: Vec<usize> = self.gene_indices.iter_from(start).take(n).collect();
+            let diffs: Vec<usize> = self.diffs.iter_from(start).take(n).collect();
 
-        let mut diff_iter = self.diffs.iter_from(start).take(n);
-        let mut nz_ind_iter = self.gene_indices.iter_from(start).take(n);
+            let mut diff_iter = self.diffs.iter_from(start).take(n);
+            let mut nz_ind_iter = self.gene_indices.iter_from(start).take(n);
 
-        let mut expression = Vec::with_capacity(self.num_genes());
-        let mut next_diff = diff_iter.next().expect("at least one");
-        let mut next_nz_ind = nz_ind_iter.next().expect("at least one");
-        
+            let mut next_diff = diff_iter.next().expect("at least one");
+            let mut next_nz_ind = nz_ind_iter.next().expect("at least one");
+  //      }
         for gidx in 0..self.num_genes() {
             if gidx < next_nz_ind {
                 expression.push(0);
             } else {
-                // even was positive
-                let diff = if next_diff % 2 == 0 {
-                    (next_diff / 2) as i32
-                } else {
-                    -((next_diff as i32 - 1) / 2)
-                };
-                // Add the median back to get the actual value
-                let median = self.medians.get(gidx) as i32;
-                let decoded_val = (diff + median) as u16;
-                expression.push(decoded_val);
-                // Move to next non-zero gene
-                next_nz_ind = nz_ind_iter.next().unwrap_or(usize::MAX);
-                next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                    // even was positive
+                    let diff = if next_diff % 2 == 0 {
+                        (next_diff / 2) as i32
+                    } else {
+                        -((next_diff as i32 - 1) / 2)
+                    };
+                    // Add the median back to get the actual value
+                    let median = self.medians.get(gidx) as i32;
+                    let decoded_val = (diff + median) as u16;
+                    expression.push(decoded_val);
+                    // Move to next non-zero gene
+                    next_nz_ind = nz_ind_iter.next().unwrap_or(usize::MAX);
+                    next_diff = diff_iter.next().unwrap_or(usize::MAX);
             }
         }
         expression
@@ -127,6 +129,7 @@ impl EncodedDiffs {
         let diff_bits = self.diffs.len() * self.diffs.bit_width();
         let n1 = self.cell_indices.len();
         let u1 = self.cell_indices.iter().max().unwrap_or(0);
+        println!("u1: {}", u1);
         let ci_bits = EliasFano::<BitVec<Box<[usize]>>>::estimate_size(u1, n1);
         let gi_bits = self.gene_indices.len() * self.gene_indices.bit_width();
         let m_bits = self.medians.len() * self.medians.bit_width();
@@ -158,6 +161,8 @@ impl Encode for EncodedDiffs {
         Encode::encode(&b, encoder)?;
         Encode::encode(&w, encoder)?;
         Encode::encode(&l, encoder)?;
+
+        Encode::encode(&self.sparse_type, encoder)?;
         Ok(())
     }
 }
@@ -188,11 +193,14 @@ impl<Context> Decode<Context> for EncodedDiffs {
         let l = Decode::decode(decoder)?;
         let medians = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
 
+        let sparse_type = Decode::decode(decoder)?;
+
         Ok(Self {
             gene_indices,
             cell_indices,
             diffs,
             medians,
+            sparse_type,
         })
     }
 }
@@ -223,11 +231,14 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
         let len = BorrowDecode::borrow_decode(decoder)?;
         let medians = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
 
+        let sparse_type = BorrowDecode::borrow_decode(decoder)?;
+
         Ok(Self {
             gene_indices,
             cell_indices,
             diffs,
             medians,
+            sparse_type,
         })
     }
 }
@@ -248,18 +259,23 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     let mut cell_indices = Vec::<u32>::new();
     let mut medians = Vec::<u16>::new();
     let mut raw_diffs = Vec::<u32>::new();
-    let mut max_diff = 0_i32;
+   // let mut max_diff = 0_i32;
+    let mut sparse_type: u8 = 0;
+    let gene_len = points[0].data.len();
+ //   let mut gene_gaps = Vec::<u32>::new();
+    let mut nz_len = 0_u32;
 
     // we'll make 2 passes, because we want to store the final results in
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
-    for j in 0..points[0].data.len() {
+    for j in 0..gene_len {
         // get the non-zero values and the non-zero indices
         let nz_values: Vec<u16> = points
             .iter()
             .filter_map(|p| if p.data[j] > 0 { Some(p.data[j]) } else { None })
             .collect();
+        nz_len += nz_values.len() as u32;
 
-        // nonzero median values
+        // median values including zero
         let median = if !nz_values.is_empty() {
             let mut sorted_values = nz_values.clone();
             sorted_values.sort_unstable();
@@ -270,10 +286,16 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         //println!("Gene {}: median={}, nz_values={:?}", j, median, nz_values);
         medians.push(median);
     }
-
+    println!("medians.len(): {:?}", medians.len());
+    let total_len = gene_len*points.len();
+    let sparsity =  nz_len as f32 / total_len as f32;
+    
     // for each cell
     for (cell_idx, gene_exp) in points.iter().enumerate() {
+        //let pre_cell_idx = cell_indices.pop().unwrap_or(0);
         cell_indices.push(gene_indices.len() as u32);
+        //let suc_cell_idx = cell_indices.pop().unwrap_or(0);
+
         // for each gene in this cell
         for ((gene_ind, val), med_val) in gene_exp.data.iter().enumerate().zip(&medians) {
             // the median of **non-zero** expression values was zero, this
@@ -281,7 +303,9 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
             // this gene. Otherwise, if the original value itself is zero, then
             // don't record anything
             if *med_val == 0 || *val == 0 {
-                continue;
+                if sparsity > 0.75 {
+                    gene_indices.push(gene_ind as u32);
+                }
             } else {
                 // we have a non-zero median value
                 let diff = *val as i32 - *med_val as i32;
@@ -292,12 +316,30 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
                 };
                 //println!("Cell {} Gene {}: val={}, med={}, diff={}", cell_idx, gene_ind, val, med_val, diff);
                 raw_diffs.push(diff as u32);
-                gene_indices.push(gene_ind as u32);
-                max_diff = max_diff.max(diff);
+                if sparsity < 0.25 {
+                    gene_indices.push(gene_ind as u32);
+                }
+                //max_diff = max_diff.max(diff);
             }
         }
+        /* taking too long
+        println!("calculating gene gaps");
+        let mut bits = bitvec![0; gene_len];
+        for &n in gene_indices.iter() {
+            bits.set(n as usize, true);
+        }
+        gene_gaps = bits.iter_zeros().map(|x| x as u32).collect();
+        */
     }
-    cell_indices.push(gene_indices.len() as u32);
+    if sparsity >= 0.25 && sparsity < 0.75 {
+        //println!("dense");
+        // get the length of 0s in the cell_indices
+        cell_indices = cell_indices.iter().enumerate().map(|(i, &x)| (gene_len * i)as u32 - x).collect();
+        sparse_type = 2;
+    }else{
+        println!("sparse");
+        cell_indices.push(gene_indices.len() as u32);
+    }
 
     let mut cell_builder = EliasFanoBuilder::new(cell_indices.len(), *cell_indices.iter().max().unwrap_or(&0) as usize + 1);
     for &idx in &cell_indices {
@@ -314,14 +356,15 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         cell_indices,
         diffs,
         medians,
+        sparse_type,
     };
-
+/* 
     // validate!
     for (cell_ind, gene_exp) in points.iter().enumerate() {
         let reconstructed = enc_diffs.expression_vec(cell_ind);
         assert_eq!(reconstructed, gene_exp.data);
     }
-    
+    */
     info!(
         "Generated {} medians and {} diffs in {} bytes",
         enc_diffs.num_medians(),
@@ -667,7 +710,7 @@ impl BitFieldQuadTree {
         let n2 = self.encoded_diffs.gene_indices.len();
         let u2 = self.encoded_diffs.gene_indices.iter().max().unwrap_or(0);
         let ci_bits = EliasFano::<BitVec<Box<[usize]>>>::estimate_size(u1, n1);
-        let gi_bits = self.encoded_diffs.diffs.len() * self.encoded_diffs.diffs.bit_width();
+        let gi_bits = self.encoded_diffs.gene_indices.len() * self.encoded_diffs.gene_indices.bit_width();
         total_diff_size += diff_bits;
         total_gene_indices += gi_bits;
         total_cell_indices += ci_bits;
