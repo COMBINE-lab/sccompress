@@ -91,7 +91,7 @@ fn decode_v(diff: i32) -> i32 {
 
 fn encode_v(val: i32, med_val: i32) -> i32 {
     let diff = val as i32 - med_val as i32;
-    let diff = if diff < 0 {
+    let diff = if diff <= 0 {
         (-2_i32 * diff) + 1
     } else {
         2_i32 * diff
@@ -132,9 +132,9 @@ impl EncodedDiffs {
 
     pub fn expression_vec(&self, cell_ind: usize) -> Vec<u16> {
         let mut expression = Vec::with_capacity(self.num_genes());
+        let first_idx = self.num_genes() * cell_ind;
+        let last_idx = first_idx + self.num_genes();
         if self.sparse_type != 1{
-            let first_idx = self.num_genes() * cell_ind;
-            let last_idx = first_idx + self.num_genes();
             let start_cur = self.indices.0.geq_cursor(first_idx as u64);
             let stop_cur = self.indices.0.geq_cursor(last_idx as u64);
 
@@ -180,12 +180,17 @@ impl EncodedDiffs {
             }
         }
         else{
-            let mut diff_iter = self.diffs.iter();
+            let mut diff_iter = self.diffs.iter_from(first_idx as usize);
             let mut next_diff = diff_iter.next().expect("at least one");
             for gidx in 0..self.num_genes() {
-                let ddiff = decode_v(next_diff as i32);
-                let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
-                expression.push(decoded_val);
+                let median = self.medians.get(gidx);
+                let decoded_val = if next_diff == 0{
+                    0_i32
+                }else{
+                    decode_v(next_diff as i32)+ median as i32
+                };
+                next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                expression.push(decoded_val as u16);
             }
             
         }
@@ -380,7 +385,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     let indices = InnerEFVector::with_items_from_slice_s(&indices);
     let medians = BitFieldVec::<usize>::from_slice(&medians).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
-    assert_eq!(indices.len(), diffs.len());
+    if sparsity < 0.25{assert_eq!(indices.len(), diffs.len());}
 
     let enc_diffs = EncodedDiffs {
         indices: EFVector(indices),
