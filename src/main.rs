@@ -1,4 +1,5 @@
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
+pub mod bits;
 pub mod quad_tree;
 use clap::{Args, Parser, Subcommand};
 use csv::ReaderBuilder;
@@ -406,7 +407,6 @@ struct BuildCommand {
 struct Data {
     pub data: Vec<EncodedDiffs>,
     pub pos: Vec<DatalessPoint>,
-    pub sep: Vec<usize>,
 }
 
 impl Data {
@@ -414,7 +414,6 @@ impl Data {
         Self {
             data: Vec::new(),
             pos: Vec::new(),
-            sep: Vec::new(),
         }
     }
 }
@@ -508,14 +507,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut d = Data::new();
             d.data = bincode::decode_from_std_read(&mut ifile, config)?;
             d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
-            //d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
-                let mut num_ones = 0_usize;
-                for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
-                    let expression = compressed_diffs
-                        .expression_vec(cell_id, &mut num_ones)
+                for (loc, expression_vec) in d
+                    .pos
+                    .iter()
+                    .skip(start)
+                    .take(n)
+                    .zip(compressed_diffs.expression_vec_iter())
+                {
+                    let expression = expression_vec
                         .iter()
                         .map(|x| x.to_string())
                         .collect::<Vec<_>>()
