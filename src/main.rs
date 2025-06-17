@@ -532,8 +532,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             info!("Collected Encoded Diffs : {}", d.data.len());
             info!("Collected Positions: {}", d.pos.len());
             
-            let(total_diff_size, total_gene_indices, total_cell_indices) = bit_field_tree.calculate_size();
-            info!("{} bytes for diffs, {} bytes for gene indices, {} bytes for cell indices", total_diff_size, total_gene_indices, total_cell_indices);
+            let(total_diff_size, total_gene_indices) = bit_field_tree.calculate_size();
+            info!("{} bytes for diffs, {} bytes for gene indices", total_diff_size, total_gene_indices);
             
             if d.data.is_empty() {
                 return Err(anyhow::anyhow!("No data was collected during build process").into());
