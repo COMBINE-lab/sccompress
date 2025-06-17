@@ -1,7 +1,8 @@
 use std::io::Cursor;
 
 use bincode::{BorrowDecode, Decode, Encode};
-use bitm;
+use bitm::{self, BitAccess};
+use cseq::elias_fano::Cursor as EFCursor;
 use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
@@ -9,6 +10,71 @@ use tracing::{debug, info, warn};
 
 type InnerEFVector = cseq::elias_fano::Sequence<bitm::BinaryRankSearch, bitm::BinaryRankSearch>;
 pub struct EFVector(InnerEFVector);
+
+#[derive(Clone, Encode, Decode)]
+enum HybridSparseVec {
+    EF(EFVector),
+    Bit(Vec<u64>),
+}
+
+struct HybridSparseIterator<'a> {
+    bit_it: Option<bitm::BitBIterator<'a, true>>,
+    ef_it: Option<
+        cseq::elias_fano::Cursor<'a, bitm::BinaryRankSearch, bitm::BinaryRankSearch, Box<[u64]>>,
+    >,
+}
+
+impl<'a> Iterator for HybridSparseIterator<'a> {
+    type Item = u64;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if let Some(bit_it) = &mut self.bit_it {
+            bit_it.next().map(|x| x as u64)
+        } else if let Some(ef_it) = &mut self.ef_it {
+            let r = ef_it.value();
+            ef_it.advance();
+            r.map(|x| x as u64)
+        } else {
+            None
+        }
+    }
+}
+
+impl HybridSparseVec {
+    pub fn empty() -> Self {
+        Self::Bit(Vec::new())
+    }
+
+    pub fn from_indices(inds: &[u64], s: f64, tot: usize) -> Self {
+        let ef = InnerEFVector::with_items_from_slice_s(inds);
+        let nw = bitm::ceiling_div(tot, 64);
+        if ef.write_bytes() < nw {
+            Self::EF(EFVector(ef))
+        } else {
+            let mut v = vec![0; nw];
+            for i in inds {
+                v.set_bit(*i as usize);
+            }
+            Self::Bit(v)
+        }
+    }
+
+    pub fn num_bits(&self) -> usize {
+        match self {
+            Self::Bit(b) => b.len() * 8,
+            Self::EF(b) => b.0.write_bytes() * 8,
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::EF(e) => e.0.len(),
+            Self::Bit(e) => e.count_bit_ones(),
+        }
+    }
+
+    //    pub fn
+}
 
 impl EFVector {
     pub fn empty() -> Self {
@@ -74,7 +140,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EFVector {
 
 #[derive(Clone)]
 pub struct EncodedDiffs {
-    pub indices: EFVector,
+    pub indices: HybridSparseVec,
     pub ncells: u32,
     pub diffs: BitFieldVec,
     pub medians: BitFieldVec,
@@ -91,7 +157,7 @@ fn decode_v(diff: i32) -> i32 {
 impl EncodedDiffs {
     pub fn empty() -> Self {
         EncodedDiffs {
-            indices: EFVector::empty(),
+            indices: HybridSparseVec::empty(),
             ncells: 0,
             diffs: BitFieldVec::with_capacity(0, 0),
             medians: BitFieldVec::with_capacity(0, 0),
@@ -118,60 +184,99 @@ impl EncodedDiffs {
         self.ncells as usize
     }
 
-    pub fn expression_vec(&self, cell_ind: usize) -> Vec<u16> {
-        let first_idx = self.num_genes() * cell_ind;
-        let last_idx = first_idx + self.num_genes();
-        let start_cur = self.indices.0.geq_cursor(first_idx as u64);
-        let stop_cur = self.indices.0.geq_cursor(last_idx as u64);
+    fn expression_vec_bitv(&self, cell_ind: usize, num_ones: &mut usize) -> Vec<u16> {
+        match &self.indices {
+            HybridSparseVec::Bit(indices) => {
+                let first_idx = self.num_genes() * cell_ind;
+                let mut diff_iter = self.diffs.iter_from(*num_ones);
 
-        let start = if !start_cur.is_valid() {
-            usize::MAX
-        } else {
-            start_cur.index()
-        };
-
-        let stop = if !stop_cur.is_valid() {
-            self.diffs.len()
-        } else {
-            stop_cur.index()
-        };
-        if start == usize::MAX {
-            warn!("SHOULD NOT HAPPEN!");
-        }
-        if start >= last_idx {
-            warn!("SHOULD NOT HAPPEN 2!");
-        }
-
-        let n = stop - start;
-        if n == 0 {
-            return vec![0_u16; self.num_genes()];
-        }
-
-        let mut diff_iter = self.diffs.iter_from(start);
-        let mut nz_ind_iter = start_cur.clone();
-
-        let mut expression = Vec::with_capacity(self.num_genes());
-        let mut next_diff = diff_iter.next().expect("at least one");
-        let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
-        for gidx in 0..self.num_genes() {
-            if gidx < next_nz_ind as usize {
-                expression.push(0);
-            } else {
-                let ddiff = decode_v(next_diff as i32);
-                let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
-                expression.push(decoded_val);
-                let _more = nz_ind_iter.advance();
-                next_nz_ind = nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
-                next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                let mut expression = Vec::with_capacity(self.num_genes());
+                let mut next_diff = diff_iter.next().expect("at least one");
+                let mut num_ones_in_cell = 0_usize;
+                for gidx in 0..self.num_genes() {
+                    if !indices.get_bit(gidx + first_idx) {
+                        expression.push(0);
+                    } else {
+                        num_ones_in_cell += 1;
+                        let ddiff = decode_v(next_diff as i32);
+                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                        expression.push(decoded_val);
+                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                    }
+                }
+                *num_ones += num_ones_in_cell;
+                expression
             }
+            _ => unimplemented!(),
         }
+    }
 
-        expression
+    fn expression_vec_ef(&self, cell_ind: usize, num_ones: &mut usize) -> Vec<u16> {
+        match &self.indices {
+            HybridSparseVec::EF(indices) => {
+                let first_idx = self.num_genes() * cell_ind;
+                let last_idx = first_idx + self.num_genes();
+
+                let start_cur = indices.0.geq_cursor(first_idx as u64);
+                let stop_cur = indices.0.geq_cursor(last_idx as u64);
+
+                let start = if !start_cur.is_valid() {
+                    usize::MAX
+                } else {
+                    start_cur.index()
+                };
+
+                let stop = if !stop_cur.is_valid() {
+                    self.diffs.len()
+                } else {
+                    stop_cur.index()
+                };
+                if start == usize::MAX {
+                    warn!("SHOULD NOT HAPPEN!");
+                }
+                if start >= last_idx {
+                    warn!("SHOULD NOT HAPPEN 2!");
+                }
+
+                let n = stop - start;
+                if n == 0 {
+                    return vec![0_u16; self.num_genes()];
+                }
+
+                let mut diff_iter = self.diffs.iter_from(start);
+                let mut nz_ind_iter = start_cur.clone();
+
+                let mut expression = Vec::with_capacity(self.num_genes());
+                let mut next_diff = diff_iter.next().expect("at least one");
+                let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
+                for gidx in 0..self.num_genes() {
+                    if gidx < next_nz_ind as usize {
+                        expression.push(0);
+                    } else {
+                        let ddiff = decode_v(next_diff as i32);
+                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                        expression.push(decoded_val);
+                        let _more = nz_ind_iter.advance();
+                        next_nz_ind = nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
+                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                    }
+                }
+                expression
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    pub fn expression_vec(&self, cell_ind: usize, num_ones: &mut usize) -> Vec<u16> {
+        match &self.indices {
+            HybridSparseVec::EF(_) => self.expression_vec_ef(cell_ind, num_ones),
+            HybridSparseVec::Bit(_) => self.expression_vec_bitv(cell_ind, num_ones),
+        }
     }
 
     pub fn bytes(&self) -> usize {
         let diff_bits = self.diffs.len() * self.diffs.bit_width();
-        let ibits = self.indices.0.write_bytes() * 8;
+        let ibits = self.indices.num_bits(); //0.write_bytes() * 8;
         let ncbits = 32;
         let m_bits = self.medians.len() * self.medians.bit_width();
         (4 * 24) + (diff_bits + ibits + ncbits + m_bits) / 8
@@ -275,6 +380,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     debug!("Processing {} points in encode_subarray()", points.len());
     debug!("Number of genes: {}", num_genes);
 
+    let mut nnz = 0_usize;
     // we'll make 2 passes, because we want to store the final results in
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
     for j in 0..points[0].data.len() {
@@ -286,6 +392,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
 
         // nonzero median values
         let median = if !nz_values.is_empty() {
+            nnz += nz_values.len();
             let mut sorted_values = nz_values.clone();
             sorted_values.sort_unstable();
             sorted_values[sorted_values.len() / 2] //median of the expressed values
@@ -294,6 +401,9 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         };
         medians.push(median);
     }
+
+    let tot = num_genes as usize * points.len();
+    let sparsity = (nnz as f64) / (tot as f64);
 
     // for each cell
     for (cell_ind, gene_exp) in points.iter().enumerate() {
@@ -327,21 +437,26 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
 
     //let gene_indices = BitFieldVec::<usize>::from_slice(&gene_indices).expect("should fit");
     //let cell_indices = BitFieldVec::<usize>::from_slice(&cell_indices).expect("should fit");
-    let indices = InnerEFVector::with_items_from_slice_s(&indices);
+    let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
     let medians = BitFieldVec::<usize>::from_slice(&medians).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
+    info!("sparsity : {}", sparsity);
     assert_eq!(indices.len(), diffs.len());
 
     let enc_diffs = EncodedDiffs {
-        indices: EFVector(indices),
+        indices,
         ncells: points.len() as u32,
         diffs,
         medians,
     };
 
     // validate!
+    let mut num_ones = 0_usize;
     for (cell_ind, gene_exp) in points.iter().enumerate() {
-        assert_eq!(enc_diffs.expression_vec(cell_ind), gene_exp.data);
+        assert_eq!(
+            enc_diffs.expression_vec(cell_ind, &mut num_ones),
+            gene_exp.data
+        );
     }
 
     info!(

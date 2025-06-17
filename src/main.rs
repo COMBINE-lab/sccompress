@@ -512,9 +512,10 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
+                let mut num_ones = 0_usize;
                 for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
                     let expression = compressed_diffs
-                        .expression_vec(cell_id)
+                        .expression_vec(cell_id, &mut num_ones)
                         .iter()
                         .map(|x| x.to_string())
                         .collect::<Vec<_>>()
