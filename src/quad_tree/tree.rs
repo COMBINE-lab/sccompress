@@ -866,7 +866,7 @@ impl QuadTree {
     /// Get all expression data for a point
     pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> Vec<&'a ArrayData> {
         // Since we now store data directly in Point, just return it as a single element
-        vec![&point.data_arc]
+        vec![&**point.data_arc]
     }
 
     pub(crate) fn query(&self, boundary: &Rect) -> Vec<Point> {
