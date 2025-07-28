@@ -10,10 +10,25 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use anndata::{AnnData, AnnDataOp, ArrayData, ArrayElemOp, Backend, data::SelectInfoElem, HasShape};
 use std::sync::Arc;
+use hdf5::{File as Hdf5File, Group, Dataset};
+use ndarray::{Array1, ArrayD, s};
 
-use anndata_hdf5::H5;
+// Simple ArrayData type to replace anndata::ArrayData
+#[derive(Clone)]
+pub struct ArrayData {
+    pub data: ArrayD<u16>,
+}
+
+impl ArrayData {
+    pub fn new(data: ArrayD<u16>) -> Self {
+        Self { data }
+    }
+    
+    pub fn shape(&self) -> &[usize] {
+        self.data.shape()
+    }
+}
 
 //use af_anndata::H5 as H52;
 use std::fs::File;
@@ -21,30 +36,65 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 
 fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
-    // Try to read as AnnData first (in case it's actually AnnData format)
-    match AnnData::<H5>::open(H5::open(h5_path.as_ref())?) {
-        Ok(adata) => {
-            println!("File is in AnnData format");
-            let var_names = adata.var_names();
-            let names: Vec<String> = var_names.into_vec();
-            println!("Found {} features", names.len());
-            
-            // If we got 0 features, the file might actually be 10x format
-            if names.is_empty() {
-                println!("Warning: Found 0 features, file might be in 10x format");
-                println!("Using placeholder features based on h5ls output (541 features)");
-                let placeholder_features: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
-                Ok(placeholder_features)
-            } else {
-                Ok(names)
+    println!("Reading features from 10x HDF5 file: {}", h5_path.as_ref().display());
+    
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    println!("Successfully opened HDF5 file");
+    
+    let matrix_group = file.group("matrix")?;
+    println!("Found matrix group");
+    
+    let features_group = matrix_group.group("features")?;
+    println!("Found features group");
+    
+    // Try to read feature names
+    match features_group.dataset("name") {
+        Ok(name_dataset) => {
+            println!("Found name dataset, attempting to read...");
+            match name_dataset.read_1d::<u8>() {
+                Ok(names_bytes) => {
+                    println!("Successfully read {} bytes from name dataset", names_bytes.len());
+                    
+                    // Convert to Vec<u8> to avoid version conflicts
+                    let names_vec: Vec<u8> = names_bytes.to_vec();
+                    
+                    // Convert bytes to strings - each string is 23 bytes
+                    let mut names = Vec::new();
+                    for i in 0..541 {
+                        let start = i * 23;
+                        let end = start + 23;
+                        if end <= names_vec.len() {
+                            let string_bytes = &names_vec[start..end];
+                            // Convert bytes to string, removing null padding
+                            let name = String::from_utf8_lossy(string_bytes)
+                                .trim_matches('\0')
+                                .to_string();
+                            names.push(name);
+                        }
+                    }
+                    
+                    println!("Successfully read {} feature names from HDF5", names.len());
+                    if names.len() > 0 {
+                        println!("First 5 features: {:?}", &names[..names.len().min(5)]);
+                    }
+                    
+                    Ok(names)
+                }
+                Err(e) => {
+                    println!("Failed to read name dataset: {:?}", e);
+                    // Fallback to placeholder features
+                    let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
+                    println!("Using {} placeholder features", names.len());
+                    Ok(names)
+                }
             }
         }
-        Err(_) => {
-            // If it's not AnnData, it's likely 10x format
-            println!("File is in 10x format");
-            println!("Using placeholder features based on h5ls output (541 features)");
-            let placeholder_features: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
-            Ok(placeholder_features)
+        Err(e) => {
+            println!("Failed to find name dataset: {:?}", e);
+            // Fallback to placeholder features
+            let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
+            println!("Using {} placeholder features", names.len());
+            Ok(names)
         }
     }
 }
@@ -117,9 +167,7 @@ fn tree_from_csv<T: AsRef<Path>>(
         }
         // Store data in data_store and use cell_id
         let cell_id = coords.len() as u32;
-        let array_data = ArrayData::Array(anndata::data::array::DynArray::U16(
-            ndarray::Array1::from_vec(cells).into_dyn()
-        ));
+        let array_data = ArrayData::new(Array1::from_vec(cells).into_dyn());
         data_store.insert(cell_id, array_data);
         // Pass the data directly to Point
         coords.push(Point::new(x, y, Arc::new(data_store[&cell_id].clone()), 0..data_store[&cell_id].shape()[0]));
@@ -153,56 +201,90 @@ fn tree_from_10X<T: AsRef<Path>>(
     _method: ErrorMetric,
     _lossless: bool,
 ) -> anyhow::Result<QuadTree> {
-    let store = H5::open(h5_path)?;
-    let adata = AnnData::<H5>::open(store)?;
-    let num_rows = adata.n_obs();
-    let x = adata.get_x();
-    println!("num_rows: {}", num_rows);
-    println!("obs_names: {:?}", adata.obs_names());
-    println!("var_names: {:?}", adata.var_names());
-
-    let coords = File::open(parquet_path.as_ref()).unwrap();
+    // Read features from 10x HDF5 file
+    println!("Reading features from HDF5 file: {}", h5_path.as_ref().display());
+    let features = read_10x_features(&h5_path)?;
+    println!("Found {} features: {:?}", features.len(), &features[..features.len().min(5)]); // Show first 5 features
+    
+    // Read the sparse matrix data from HDF5
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    let matrix_group = file.group("matrix")?;
+    
+    // Read the shape of the matrix
+    let shape_dataset = matrix_group.dataset("shape")?;
+    let shape_array = shape_dataset.read_1d::<usize>()?;
+    let shape: Vec<usize> = shape_array.to_vec();
+    let num_cells = shape[0];
+    let num_features = shape[1];
+    
+    println!("Matrix shape: {} cells x {} features", num_cells, num_features);
+    
+    // Read the sparse matrix components
+    let data_dataset = matrix_group.dataset("data")?;
+    let indices_dataset = matrix_group.dataset("indices")?;
+    let indptr_dataset = matrix_group.dataset("indptr")?;
+    
+    let data_array = data_dataset.read_1d::<u16>()?;
+    let data: Vec<u16> = data_array.to_vec();
+    let indices_array = indices_dataset.read_1d::<usize>()?;
+    let indices: Vec<usize> = indices_array.to_vec();
+    let indptr_array = indptr_dataset.read_1d::<usize>()?;
+    let indptr: Vec<usize> = indptr_array.to_vec();
+    
+    println!("Sparse matrix data: {} non-zero elements", data.len());
+    
+    println!("Reading from parquet file: {}", parquet_path.as_ref().display());
+    
+    let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
     let reader = SerializedFileReader::new(coords).unwrap();
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
     let mut data_store = std::collections::HashMap::new();
-    // let mut gene_data: Vec<ndarray::Array1<f64>> = Vec::new(); // Only if needed
     
-    // Pre-allocate vectors with capacity to avoid reallocations
-    coords.reserve(num_rows);
-    xs.reserve(num_rows);
-    ys.reserve(num_rows);
+    // Pre-allocate vectors with capacity
+    coords.reserve(num_cells);
+    xs.reserve(num_cells);
+    ys.reserve(num_cells);
     
-    // Iterate by row index - this ensures both files are aligned
+    // Iterate through parquet rows
     let mut iter = reader.get_row_iter(None).unwrap();
+    let mut row_idx = 0;
     
-    for row_idx in 0..num_rows {
-        // Get parquet row by index
-        let parquet_row = iter.next().unwrap().unwrap();
-        
-        // Get HDF5 row by index
-        let h5_row: ArrayData = x.slice_axis(0, SelectInfoElem::Index(vec![row_idx])).unwrap().unwrap();
-        
-        // Extract spatial coordinates from parquet (owned)
-        //let columns = parquet_row.into_columns();
-        //let barcode = columns[0];
+    while let Some(Ok(parquet_row)) = iter.next() {
+        // Extract spatial coordinates from parquet
         let x_coord = parquet_row.get_double(1).unwrap(); // Get x coordinate as f64
         let y_coord = parquet_row.get_double(2).unwrap(); // Get y coordinate as f64
-        
-        // Get barcode for comparison
-       // let obs_name = adata.obs_names().get(row_idx).unwrap(); // Use .get() instead of indexing
-        //assert_eq!(barcode, obs_name);
         
         xs.push(x_coord);
         ys.push(y_coord);
         
+        // Extract gene expression data for this cell from the sparse matrix
+        let start_idx = indptr[row_idx];
+        let end_idx = indptr[row_idx + 1];
+        
+        // Create a dense vector for this cell's gene expression
+        let mut cell_expression = vec![0u16; num_features];
+        
+        for i in start_idx..end_idx {
+            let gene_idx = indices[i];
+            let expression_value = data[i];
+            cell_expression[gene_idx] = expression_value;
+        }
+        
+        // Create ArrayData for this cell
+        let array_data = ArrayData::new(Array1::from_vec(cell_expression).into_dyn());
+        
         // Store data in data_store and use cell_id
         let cell_id = row_idx as u32;
-        data_store.insert(cell_id, h5_row);
+        data_store.insert(cell_id, array_data);
         // Pass the data directly to Point
         coords.push(Point::new(x_coord, y_coord, Arc::new(data_store[&cell_id].clone()), 0..data_store[&cell_id].shape()[0]));
+        
+        row_idx += 1;
     }
+    
+    println!("num_rows: {}", row_idx);
 
     let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0; // |a, &b| pattern matching, does not need clone() 
     let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
