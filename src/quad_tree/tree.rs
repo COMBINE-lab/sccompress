@@ -5,41 +5,13 @@ use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info, warn};
-use anndata::ArrayData;
+use crate::ArrayData;
 use std::sync::Arc;
 
 
 // Helper function to extract numeric data from ArrayData
 fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
-    match data {
-        ArrayData::Array(dyn_array) => {
-            match dyn_array {
-                anndata::data::array::DynArray::F64(arr) => {
-                    arr.iter().map(|&x| x as u16).collect()
-                }
-                anndata::data::array::DynArray::F32(arr) => {
-                    arr.iter().map(|&x| x as u16).collect()
-                }
-                anndata::data::array::DynArray::I32(arr) => {
-                    arr.iter().map(|&x| x as u16).collect()
-                }
-                anndata::data::array::DynArray::I64(arr) => {
-                    arr.iter().map(|&x| x as u16).collect()
-                }
-                anndata::data::array::DynArray::U16(arr) => {
-                    arr.iter().map(|&x| x).collect()
-                }
-                anndata::data::array::DynArray::U32(arr) => {
-                    arr.iter().map(|&x| x as u16).collect()
-                }
-                anndata::data::array::DynArray::U64(arr) => {
-                    arr.iter().map(|&x| x as u16).collect()
-                }
-                _ => vec![], // Handle other types as needed
-            }
-        }
-        _ => vec![], // Handle other ArrayData variants as needed
-    }
+    data.data.as_slice().unwrap().to_vec()
 }
 
 
@@ -866,7 +838,7 @@ impl QuadTree {
     /// Get all expression data for a point
     pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> Vec<&'a ArrayData> {
         // Since we now store data directly in Point, just return it as a single element
-        vec![&**point.data_arc]
+        vec![&point.data_arc]
     }
 
     pub(crate) fn query(&self, boundary: &Rect) -> Vec<Point> {
