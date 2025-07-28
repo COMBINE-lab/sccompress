@@ -5,6 +5,44 @@ use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info, warn};
+use anndata::ArrayData;
+use std::sync::Arc;
+
+
+// Helper function to extract numeric data from ArrayData
+fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
+    match data {
+        ArrayData::Array(dyn_array) => {
+            match dyn_array {
+                anndata::data::array::DynArray::F64(arr) => {
+                    arr.iter().map(|&x| x as u16).collect()
+                }
+                anndata::data::array::DynArray::F32(arr) => {
+                    arr.iter().map(|&x| x as u16).collect()
+                }
+                anndata::data::array::DynArray::I32(arr) => {
+                    arr.iter().map(|&x| x as u16).collect()
+                }
+                anndata::data::array::DynArray::I64(arr) => {
+                    arr.iter().map(|&x| x as u16).collect()
+                }
+                anndata::data::array::DynArray::U16(arr) => {
+                    arr.iter().map(|&x| x).collect()
+                }
+                anndata::data::array::DynArray::U32(arr) => {
+                    arr.iter().map(|&x| x as u16).collect()
+                }
+                anndata::data::array::DynArray::U64(arr) => {
+                    arr.iter().map(|&x| x as u16).collect()
+                }
+                _ => vec![], // Handle other types as needed
+            }
+        }
+        _ => vec![], // Handle other ArrayData variants as needed
+    }
+}
+
+
 
 #[derive(Clone)]
 pub(crate) struct EncodedDiffs {
@@ -270,7 +308,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
 /// along that axis/coordinate.
 /// Returns a `Some(EncodedDiff)` struct representing the encoded differences or `None`
 /// if the slice is empty.
-pub(crate) fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
+pub(crate) fn encode_subarray(points: &[Point], _data_store: &std::collections::HashMap<u32, ArrayData>) -> Option<EncodedDiffs> {
     if points.is_empty() {
         debug!("Empty points array in encode_subarray()");
         return None;
@@ -280,18 +318,21 @@ pub(crate) fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     let mut medians = Vec::<u16>::new();
     let mut raw_diffs = Vec::<u32>::new();
     let mut max_diff = 0_i32;
-    let num_genes = points[0].data.len() as u32;
+    let num_genes = points[0].get_data().len() as u32;
     debug!("Processing {} points in encode_subarray()", points.len());
     debug!("Number of genes: {}", num_genes);
 
     let mut nnz = 0_usize;
     // we'll make 2 passes, because we want to store the final results in
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
-    for j in 0..points[0].data.len() {
+    for j in 0..points[0].get_data().len() {
         // get the non-zero values and the non-zero indices
         let nz_values: Vec<u16> = points
             .iter()
-            .filter_map(|p| if p.data[j] > 0 { Some(p.data[j]) } else { None })
+            .filter_map(|p| {
+                let data = p.get_data();
+                if data[j] > 0 { Some(data[j]) } else { None }
+            })
             .collect();
 
         // nonzero median values
@@ -314,7 +355,8 @@ pub(crate) fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         let index_offset = cell_ind * num_genes as usize;
         // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
-        for ((gene_ind, val), med_val) in gene_exp.data.iter().enumerate().zip(&medians) {
+        let gene_data = gene_exp.get_data();
+        for ((gene_ind, val), med_val) in gene_data.iter().enumerate().zip(&medians) {
             // the median of **non-zero** expression values was zero, this
             // is recorded iff there were no cells in the current block expressing
             // this gene. Otherwise, if the original value itself is zero, then
@@ -353,7 +395,8 @@ pub(crate) fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
 
     // validate!
     for (recon_vec, orig_vec) in enc_diffs.expression_vec_iter().zip(points.iter()) {
-        assert_eq!(recon_vec, orig_vec.data);
+        let orig_data = orig_vec.get_data();
+        assert_eq!(recon_vec, orig_data);
     }
 
     info!(
@@ -377,17 +420,29 @@ pub(crate) trait PointLike {
     fn ypos(&self) -> f64;
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
+/*
+pub(crate) enum ArrayData {
+    Vector(Vec<u16>),
+    Optional(Option<ArrayData>),
+}
+*/
+
+#[derive(Clone)]
 pub(crate) struct Point {
     pub(crate) x: f64,
     pub(crate) y: f64,
-    pub(crate) data: Vec<u16>,
+    pub(crate) data_arc: Arc<ArrayData>,
+    pub(crate) data_slice: std::ops::Range<usize>,
 }
 
 impl Point {
     #[inline(always)]
-    pub(crate) const fn new(x: f64, y: f64, data: Vec<u16>) -> Self {
-        Self { x, y, data }
+    pub(crate) fn new(x: f64, y: f64, data_arc: Arc<ArrayData>, data_slice: std::ops::Range<usize>) -> Self {
+        Self { x, y, data_arc, data_slice }
+    }
+
+    pub(crate) fn get_data(&self) -> Vec<u16> {
+        extract_numeric_data(&self.data_arc)
     }
 }
 
@@ -761,7 +816,6 @@ impl BitFieldQuadTree {
     }
 }
 
-#[derive(Debug, Encode, Decode)]
 pub(crate) struct QuadTree {
     boundary: Rect,
     points: Vec<Point>,
@@ -773,12 +827,15 @@ pub(crate) struct QuadTree {
     se: Option<Box<Self>>,
     sw: Option<Box<Self>>,
     data: Vec<f64>,
+    //index: Vec<u16>,
     positions: Vec<DatalessPoint>,
+    // External data storage - maps cell_id to ArrayData
+    data_store: std::collections::HashMap<u32, ArrayData>,
 }
 
 impl QuadTree {
     #[inline(always)]
-    pub(crate) const fn new(boundary: Rect, points: Vec<Point>, depth: usize) -> Self {
+    pub(crate) fn new(boundary: Rect, points: Vec<Point>, depth: usize, data_store: std::collections::HashMap<u32, ArrayData>) -> Self {
         Self {
             boundary,
             points,
@@ -790,8 +847,26 @@ impl QuadTree {
             se: None,
             sw: None,
             data: Vec::new(),
+            //index: Vec::new(),
             positions: Vec::new(),
+            data_store,
         }
+    }
+
+    /// Get the expression data for a specific cell
+    pub(crate) fn get_cell_data(&self, cell_id: u32) -> Option<&ArrayData> {
+        self.data_store.get(&cell_id)
+    }
+
+    /// Get the expression data for a point
+    pub(crate) fn get_point_data<'a>(&self, point: &'a Point) -> Option<&'a ArrayData> {
+        Some(&point.data_arc)
+    }
+
+    /// Get all expression data for a point
+    pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> Vec<&'a ArrayData> {
+        // Since we now store data directly in Point, just return it as a single element
+        vec![&point.data_arc]
     }
 
     pub(crate) fn query(&self, boundary: &Rect) -> Vec<Point> {
@@ -867,7 +942,7 @@ impl QuadTree {
 
         debug!("self.points.len(): {}", self.points.len());
         if !self.points.is_empty() {
-            println!("Initial number of genes: {}", self.points[0].data.len());
+            println!("Initial number of genes: {}", self.points[0].get_data().len());
         }
 
         // nothing to do if this subtree is empty
@@ -883,7 +958,7 @@ impl QuadTree {
             .collect();
 
         // Compute the expense of encoding the current block
-        let current_expense = encode_subarray(&self.points).map_or(0, |x| x.bytes());
+        let current_expense = encode_subarray(&self.points, &self.data_store).map_or(0, |x| x.bytes());
         info!(
             "expense of current block consisting of {} points is {}",
             self.points.len(),
@@ -893,16 +968,16 @@ impl QuadTree {
         // Find the children of the current node
         let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&self.boundary);
         let nw_points = self.query(&nw_boundary);
-        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
+        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1, self.data_store.clone());
 
         let ne_points = self.query(&ne_boundary);
-        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
+        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1, self.data_store.clone());
 
         let se_points = self.query(&se_boundary);
-        let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
+        let se = QuadTree::new(se_boundary, se_points, self.depth + 1, self.data_store.clone());
 
         let sw_points = self.query(&sw_boundary);
-        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
+        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1, self.data_store.clone());
 
         // make sure we're not losing any points
         assert_eq!(
@@ -911,10 +986,10 @@ impl QuadTree {
         );
 
         // Convert children to BitFieldQuadTree to calculate their expenses
-        let nw_expense = encode_subarray(&nw.points).map_or(0, |x| x.bytes());
-        let ne_expense = encode_subarray(&ne.points).map_or(0, |x| x.bytes());
-        let se_expense = encode_subarray(&se.points).map_or(0, |x| x.bytes());
-        let sw_expense = encode_subarray(&sw.points).map_or(0, |x| x.bytes());
+        let nw_expense = encode_subarray(&nw.points, &self.data_store).map_or(0, |x| x.bytes());
+        let ne_expense = encode_subarray(&ne.points, &self.data_store).map_or(0, |x| x.bytes());
+        let se_expense = encode_subarray(&se.points, &self.data_store).map_or(0, |x| x.bytes());
+        let sw_expense = encode_subarray(&sw.points, &self.data_store).map_or(0, |x| x.bytes());
 
         info!("NW expense: {}", nw_expense);
         info!("NE expense: {}", ne_expense);
@@ -952,7 +1027,7 @@ impl QuadTree {
                 info!(
                     "Leaf node - points: {}, genes: {}",
                     self.points.len(),
-                    self.points[0].data.len()
+                    self.points[0].get_data().len()
                 );
                 self.positions = positions; // Use the stored positions
                                             // Keep the points for bit field representation
@@ -992,7 +1067,7 @@ impl QuadTree {
         if !self.points.is_empty() {
             debug!(
                 "Computing bit fields - genes per point: {}",
-                self.points[0].data.len()
+                self.points[0].get_data().len()
             );
         }
 
@@ -1031,9 +1106,10 @@ impl QuadTree {
                 node.sw = Some(Box::new(sw.compute_quadtree_bit_fields()));
             }
         } else {
-            node.encoded_diffs = encode_subarray(&self.points).expect("nonempty");
+            node.encoded_diffs = encode_subarray(&self.points, &self.data_store).expect("nonempty");
             node.positions = self.positions.clone();
         }
         node
     }
 }
+
