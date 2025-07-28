@@ -1,18 +1,26 @@
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
-pub mod bits;
 pub mod quad_tree;
 use clap::{Args, Parser, Subcommand};
 use csv::ReaderBuilder;
-use quad_tree::tree::{DatalessPoint, EncodedDiffs};
+use hdf5::types::FixedAscii;
+use hdf5::File;
+use ndarray::Array1;
+use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
+use std::collections::HashMap;
 use std::error::Error;
+use std::fs::File as StdFile;
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use tracing::info;
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
 use hdf5::{File as Hdf5File, Group, Dataset};
+use hdf5::types::FixedAscii;
 use ndarray::{Array1, ArrayD, s};
+use tracing::{debug, info, warn};
 
 // Simple ArrayData type to replace anndata::ArrayData
 #[derive(Clone)]
@@ -28,6 +36,50 @@ impl ArrayData {
     pub fn shape(&self) -> &[usize] {
         self.data.shape()
     }
+}
+
+// Sparse gene expression data - much more memory efficient!
+#[derive(Clone)]
+pub struct SparseGeneData {
+    pub gene_indices: Vec<usize>,    // Which genes are expressed
+    pub expression_values: Vec<u16>,  // Expression counts
+    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+}
+
+impl SparseGeneData {
+    pub fn new(gene_indices: Vec<usize>, expression_values: Vec<u16>, num_genes: usize) -> Self {
+        Self { gene_indices, expression_values, num_genes }
+    }
+    
+    // Convert to dense only when needed
+    pub fn to_dense(&self) -> Vec<u16> {
+        let mut dense = vec![0u16; self.num_genes];
+        for (idx, &value) in self.gene_indices.iter().zip(&self.expression_values) {
+            dense[*idx] = value;
+        }
+        dense
+    }
+    
+    // Memory usage in bytes
+    pub fn memory_usage(&self) -> usize {
+        self.gene_indices.len() * std::mem::size_of::<usize>() +
+        self.expression_values.len() * std::mem::size_of::<u16>() +
+        std::mem::size_of::<usize>()
+    }
+    
+    // Get expression for a specific gene
+    pub fn get_gene_expression(&self, gene_idx: usize) -> u16 {
+        if let Some(pos) = self.gene_indices.binary_search(&gene_idx).ok() {
+            self.expression_values[pos]
+        } else {
+            0
+        }
+    }
+}
+
+// Helper function to extract numeric data from ArrayData
+fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
+    data.data.as_slice().unwrap().to_vec()
 }
 
 //use af_anndata::H5 as H52;
@@ -97,6 +149,75 @@ fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> 
             Ok(names)
         }
     }
+}
+
+// Helper functions to read fixed-length strings from HDF5
+fn read_strings_7(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<7>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 7, 541)
+    }
+}
+
+fn read_strings_23(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<23>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 23, 541)
+    }
+}
+
+fn read_strings_25(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<25>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 25, 541)
+    }
+}
+
+fn read_strings_as_bytes(
+    file: &Hdf5File,
+    dataset_path: &str,
+    string_length: usize,
+    num_strings: usize,
+) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    let bytes = dataset.read_1d::<u8>()?;
+    let bytes_vec: Vec<u8> = bytes.to_vec();
+    
+    let mut strings = Vec::new();
+    for i in 0..num_strings {
+        let start = i * string_length;
+        let end = start + string_length;
+        if end <= bytes_vec.len() {
+            let string_bytes = &bytes_vec[start..end];
+            let string = String::from_utf8_lossy(string_bytes)
+                .trim_matches('\0')
+                .to_string();
+            strings.push(string);
+        }
+    }
+    
+    Ok(strings)
 }
 
 fn tree_from_csv<T: AsRef<Path>>(
@@ -170,7 +291,21 @@ fn tree_from_csv<T: AsRef<Path>>(
         let array_data = ArrayData::new(Array1::from_vec(cells).into_dyn());
         data_store.insert(cell_id, array_data);
         // Pass the data directly to Point
-        coords.push(Point::new(x, y, Arc::new(data_store[&cell_id].clone()), 0..data_store[&cell_id].shape()[0]));
+        // Convert ArrayData to SparseGeneData for compatibility
+        let array_data = &data_store[&cell_id];
+        let dense_data = extract_numeric_data(array_data);
+        let mut gene_indices = Vec::new();
+        let mut expression_values = Vec::new();
+        
+        for (idx, &value) in dense_data.iter().enumerate() {
+            if value > 0 {
+                gene_indices.push(idx);
+                expression_values.push(value);
+            }
+        }
+        
+        let sparse_data = SparseGeneData::new(gene_indices, expression_values, dense_data.len());
+        coords.push(Point::new(x, y, Arc::new(sparse_data)));
     }
 
     let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
@@ -183,10 +318,11 @@ fn tree_from_csv<T: AsRef<Path>>(
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
 
     // No need to convert since we're already using u16
-    let mut qtree = QuadTree::new(domain, coords, 0, data_store);
+    let mut qtree = QuadTree::new(domain, coords, 0);
     qtree.divide();
     Ok(qtree)
 }
+
 /* 
 fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> { 
     let file = File::open(Path::new(file_path))?; 
@@ -206,16 +342,35 @@ fn tree_from_10X<T: AsRef<Path>>(
     let features = read_10x_features(&h5_path)?;
     println!("Found {} features: {:?}", features.len(), &features[..features.len().min(5)]); // Show first 5 features
     
-    // Read the sparse matrix data from HDF5
+    // Read all feature information
     let file = Hdf5File::open(h5_path.as_ref())?;
+
+    // Read gene names (23 chars each)
+    let gene_names = read_strings_23(&file, "matrix/features/name")?;
+
+    // Read gene IDs (23 chars each) 
+    let gene_ids = read_strings_23(&file, "matrix/features/id")?;
+
+    // Read feature types (25 chars each)
+    let feature_types = read_strings_25(&file, "matrix/features/feature_type")?;
+
+    // Read genome references (7 chars each)
+    let genomes = read_strings_7(&file, "matrix/features/genome")?;
+
+    println!("Gene names: {:?}", &gene_names[..5]);
+    println!("Gene IDs: {:?}", &gene_ids[..5]);
+    println!("Feature types: {:?}", &feature_types[..5]);
+    println!("Genomes: {:?}", &genomes[..5]);
+    
+
     let matrix_group = file.group("matrix")?;
     
     // Read the shape of the matrix
     let shape_dataset = matrix_group.dataset("shape")?;
     let shape_array = shape_dataset.read_1d::<usize>()?;
     let shape: Vec<usize> = shape_array.to_vec();
-    let num_cells = shape[0];
-    let num_features = shape[1];
+    let num_features = shape[0];
+    let num_cells = shape[1];
     
     println!("Matrix shape: {} cells x {} features", num_cells, num_features);
     
@@ -240,7 +395,6 @@ fn tree_from_10X<T: AsRef<Path>>(
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    let mut data_store = std::collections::HashMap::new();
     
     // Pre-allocate vectors with capacity
     coords.reserve(num_cells);
@@ -253,6 +407,8 @@ fn tree_from_10X<T: AsRef<Path>>(
     
     while let Some(Ok(parquet_row)) = iter.next() {
         // Extract spatial coordinates from parquet
+        let cell_id = parquet_row.get_string(0).unwrap();
+        assert_eq!(cell_id, row_idx.to_string());
         let x_coord = parquet_row.get_double(1).unwrap(); // Get x coordinate as f64
         let y_coord = parquet_row.get_double(2).unwrap(); // Get y coordinate as f64
         
@@ -263,23 +419,33 @@ fn tree_from_10X<T: AsRef<Path>>(
         let start_idx = indptr[row_idx];
         let end_idx = indptr[row_idx + 1];
         
-        // Create a dense vector for this cell's gene expression
-        let mut cell_expression = vec![0u16; num_features];
+        // Create sparse representation - only store non-zero values!
+        let mut gene_indices = Vec::new();
+        let mut expression_values = Vec::new();
         
         for i in start_idx..end_idx {
             let gene_idx = indices[i];
             let expression_value = data[i];
-            cell_expression[gene_idx] = expression_value;
+            if expression_value > 0 {  // Only store non-zero values
+                gene_indices.push(gene_idx);
+                expression_values.push(expression_value);
+            }
         }
         
-        // Create ArrayData for this cell
-        let array_data = ArrayData::new(Array1::from_vec(cell_expression).into_dyn());
+        // Create sparse gene data
+        let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
         
-        // Store data in data_store and use cell_id
-        let cell_id = row_idx as u32;
-        data_store.insert(cell_id, array_data);
-        // Pass the data directly to Point
-        coords.push(Point::new(x_coord, y_coord, Arc::new(data_store[&cell_id].clone()), 0..data_store[&cell_id].shape()[0]));
+        // Log memory usage for first few cells
+        if row_idx < 5 {
+            let dense_memory = num_features * std::mem::size_of::<u16>();
+            let sparse_memory = sparse_data.memory_usage();
+            println!("Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%", 
+                    row_idx, dense_memory, sparse_memory, 
+                    (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0);
+        }
+        
+        // Create Point with sparse data using Arc for shared ownership
+        coords.push(Point::new(x_coord, y_coord, Arc::new(sparse_data)));
         
         row_idx += 1;
     }
@@ -294,10 +460,10 @@ fn tree_from_10X<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0, data_store);
+    let mut qtree = QuadTree::new(domain, coords, 0);
     qtree.divide();
     Ok(qtree)
-}   
+}
 
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
@@ -343,14 +509,14 @@ struct BuildCommand {
     /// Input file format (csv or hdf5)
     #[arg(short = 'f', long, default_value = "csv")]
     format: String,
-    /// Index of x coordinate, default 5
+    /// Index of x coordinate, default 6
     #[arg(short = 'x', long, default_value_t = 6)]
     idx_x: usize,
-    /// Index of y coordinate, default 6
+    /// Index of y coordinate, default 7
     #[arg(short = 'y', long, default_value_t = 7)]
     idx_y: usize,
-    /// Index of gene start, default 1
-    #[arg(short = 's', long, default_value_t = 11)]
+    /// Index of gene start, default 10
+    #[arg(short = 's', long, default_value_t = 10)]
     idx_gene_start: usize,
     /// Index of gene end, default all remaining columns
     #[arg(short = 'e', long)]
@@ -360,6 +526,7 @@ struct BuildCommand {
 struct Data {
     pub data: Vec<EncodedDiffs>,
     pub pos: Vec<DatalessPoint>,
+    pub sep: Vec<usize>,
 }
 
 impl Data {
@@ -370,7 +537,7 @@ impl Data {
         }
     }
 }
-
+/* 
 fn main() -> Result<(), Box<dyn Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -394,7 +561,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     tree_from_10X(file_path, parquet_path, ErrorMetric::Mean, true)?;
     Ok(())
 }
-/* 
+    */
+
 fn main() -> Result<(), Box<dyn Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -415,14 +583,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli_args.command {
         Commands::Build(args) => {
-            let file_path = args.input;
             let qtree = match args.format.as_str() {
                 "csv" => {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {
                     //    anyhow::anyhow!("Position file required for CSV format")
                     //})?;
                     tree_from_csv(
-                        file_path,
+                        &args.input,
                         //file_path_pos,
                         args.idx_x,          // idx_x
                         args.idx_y,          // idx_y
@@ -432,18 +599,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         true,
                     )?
                 }
-                // "hdf5" => {
-                // let file_path_pos = args.input_pos.ok_or_else(|| {
-                //   anyhow::anyhow!("Position file required for HDF5 format")
-                //})?;
-                //tree_from_h5(
-                //  &args.input,
-                //file_path_pos,
-                //ErrorMetric::Mean,
-                //true,
-                //"10x"
-                //)?
-                //}
+                 "10x" => {
+                 let file_path_pos = args.input_pos.ok_or_else(|| {
+                   anyhow::anyhow!("Position file required for HDF5 format")
+                })?;
+                tree_from_10X(
+                  &args.input,
+                &file_path_pos,
+                ErrorMetric::Mean,
+                true,
+                )?
+                }
                 _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
             };
 
@@ -487,14 +653,9 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
-                for (loc, expression_vec) in d
-                    .pos
-                    .iter()
-                    .skip(start)
-                    .take(n)
-                    .zip(compressed_diffs.expression_vec_iter())
-                {
-                    let expression = expression_vec
+                for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
+                    let expression = compressed_diffs
+                        .expression_vec(cell_id)
                         .iter()
                         .map(|x| x.to_string())
                         .collect::<Vec<_>>()
@@ -507,4 +668,100 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     Ok(())
 }
-*/
+
+// Function to explore HDF5 file structure
+fn explore_hdf5_structure<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    
+    println!("=== HDF5 File Structure ===");
+    println!("File: {}", h5_path.as_ref().display());
+    
+    // Try to access common paths
+    let common_paths = [
+        "matrix/obs/name",
+        "matrix/obs/_index", 
+        "obs/name",
+        "matrix/features/name",
+        "matrix/data",
+        "matrix/indices",
+        "matrix/indptr",
+        "matrix/shape"
+    ];
+    
+    for path in &common_paths {
+        if let Ok(dataset) = file.dataset(path) {
+            let shape = dataset.shape();
+            let dtype = dataset.dtype()?;
+            println!("✅ {} (shape: {:?}, dtype: {:?})", path, shape, dtype);
+        } else {
+            println!("❌ {} (not found)", path);
+        }
+    }
+    
+    println!("=== End Structure ===");
+    
+    Ok(())
+}
+
+// Simple function to demonstrate reading cell names from HDF5
+fn demonstrate_cell_names<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
+    println!("\n=== Trying to read cell names from HDF5 ===");
+    
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    
+    // Try common paths for cell names
+    let cell_name_paths = [
+        "matrix/obs/name",
+        "matrix/obs/_index", 
+        "obs/name",
+        "matrix/obs/id"
+    ];
+    
+    for path in &cell_name_paths {
+        match file.dataset(path) {
+            Ok(dataset) => {
+                let shape = dataset.shape();
+                let dtype = dataset.dtype()?;
+                println!("✅ Found cell names at '{}' (shape: {:?}, dtype: {:?})", path, shape, dtype);
+                
+                // Try to read a few sample cell names
+                if shape.len() == 1 && shape[0] > 0 {
+                    let num_cells = shape[0];
+                    let sample_size = std::cmp::min(5, num_cells);
+                    
+                    // Try to read as strings
+                    if let Ok(strings) = read_strings_as_bytes(&file, path, 23, sample_size) {
+                        println!("   Sample cell names: {:?}", strings);
+                    } else {
+                        println!("   Could not read as strings");
+                    }
+                }
+            }
+            Err(_) => {
+                println!("❌ No cell names found at '{}'", path);
+            }
+        }
+    }
+    
+    println!("=== End cell names exploration ===\n");
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Check the `RUST_LOG` variable for the logger level and
+    // initialize the logger.
+    tracing_subscriber::fmt::init();
+
+    // Test reading HDF5 file directly with hdf5 crate
+    println!("Testing HDF5 file reading...");
+    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
+    
+    // Explore HDF5 structure first
+    explore_hdf5_structure(file_path)?;
+    
+    // Demonstrate reading cell names from HDF5
+    demonstrate_cell_names(file_path)?;
+    
+    println!("Done exploring HDF5 structure!");
+    Ok(())
+}
