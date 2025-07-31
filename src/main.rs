@@ -578,11 +578,12 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .add_directive("ureq=warn".parse()?),
         )
         .init();
-
+  
     let cli_args = Cli::parse();
 
     match cli_args.command {
         Commands::Build(args) => {
+
             let qtree = match args.format.as_str() {
                 "csv" => {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {

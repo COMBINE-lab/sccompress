@@ -1,3 +1,4 @@
+
 use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
@@ -191,6 +192,7 @@ impl EncodedDiffs {
     pub(crate) fn bytes(&self) -> usize {
         let diff_bits = self.diffs.len() * self.diffs.bit_width();
         let ibits = self.indices.num_bits(); //0.write_bytes() * 8;
+
         let ncbits = 32;
         let m_bits = self.medians.len() * self.medians.bit_width();
         (4 * 24) + (diff_bits + ibits + ncbits + m_bits) / 8
@@ -238,7 +240,6 @@ impl<Context> Decode<Context> for EncodedDiffs {
         let w = Decode::decode(decoder)?;
         let l = Decode::decode(decoder)?;
         let medians = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
-
         Ok(Self {
             indices,
             ncells,
@@ -264,7 +265,6 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
         let width = BorrowDecode::borrow_decode(decoder)?;
         let len = BorrowDecode::borrow_decode(decoder)?;
         let medians = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
-
         Ok(Self {
             indices,
             ncells,
@@ -280,7 +280,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
 /// along that axis/coordinate.
 /// Returns a `Some(EncodedDiff)` struct representing the encoded differences or `None`
 /// if the slice is empty.
-pub(crate) fn encode_subarray(points: &[Point], _data_store: &std::collections::HashMap<u32, ArrayData>) -> Option<EncodedDiffs> {
+pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     if points.is_empty() {
         debug!("Empty points array in encode_subarray()");
         return None;
@@ -432,6 +432,7 @@ impl PointLike for Point {
 /// A point that has just its 2D coordinates, but does not
 /// carry with it any additional data.
 #[derive(Debug, Clone, Encode, Decode)]
+
 pub(crate) struct DatalessPoint {
     x: f64,
     y: f64,
@@ -475,7 +476,6 @@ fn get_child_rects(parent: &Rect) -> (Rect, Rect, Rect, Rect) {
     let center_x = parent.cx;
     let center_y = parent.cy;
 
-    // pub(crate) const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64)
     let nw_boundary = Rect::new_from_bounds(west_child_west, center_x, north_child_north, center_y);
     let ne_boundary = Rect::new_from_bounds(center_x, east_child_east, north_child_north, center_y);
 
@@ -661,7 +661,6 @@ impl BitFieldQuadTree {
             positions: Vec::new(),
         }
     }
-
     pub(crate) fn visit(&self, fun: &mut impl FnMut(&BitFieldQuadTree)) {
         fun(self);
         if self.divided {
@@ -799,7 +798,6 @@ pub(crate) struct QuadTree {
     se: Option<Box<Self>>,
     sw: Option<Box<Self>>,
     data: Vec<f64>,
-    //index: Vec<u16>,
     positions: Vec<DatalessPoint>,
     // External data storage - maps cell_id to ArrayData
     data_store: std::collections::HashMap<u32, ArrayData>,
@@ -874,8 +872,32 @@ impl QuadTree {
         found_points
     }
 
-    /*
-        pub(crate) fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f64) -> f64 {
+/*
+    pub fn block_data_repr(&self, method: ErrorMetric) -> Vec<f64> {
+        if self.points.is_empty() {
+            return Vec::new();
+        }
+
+        let mut block_mean = Vec::<f64>::with_capacity(self.points[0].data.len());
+        for j in 0..self.points[0].data.len() {
+            let block_mean_j = match method {
+                ErrorMetric::Median => {
+                    let mut values: Vec<f64> =
+                        self.points.iter().map(|p| p.data[j] as f64).collect();
+                    values.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    values[values.len() / 2]
+                }
+                ErrorMetric::Mean => {
+                    self.points.iter().map(|p| p.data[j] as f64).sum::<f64>()
+                        / self.points.len() as f64
+                }
+            };
+            block_mean.push(block_mean_j);
+        }
+        block_mean
+    }
+    
+        pub fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f64) -> f64 {
             let mut found_points = Vec::new();
             self.query(&self.boundary);
 
@@ -922,6 +944,11 @@ impl QuadTree {
             return;
         }
 
+        // nothing to do if this subtree is empty
+        if self.points.is_empty() {
+            return;
+        }
+
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self
             .points
@@ -950,6 +977,12 @@ impl QuadTree {
 
         let sw_points = self.query(&sw_boundary);
         let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1, self.data_store.clone());
+
+        // make sure we're not losing any points
+        assert_eq!(
+            nw.points.len() + ne.points.len() + se.points.len() + sw.points.len(),
+            self.points.len()
+        );
 
         // make sure we're not losing any points
         assert_eq!(
@@ -1078,7 +1111,7 @@ impl QuadTree {
                 node.sw = Some(Box::new(sw.compute_quadtree_bit_fields()));
             }
         } else {
-            node.encoded_diffs = encode_subarray(&self.points, &self.data_store).expect("nonempty");
+            node.encoded_diffs = encode_subarray(&self.points).expect("nonempty");
             node.positions = self.positions.clone();
         }
         node
