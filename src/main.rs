@@ -16,7 +16,209 @@ use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use std::collections::HashSet;
+use std::sync::Arc;
+use hdf5::{File as Hdf5File, Group, Dataset};
+use hdf5::types::FixedAscii;
+use ndarray::{Array1, ArrayD, s};
+use tracing::{debug, info, warn};
+
+// Simple ArrayData type to replace anndata::ArrayData
+#[derive(Clone)]
+pub struct ArrayData {
+    pub data: ArrayD<u16>,
+}
+
+impl ArrayData {
+    pub fn new(data: ArrayD<u16>) -> Self {
+        Self { data }
+    }
+    
+    pub fn shape(&self) -> &[usize] {
+        self.data.shape()
+    }
+}
+
+// Sparse gene expression data - much more memory efficient!
+#[derive(Clone)]
+pub struct SparseGeneData {
+    pub gene_indices: Vec<usize>,    // Which genes are expressed
+    pub expression_values: Vec<u16>,  // Expression counts
+    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+}
+
+impl SparseGeneData {
+    pub fn new(gene_indices: Vec<usize>, expression_values: Vec<u16>, num_genes: usize) -> Self {
+        Self { gene_indices, expression_values, num_genes }
+    }
+    
+    // Convert to dense only when needed
+    pub fn to_dense(&self) -> Vec<u16> {
+        let mut dense = vec![0u16; self.num_genes];
+        for (idx, &value) in self.gene_indices.iter().zip(&self.expression_values) {
+            dense[*idx] = value;
+        }
+        dense
+    }
+    
+    // Memory usage in bytes
+    pub fn memory_usage(&self) -> usize {
+        self.gene_indices.len() * std::mem::size_of::<usize>() +
+        self.expression_values.len() * std::mem::size_of::<u16>() +
+        std::mem::size_of::<usize>()
+    }
+    
+    // Get expression for a specific gene
+    pub fn get_gene_expression(&self, gene_idx: usize) -> u16 {
+        if let Some(pos) = self.gene_indices.binary_search(&gene_idx).ok() {
+            self.expression_values[pos]
+        } else {
+            0
+        }
+    }
+}
+
+// Helper function to extract numeric data from ArrayData
+fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
+    data.data.as_slice().unwrap().to_vec()
+}
+
+//use af_anndata::H5 as H52;
+use std::fs::File;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
+
+fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
+    println!("Reading features from 10x HDF5 file: {}", h5_path.as_ref().display());
+    
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    println!("Successfully opened HDF5 file");
+    
+    let matrix_group = file.group("matrix")?;
+    println!("Found matrix group");
+    
+    let features_group = matrix_group.group("features")?;
+    println!("Found features group");
+    
+    // Try to read feature names
+    match features_group.dataset("name") {
+        Ok(name_dataset) => {
+            println!("Found name dataset, attempting to read...");
+            match name_dataset.read_1d::<u8>() {
+                Ok(names_bytes) => {
+                    println!("Successfully read {} bytes from name dataset", names_bytes.len());
+                    
+                    // Convert to Vec<u8> to avoid version conflicts
+                    let names_vec: Vec<u8> = names_bytes.to_vec();
+                    
+                    // Convert bytes to strings - each string is 23 bytes
+                    let mut names = Vec::new();
+                    for i in 0..541 {
+                        let start = i * 23;
+                        let end = start + 23;
+                        if end <= names_vec.len() {
+                            let string_bytes = &names_vec[start..end];
+                            // Convert bytes to string, removing null padding
+                            let name = String::from_utf8_lossy(string_bytes)
+                                .trim_matches('\0')
+                                .to_string();
+                            names.push(name);
+                        }
+                    }
+                    
+                    println!("Successfully read {} feature names from HDF5", names.len());
+                    if names.len() > 0 {
+                        println!("First 5 features: {:?}", &names[..names.len().min(5)]);
+                    }
+                    
+                    Ok(names)
+                }
+                Err(e) => {
+                    println!("Failed to read name dataset: {:?}", e);
+                    // Fallback to placeholder features
+                    let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
+                    println!("Using {} placeholder features", names.len());
+                    Ok(names)
+                }
+            }
+        }
+        Err(e) => {
+            println!("Failed to find name dataset: {:?}", e);
+            // Fallback to placeholder features
+            let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
+            println!("Using {} placeholder features", names.len());
+            Ok(names)
+        }
+    }
+}
+
+// Helper functions to read fixed-length strings from HDF5
+fn read_strings_7(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<7>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 7, 541)
+    }
+}
+
+fn read_strings_23(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<23>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 23, 541)
+    }
+}
+
+fn read_strings_25(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<25>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 25, 541)
+    }
+}
+
+fn read_strings_as_bytes(
+    file: &Hdf5File,
+    dataset_path: &str,
+    string_length: usize,
+    num_strings: usize,
+) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    let bytes = dataset.read_1d::<u8>()?;
+    let bytes_vec: Vec<u8> = bytes.to_vec();
+    
+    let mut strings = Vec::new();
+    for i in 0..num_strings {
+        let start = i * string_length;
+        let end = start + string_length;
+        if end <= bytes_vec.len() {
+            let string_bytes = &bytes_vec[start..end];
+            let string = String::from_utf8_lossy(string_bytes)
+                .trim_matches('\0')
+                .to_string();
+            strings.push(string);
+        }
+    }
+    
+    Ok(strings)
+}
 
 fn tree_from_csv<T: AsRef<Path>>(
     file_path: T,
@@ -30,6 +232,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
+    let mut data_store = std::collections::HashMap::new();
     //let mut mind = Vec::new();
     //let mut maxd = Vec::new();
 
@@ -83,7 +286,26 @@ fn tree_from_csv<T: AsRef<Path>>(
             }
             */
         }
-        coords.push(Point::new(x, y, cells));
+        // Store data in data_store and use cell_id
+        let cell_id = coords.len() as u32;
+        let array_data = ArrayData::new(Array1::from_vec(cells).into_dyn());
+        data_store.insert(cell_id, array_data);
+        // Pass the data directly to Point
+        // Convert ArrayData to SparseGeneData for compatibility
+        let array_data = &data_store[&cell_id];
+        let dense_data = extract_numeric_data(array_data);
+        let mut gene_indices = Vec::new();
+        let mut expression_values = Vec::new();
+        
+        for (idx, &value) in dense_data.iter().enumerate() {
+            if value > 0 {
+                gene_indices.push(idx);
+                expression_values.push(value);
+            }
+        }
+        
+        let sparse_data = SparseGeneData::new(gene_indices, expression_values, dense_data.len());
+        coords.push(Point::new(x, y, Arc::new(sparse_data)));
     }
 
     let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
@@ -102,280 +324,143 @@ fn tree_from_csv<T: AsRef<Path>>(
 }
 
 /* 
-#[allow(dead_code)]
-fn load_matched_coordinates<P: AsRef<Path>>(
-    h5_path: P,
-    parquet_path: P,
-) -> Result<DataFrame, Box<dyn std::error::Error>> {
-    // Step 1: Read barcodes from HDF5
-    let file = File::open(h5_path)?;
-    let matrix_group = file.group("matrix")?;
-    let barcodes: Vec<String> = matrix_group.dataset("barcodes")?.read_1d()?;
-    let barcode_set: HashSet<&str> = barcodes.iter().map(|s| s.as_str()).collect();
+fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> { 
+    let file = File::open(Path::new(file_path))?; 
+    let reader = SerializedFileReader::new(file)?;  
+    let data = reader.read_all()?;
+    return reader;
+}*/
 
-    // Step 2: Read coordinates from Parquet
-    let mut df = LazyFrame::scan_parquet(parquet_path.as_ref().to_str().unwrap(), Default::default())?
-        .collect()?;
-
-    // Step 3: Filter rows where "barcode" exists in HDF5 barcodes
-    if df.get_column_names().contains(&"barcode") {
-        let mask = df
-            .column("barcode")?
-            .utf8()?
-            .into_iter()
-            .map(|opt| opt.map(|s| barcode_set.contains(s)))
-            .collect::<Result<BooleanChunked, _>>()?;
-
-        df = df.filter(&mask)?;
-    } else {
-        return Err("Column 'barcode' not found in parquet file".into());
-    }
-
-    Ok(df)
-}
-*/
-
-
-#[allow(dead_code)]
-fn tree_from_h5<T: AsRef<Path>>(
+fn tree_from_10X<T: AsRef<Path>>(
     h5_path: T,
-    spatial_path: T,
+    parquet_path: T,
     _method: ErrorMetric,
     _lossless: bool,
-    seq_type: &str,
 ) -> anyhow::Result<QuadTree> {
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true)
-        .flexible(true) // Allow varying number of fields
-        .from_path(spatial_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open spatial file: {}", e))?;
+    // Read features from 10x HDF5 file
+    println!("Reading features from HDF5 file: {}", h5_path.as_ref().display());
+    let features = read_10x_features(&h5_path)?;
+    println!("Found {} features: {:?}", features.len(), &features[..features.len().min(5)]); // Show first 5 features
+    
+    // Read all feature information
+    let file = Hdf5File::open(h5_path.as_ref())?;
 
-    let mut spatial_coords = HashMap::new();
-    let mut spatial_count: u32 = 0;
-    let mut line_number: u32 = 0;
+    // Read gene names (23 chars each)
+    let gene_names = read_strings_23(&file, "matrix/features/name")?;
 
-    // Print header row for debugging
-    if let Ok(header) = rdr.headers() {
-        info!("CSV Headers: {:?}", header);
-        info!("Number of columns in header: {}", header.len());
-    }
+    // Read gene IDs (23 chars each) 
+    let gene_ids = read_strings_23(&file, "matrix/features/id")?;
 
-    for result in rdr.records() {
-        line_number += 1;
-        let record = result
-            .map_err(|e| anyhow::anyhow!("Failed to read record at line {}: {}", line_number, e))?;
+    // Read feature types (25 chars each)
+    let feature_types = read_strings_25(&file, "matrix/features/feature_type")?;
 
-        // Print first few records for debugging
-        if line_number <= 5 {
-            info!("Record {}: {:?}", line_number, record);
-            info!("Number of fields in record: {}", record.len());
-        }
+    // Read genome references (7 chars each)
+    let genomes = read_strings_7(&file, "matrix/features/genome")?;
 
-        if record.len() < 3 {
-            return Err(anyhow::anyhow!(
-                "Record at line {} has insufficient fields (need 3, got {})",
-                line_number,
-                record.len()
-            ));
-        }
+    println!("Gene names: {:?}", &gene_names[..5]);
+    println!("Gene IDs: {:?}", &gene_ids[..5]);
+    println!("Feature types: {:?}", &feature_types[..5]);
+    println!("Genomes: {:?}", &genomes[..5]);
+    
 
-        let barcode = record[0].to_string(); // barcode is in first column
-
-        // Debug print the raw values before parsing
-        if line_number <= 5 {
-            info!(
-                "Raw values for barcode {}: x='{}', y='{}'",
-                barcode,
-                record[1].to_string(),
-                record[2].to_string()
-            );
-        }
-
-        // Try to parse with more detailed error handling
-        let x_str = record[1].trim();
-        let y_str = record[2].trim();
-
-        if x_str.is_empty() || y_str.is_empty() {
-            return Err(anyhow::anyhow!(
-                "Empty coordinate value at line {} for barcode {}: x='{}', y='{}'",
-                line_number,
-                barcode,
-                x_str,
-                y_str
-            ));
-        }
-
-        let x: f64 = x_str.parse().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse x coordinate at line {} for barcode {}: '{}' - {}",
-                line_number,
-                barcode,
-                x_str,
-                e
-            )
-        })?;
-
-        let y: f64 = y_str.parse().map_err(|e| {
-            anyhow::anyhow!(
-                "Failed to parse y coordinate at line {} for barcode {}: '{}' - {}",
-                line_number,
-                barcode,
-                y_str,
-                e
-            )
-        })?;
-
-        spatial_coords.insert(barcode.clone(), (x, y));
-        spatial_count += 1;
-        if spatial_count <= 5 {
-            info!("Successfully parsed barcode: {} at ({}, {})", barcode, x, y);
-        }
-    }
-    info!("Read {} spatial coordinates", spatial_count);
-
-    if spatial_count == 0 {
-        return Err(anyhow::anyhow!(
-            "No valid coordinates found in the CSV file"
-        ));
-    }
-
-    // Read H5AD file
-    let file = File::open(h5_path)?;
-
-    // Read barcodes based on seq_type
-    let barcodes_dataset = if seq_type == "10x" {
-        file.dataset("matrix/barcodes")?
-    } else {
-        file.dataset("obs/_index")?
-    };
-    let barcodes_array: Array1<FixedAscii<32>> = barcodes_dataset.read()?;
-    let barcodes: Vec<String> = barcodes_array
-        .iter()
-        .map(|s| s.as_str().trim_end_matches('\0').to_string())
-        .collect();
-    info!("Read {} barcodes", barcodes.len());
-
-    // Print sample barcodes from H5AD
-    for (i, barcode) in barcodes.iter().take(5).enumerate() {
-        info!("Sample H5AD barcode {}: {}", i, barcode);
-    }
-
-    // Read features based on seq_type
-    let features_dataset = if seq_type == "10x" {
-        file.dataset("matrix/features/name")?
-    } else {
-        file.dataset("var/gene_symbol")?
-    };
-    let features_array: Array1<FixedAscii<32>> = features_dataset.read()?;
-    let features: Vec<String> = features_array
-        .iter()
-        .map(|s| s.as_str().trim_end_matches('\0').to_string())
-        .collect();
-    info!("Read {} features", features.len());
-
-    // Read sparse matrix data based on seq_type
-    let data_dataset = if seq_type == "10x" {
-        file.dataset("matrix/data")?
-    } else {
-        file.dataset("X/data")?
-    };
-    let indices_dataset = if seq_type == "10x" {
-        file.dataset("matrix/indices")?
-    } else {
-        file.dataset("X/indices")?
-    };
-    let indptr_dataset = if seq_type == "10x" {
-        file.dataset("matrix/indptr")?
-    } else {
-        file.dataset("X/indptr")?
-    };
-    let shape_dataset = if seq_type == "10x" {
-        file.dataset("matrix/shape")?
-    } else {
-        file.dataset("X/shape")?
-    };
-
-    let data_array: Array1<f64> = data_dataset.read()?;
-    let indices_array: Array1<usize> = indices_dataset.read()?;
-    let indptr_array: Array1<usize> = indptr_dataset.read()?;
-    let shape_array: Array1<usize> = shape_dataset.read()?;
-
-    let data: Vec<f64> = data_array.to_vec();
-    let indices: Vec<usize> = indices_array.to_vec();
-    let indptr: Vec<usize> = indptr_array.to_vec();
+    let matrix_group = file.group("matrix")?;
+    
+    // Read the shape of the matrix
+    let shape_dataset = matrix_group.dataset("shape")?;
+    let shape_array = shape_dataset.read_1d::<usize>()?;
     let shape: Vec<usize> = shape_array.to_vec();
-
-    info!("Matrix shape: {:?}", shape);
-    info!("Number of non-zero elements: {}", data.len());
-
-    // Create points with coordinates and gene expression
-    let mut points = Vec::new();
-    let num_genes = shape[1];
-    let mut matched_count = 0;
-    let mut unmatched_count = 0;
-
-    for (cell_idx, barcode) in barcodes.iter().enumerate() {
-        if let Some(&(x, y)) = spatial_coords.get(barcode) {
-            // Initialize gene expression vector with zeros
-            let mut gene_expr = vec![0_u16; num_genes];
-
-            // Fill in non-zero values from sparse matrix
-            let start = indptr[cell_idx];
-            let end = indptr[cell_idx + 1];
-            for i in start..end {
-                let gene_idx = indices[i];
-                if gene_idx >= num_genes {
-                    return Err(anyhow::anyhow!(
-                        "Gene index {} out of bounds (max: {}) for cell {}",
-                        gene_idx,
-                        num_genes - 1,
-                        cell_idx
-                    ));
-                }
-                gene_expr[gene_idx] = data[i] as u16;
-            }
-            println!("gene_expr: {:?}", gene_expr);
-            points.push(Point::new(x, y, gene_expr));
-            matched_count += 1;
-            if matched_count <= 5 {
-                info!("Matched barcode: {} at position ({}, {})", barcode, x, y);
-            }
-        } else {
-            unmatched_count += 1;
-            if unmatched_count <= 5 {
-                info!("Unmatched barcode: {}", barcode);
+    let num_features = shape[0];
+    let num_cells = shape[1];
+    
+    println!("Matrix shape: {} cells x {} features", num_cells, num_features);
+    
+    // Read the sparse matrix components
+    let data_dataset = matrix_group.dataset("data")?;
+    let indices_dataset = matrix_group.dataset("indices")?;
+    let indptr_dataset = matrix_group.dataset("indptr")?;
+    
+    let data_array = data_dataset.read_1d::<u16>()?;
+    let data: Vec<u16> = data_array.to_vec();
+    let indices_array = indices_dataset.read_1d::<usize>()?;
+    let indices: Vec<usize> = indices_array.to_vec();
+    let indptr_array = indptr_dataset.read_1d::<usize>()?;
+    let indptr: Vec<usize> = indptr_array.to_vec();
+    
+    println!("Sparse matrix data: {} non-zero elements", data.len());
+    
+    println!("Reading from parquet file: {}", parquet_path.as_ref().display());
+    
+    let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
+    let reader = SerializedFileReader::new(coords).unwrap();
+    let mut coords = Vec::new();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    
+    // Pre-allocate vectors with capacity
+    coords.reserve(num_cells);
+    xs.reserve(num_cells);
+    ys.reserve(num_cells);
+    
+    // Iterate through parquet rows
+    let mut iter = reader.get_row_iter(None).unwrap();
+    let mut row_idx = 0;
+    
+    while let Some(Ok(parquet_row)) = iter.next() {
+        // Extract spatial coordinates from parquet
+        let cell_id = parquet_row.get_string(0).unwrap();
+        assert_eq!(cell_id, row_idx.to_string());
+        let x_coord = parquet_row.get_double(1).unwrap(); // Get x coordinate as f64
+        let y_coord = parquet_row.get_double(2).unwrap(); // Get y coordinate as f64
+        
+        xs.push(x_coord);
+        ys.push(y_coord);
+        
+        // Extract gene expression data for this cell from the sparse matrix
+        let start_idx = indptr[row_idx];
+        let end_idx = indptr[row_idx + 1];
+        
+        // Create sparse representation - only store non-zero values!
+        let mut gene_indices = Vec::new();
+        let mut expression_values = Vec::new();
+        
+        for i in start_idx..end_idx {
+            let gene_idx = indices[i];
+            let expression_value = data[i];
+            if expression_value > 0 {  // Only store non-zero values
+                gene_indices.push(gene_idx);
+                expression_values.push(expression_value);
             }
         }
+        
+        // Create sparse gene data
+        let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
+        
+        // Log memory usage for first few cells
+        if row_idx < 5 {
+            let dense_memory = num_features * std::mem::size_of::<u16>();
+            let sparse_memory = sparse_data.memory_usage();
+            println!("Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%", 
+                    row_idx, dense_memory, sparse_memory, 
+                    (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0);
+        }
+        
+        // Create Point with sparse data using Arc for shared ownership
+        coords.push(Point::new(x_coord, y_coord, Arc::new(sparse_data)));
+        
+        row_idx += 1;
     }
-    info!(
-        "Matched {} barcodes with spatial coordinates",
-        matched_count
-    );
-    info!("Unmatched {} barcodes", unmatched_count);
-    info!("Created {} points", points.len());
+    
+    println!("num_rows: {}", row_idx);
 
-    if points.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No points were created - check if barcodes match between H5 and spatial files"
-        ));
-    }
-
-    // Calculate boundaries
-    let minx = points.iter().map(|p| p.x).fold(f64::INFINITY, f64::min) - 1.0;
-    let miny = points.iter().map(|p| p.y).fold(f64::INFINITY, f64::min) - 1.0;
-    let maxx = points.iter().map(|p| p.x).fold(f64::NEG_INFINITY, f64::max) + 1.0;
-    let maxy = points.iter().map(|p| p.y).fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0; // |a, &b| pattern matching, does not need clone() 
+    let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
+    let maxx = xs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
+    let maxy = ys.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
     let w = maxx - minx;
     let h = maxy - miny;
 
-    info!(
-        "Spatial boundaries: x=[{}, {}], y=[{}, {}]",
-        minx, maxx, miny, maxy
-    );
-
-    // Create quadtree
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, points.clone(), 1);
+    let mut qtree = QuadTree::new(domain, coords, 0);
     qtree.divide();
     Ok(qtree)
 }
@@ -449,11 +534,10 @@ impl Data {
         Self {
             data: Vec::new(),
             pos: Vec::new(),
-            sep: Vec::new(),
         }
     }
 }
-
+/* 
 fn main() -> Result<(), Box<dyn Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -470,18 +554,43 @@ fn main() -> Result<(), Box<dyn Error>> {
         )
         .init();
 
+    // Test reading HDF5 file directly with hdf5 crate
+    println!("Testing HDF5 file reading...");
+    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
+    let parquet_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cells.parquet";
+    tree_from_10X(file_path, parquet_path, ErrorMetric::Mean, true)?;
+    Ok(())
+}
+    */
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Check the `RUST_LOG` variable for the logger level and
+    // respect the value found there. If this environment
+    // variable is not set then set the logging level to
+    // INFO.
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy()
+                // we don't want to hear anything below a warning from ureq
+                .add_directive("ureq=warn".parse()?),
+        )
+        .init();
+  
     let cli_args = Cli::parse();
 
     match cli_args.command {
         Commands::Build(args) => {
-            let file_path = args.input;
+
             let qtree = match args.format.as_str() {
                 "csv" => {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {
                     //    anyhow::anyhow!("Position file required for CSV format")
                     //})?;
                     tree_from_csv(
-                        file_path,
+                        &args.input,
                         //file_path_pos,
                         args.idx_x,          // idx_x
                         args.idx_y,          // idx_y
@@ -491,18 +600,17 @@ fn main() -> Result<(), Box<dyn Error>> {
                         true,
                     )?
                 }
-                //"hdf5" => {
-                  //  let file_path_pos = args.input_pos.ok_or_else(|| {
-                  //      anyhow::anyhow!("Position file required for HDF5 format")
-                  //  })?;
-                //tree_from_h5(
-                //  file_path,
-                //  &file_path_pos,
-                //  ErrorMetric::Mean,
-                //  true,
-                  //  "10x"
-                //)?
-                //}
+                 "10x" => {
+                 let file_path_pos = args.input_pos.ok_or_else(|| {
+                   anyhow::anyhow!("Position file required for HDF5 format")
+                })?;
+                tree_from_10X(
+                  &args.input,
+                &file_path_pos,
+                ErrorMetric::Mean,
+                true,
+                )?
+                }
                 _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
             };
 
@@ -517,9 +625,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut d = Data::new();
 
             let mut collect_data = |n: &BitFieldQuadTree| {
-                info!("Node has {} bytes of encoded diffs", n.encoded_diffs.bytes());
                 if n.encoded_diffs.bytes() > 0 {
-                    info!("Collecting data for node with {} positions", n.positions.len());
                     d.data.push(n.encoded_diffs.clone());
                     d.pos.extend_from_slice(&n.positions);
                 }
@@ -530,15 +636,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 qtree.non_zero_blocks()
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
-            info!("Collected Positions: {}", d.pos.len());
-            
-            let(total_diff_size, total_gene_indices) = bit_field_tree.calculate_size();
-            info!("{} bytes for diffs, {} bytes for gene indices", total_diff_size, total_gene_indices);
-            
-            if d.data.is_empty() {
-                return Err(anyhow::anyhow!("No data was collected during build process").into());
-            }
-            
             bincode::encode_into_std_write(&d.data, &mut file, config).unwrap();
             bincode::encode_into_std_write(&d.pos, &mut file, config).unwrap();
         }
@@ -554,7 +651,6 @@ fn main() -> Result<(), Box<dyn Error>> {
             let mut d = Data::new();
             d.data = bincode::decode_from_std_read(&mut ifile, config)?;
             d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
-            //d.sep = bincode::decode_from_std_read(&mut ifile, config)?;
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
@@ -571,5 +667,102 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
         }
     }
+    Ok(())
+}
+
+// Function to explore HDF5 file structure
+fn explore_hdf5_structure<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    
+    println!("=== HDF5 File Structure ===");
+    println!("File: {}", h5_path.as_ref().display());
+    
+    // Try to access common paths
+    let common_paths = [
+        "matrix/obs/name",
+        "matrix/obs/_index", 
+        "obs/name",
+        "matrix/features/name",
+        "matrix/data",
+        "matrix/indices",
+        "matrix/indptr",
+        "matrix/shape"
+    ];
+    
+    for path in &common_paths {
+        if let Ok(dataset) = file.dataset(path) {
+            let shape = dataset.shape();
+            let dtype = dataset.dtype()?;
+            println!("✅ {} (shape: {:?}, dtype: {:?})", path, shape, dtype);
+        } else {
+            println!("❌ {} (not found)", path);
+        }
+    }
+    
+    println!("=== End Structure ===");
+    
+    Ok(())
+}
+
+// Simple function to demonstrate reading cell names from HDF5
+fn demonstrate_cell_names<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
+    println!("\n=== Trying to read cell names from HDF5 ===");
+    
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    
+    // Try common paths for cell names
+    let cell_name_paths = [
+        "matrix/obs/name",
+        "matrix/obs/_index", 
+        "obs/name",
+        "matrix/obs/id"
+    ];
+    
+    for path in &cell_name_paths {
+        match file.dataset(path) {
+            Ok(dataset) => {
+                let shape = dataset.shape();
+                let dtype = dataset.dtype()?;
+                println!("✅ Found cell names at '{}' (shape: {:?}, dtype: {:?})", path, shape, dtype);
+                
+                // Try to read a few sample cell names
+                if shape.len() == 1 && shape[0] > 0 {
+                    let num_cells = shape[0];
+                    let sample_size = std::cmp::min(5, num_cells);
+                    
+                    // Try to read as strings
+                    if let Ok(strings) = read_strings_as_bytes(&file, path, 23, sample_size) {
+                        println!("   Sample cell names: {:?}", strings);
+                    } else {
+                        println!("   Could not read as strings");
+                    }
+                }
+            }
+            Err(_) => {
+                println!("❌ No cell names found at '{}'", path);
+            }
+        }
+    }
+    
+    println!("=== End cell names exploration ===\n");
+    Ok(())
+}
+
+fn main() -> Result<(), Box<dyn Error>> {
+    // Check the `RUST_LOG` variable for the logger level and
+    // initialize the logger.
+    tracing_subscriber::fmt::init();
+
+    // Test reading HDF5 file directly with hdf5 crate
+    println!("Testing HDF5 file reading...");
+    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
+    
+    // Explore HDF5 structure first
+    explore_hdf5_structure(file_path)?;
+    
+    // Demonstrate reading cell names from HDF5
+    demonstrate_cell_names(file_path)?;
+    
+    println!("Done exploring HDF5 structure!");
     Ok(())
 }

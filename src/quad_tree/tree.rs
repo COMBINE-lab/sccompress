@@ -1,84 +1,28 @@
-use std::io::Cursor;
 
+use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
-use bitm;
+use bitm::{self, BitAccess};
 use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info, warn};
+use crate::ArrayData;
+use std::sync::Arc;
 
-type InnerEFVector = cseq::elias_fano::Sequence<bitm::BinaryRankSearch, bitm::BinaryRankSearch>;
-pub struct EFVector(InnerEFVector);
 
-impl EFVector {
-    pub fn empty() -> Self {
-        let e = Vec::<u64>::new();
-        Self(InnerEFVector::with_items_from_slice_s(&e))
-    }
+// Helper function to extract numeric data from ArrayData
+fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
+    data.data.as_slice().unwrap().to_vec()
 }
 
-impl Clone for EFVector {
-    // Required method
-    fn clone(&self) -> Self {
-        //if !self.0.is_empty() {
-        let mut c = Cursor::new(Vec::new());
-        self.0.write(&mut c);
-        //let v = self.0.iter().collect::<Vec<u64>>();
-        //let seq = InnerEFVector::with_items_from_slice_s(&v);
-        c.set_position(0);
-        let seq = InnerEFVector::read_s(&mut c).expect("works");
-        Self(seq)
-        //} else {
-        //let v = Vec::<u64>::new();
-        //Self(InnerEFVector::with_items_from_slice_s(&v))
-        //}
-    }
-}
 
-impl Encode for EFVector {
-    fn encode<E: bincode::enc::Encoder>(
-        &self,
-        encoder: &mut E,
-    ) -> core::result::Result<(), bincode::error::EncodeError> {
-        let b = self.0.write_bytes();
-        let mut d = Cursor::new(Vec::<u8>::with_capacity(b));
-        self.0.write(&mut d).expect("can write to cursor");
-        d.set_position(0);
-        Encode::encode(&d.into_inner(), encoder)
-    }
-}
-
-impl<Context> Decode<Context> for EFVector {
-    fn decode<D: bincode::de::Decoder<Context = Context>>(
-        decoder: &mut D,
-    ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let d: Vec<u8> = Decode::decode(decoder)?;
-        let mut c = Cursor::new(d);
-        c.set_position(0);
-        let seq = InnerEFVector::read_s(&mut c).expect("valid EF sequence");
-        Ok(Self(seq))
-    }
-}
-
-impl<'de, Context> BorrowDecode<'de, Context> for EFVector {
-    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
-        decoder: &mut D,
-    ) -> Result<Self, bincode::error::DecodeError> {
-        let d: Vec<u8> = BorrowDecode::borrow_decode(decoder)?;
-        let mut c = Cursor::new(d);
-        c.set_position(0);
-        let indices = InnerEFVector::read_s(&mut c).expect("valid EF sequence");
-        Ok(Self(indices))
-    }
-}
 
 #[derive(Clone)]
-pub struct EncodedDiffs {
-    pub indices: EFVector,
-    pub ncells: u32,
-    pub diffs: BitFieldVec,
-    pub medians: BitFieldVec,
-    pub sparse_type: u8,
+pub(crate) struct EncodedDiffs {
+    pub(crate) indices: HybridSparseVec,
+    pub(crate) ncells: u32,
+    pub(crate) diffs: BitFieldVec,
+    pub(crate) medians: BitFieldVec,
 }
 
 fn decode_v(diff: i32) -> i32 {
@@ -89,118 +33,166 @@ fn decode_v(diff: i32) -> i32 {
     }
 }
 
-fn encode_v(val: i32, med_val: i32) -> i32 {
-    let diff = val as i32 - med_val as i32;
-    let diff = if diff <= 0 {
-        (-2_i32 * diff) + 1
-    } else {
-        2_i32 * diff
-    };
-    diff
+pub(crate) struct ExpressionVecIter<'a> {
+    ediff: &'a EncodedDiffs,
+    num_ones: usize,
+    cell_ind: usize,
 }
 
+impl Iterator for ExpressionVecIter<'_> {
+    type Item = Vec<u16>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if (self.cell_ind as u32) < self.ediff.ncells {
+            let cell_ind = self.cell_ind;
+            self.cell_ind += 1;
+            Some(match &self.ediff.indices {
+                HybridSparseVec::EF(_) => {
+                    self.ediff.expression_vec_ef(cell_ind, &mut self.num_ones)
+                }
+                HybridSparseVec::Bit(_) => {
+                    self.ediff.expression_vec_bitv(cell_ind, &mut self.num_ones)
+                }
+            })
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let b = (self.ediff.ncells as usize) - self.cell_ind;
+        (b, Some(b))
+    }
+}
+
+impl ExactSizeIterator for ExpressionVecIter<'_> {}
+
 impl EncodedDiffs {
-    pub fn empty() -> Self {
+    pub(crate) fn empty() -> Self {
         EncodedDiffs {
-            indices: EFVector::empty(),
+            indices: HybridSparseVec::empty(),
             ncells: 0,
             diffs: BitFieldVec::with_capacity(0, 0),
             medians: BitFieldVec::with_capacity(0, 0),
-            sparse_type: 0,
         }
     }
 
-    pub fn is_empty(&self) -> bool {
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub fn num_medians(&self) -> usize {
+    pub(crate) fn num_medians(&self) -> usize {
         self.medians.len()
     }
 
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.diffs.len()
     }
 
-    pub fn num_genes(&self) -> usize {
+    pub(crate) fn num_genes(&self) -> usize {
         self.medians.len()
     }
 
-    pub fn num_cells(&self) -> usize {
+    pub(crate) fn num_cells(&self) -> usize {
         self.ncells as usize
     }
 
-    pub fn expression_vec(&self, cell_ind: usize) -> Vec<u16> {
-        let mut expression = Vec::with_capacity(self.num_genes());
-        let first_idx = self.num_genes() * cell_ind;
-        let last_idx = first_idx + self.num_genes();
-        if self.sparse_type != 1{
-            let start_cur = self.indices.0.geq_cursor(first_idx as u64);
-            let stop_cur = self.indices.0.geq_cursor(last_idx as u64);
+    fn expression_vec_bitv(&self, cell_ind: usize, num_ones: &mut usize) -> Vec<u16> {
+        match &self.indices {
+            HybridSparseVec::Bit(indices) => {
+                let first_idx = self.num_genes() * cell_ind;
+                let mut diff_iter = self.diffs.iter_from(*num_ones);
 
-            let start = if !start_cur.is_valid() {
-                usize::MAX
-            } else {
-                start_cur.index()
-            };
-
-            let stop = if !stop_cur.is_valid() {
-                self.diffs.len()
-            } else {
-                stop_cur.index()
-            };
-            if start == usize::MAX {
-                warn!("SHOULD NOT HAPPEN!");
-            }
-            if start >= last_idx {
-                warn!("SHOULD NOT HAPPEN 2!");
-            }
-
-            let n = stop - start;
-            if n == 0 {
-                return vec![0_u16; self.num_genes()];
-            }
-
-            let mut diff_iter = self.diffs.iter_from(start);
-            let mut nz_ind_iter = start_cur.clone();
-
-            let mut next_diff = diff_iter.next().expect("at least one");
-            let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
-            for gidx in 0..self.num_genes() {
-                if gidx < next_nz_ind as usize {
-                    expression.push(0);
-                } else {
-                    let ddiff = decode_v(next_diff as i32);
-                    let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
-                    expression.push(decoded_val);
-                    let _more = nz_ind_iter.advance();
-                    next_nz_ind = nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
-                    next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                let mut expression = Vec::with_capacity(self.num_genes());
+                let mut next_diff = diff_iter.next().expect("at least one");
+                let mut num_ones_in_cell = 0_usize;
+                for gidx in 0..self.num_genes() {
+                    if !indices.get_bit(gidx + first_idx) {
+                        expression.push(0);
+                    } else {
+                        num_ones_in_cell += 1;
+                        let ddiff = decode_v(next_diff as i32);
+                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                        expression.push(decoded_val);
+                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                    }
                 }
+                *num_ones += num_ones_in_cell;
+                expression
             }
+            _ => unimplemented!(),
         }
-        else{
-            let mut diff_iter = self.diffs.iter_from(first_idx as usize);
-            let mut next_diff = diff_iter.next().expect("at least one");
-            for gidx in 0..self.num_genes() {
-                let median = self.medians.get(gidx);
-                let decoded_val = if next_diff == 0{
-                    0_i32
-                }else{
-                    decode_v(next_diff as i32)+ median as i32
-                };
-                next_diff = diff_iter.next().unwrap_or(usize::MAX);
-                expression.push(decoded_val as u16);
-            }
-            
-        }
-
-        expression
     }
 
-    pub fn bytes(&self) -> usize {
+    fn expression_vec_ef(&self, cell_ind: usize, _num_ones: &mut usize) -> Vec<u16> {
+        match &self.indices {
+            HybridSparseVec::EF(indices) => {
+                let first_idx = self.num_genes() * cell_ind;
+                let last_idx = first_idx + self.num_genes();
+
+                let start_cur = indices.0.geq_cursor(first_idx as u64);
+                let stop_cur = indices.0.geq_cursor(last_idx as u64);
+
+                let start = if !start_cur.is_valid() {
+                    usize::MAX
+                } else {
+                    start_cur.index()
+                };
+
+                let stop = if !stop_cur.is_valid() {
+                    self.diffs.len()
+                } else {
+                    stop_cur.index()
+                };
+                if start == usize::MAX {
+                    warn!("SHOULD NOT HAPPEN!");
+                }
+                if start >= last_idx {
+                    warn!("SHOULD NOT HAPPEN 2!");
+                }
+
+                let n = stop - start;
+                if n == 0 {
+                    return vec![0_u16; self.num_genes()];
+                }
+
+                let mut diff_iter = self.diffs.iter_from(start);
+                let mut nz_ind_iter = start_cur.clone();
+
+                let mut expression = Vec::with_capacity(self.num_genes());
+                let mut next_diff = diff_iter.next().expect("at least one");
+                let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
+                for gidx in 0..self.num_genes() {
+                    if gidx < next_nz_ind as usize {
+                        expression.push(0);
+                    } else {
+                        let ddiff = decode_v(next_diff as i32);
+                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                        expression.push(decoded_val);
+                        let _more = nz_ind_iter.advance();
+                        next_nz_ind = nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
+                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                    }
+                }
+                expression
+            }
+            _ => unimplemented!(),
+        }
+    }
+
+    pub(crate) fn expression_vec_iter(&self) -> ExpressionVecIter {
+        ExpressionVecIter {
+            ediff: self,
+            num_ones: 0,
+            cell_ind: 0,
+        }
+    }
+
+    pub(crate) fn bytes(&self) -> usize {
         let diff_bits = self.diffs.len() * self.diffs.bit_width();
-        let ibits = self.indices.0.write_bytes() * 8;
+        let ibits = self.indices.num_bits(); //0.write_bytes() * 8;
+
         let ncbits = 32;
         let m_bits = self.medians.len() * self.medians.bit_width();
         (4 * 24) + (diff_bits + ibits + ncbits + m_bits) / 8
@@ -227,8 +219,6 @@ impl Encode for EncodedDiffs {
         Encode::encode(&b, encoder)?;
         Encode::encode(&w, encoder)?;
         Encode::encode(&l, encoder)?;
-
-        Encode::encode(&self.sparse_type, encoder)?;
         Ok(())
     }
 }
@@ -250,15 +240,11 @@ impl<Context> Decode<Context> for EncodedDiffs {
         let w = Decode::decode(decoder)?;
         let l = Decode::decode(decoder)?;
         let medians = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
-
-        let sparse_type = Decode::decode(decoder)?;
-
         Ok(Self {
             indices,
             ncells,
             diffs,
             medians,
-            sparse_type,
         })
     }
 }
@@ -279,15 +265,11 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
         let width = BorrowDecode::borrow_decode(decoder)?;
         let len = BorrowDecode::borrow_decode(decoder)?;
         let medians = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
-
-        let sparse_type = BorrowDecode::borrow_decode(decoder)?;
-
         Ok(Self {
             indices,
             ncells,
             diffs,
             medians,
-            sparse_type,
         })
     }
 }
@@ -304,28 +286,30 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         return None;
     }
 
-    let mut indices = Vec::<u32>::new();
+    let mut indices = Vec::<u64>::new();
     let mut medians = Vec::<u16>::new();
     let mut raw_diffs = Vec::<u32>::new();
-    //let mut max_diff = 0_i32;
-    let num_genes = points[0].data.len() as u32;
-    let mut sparse_type: u8 = 0;
-    let mut nz_len = 0_u32;
+    let mut max_diff = 0_i32;
+    let num_genes = points[0].get_data().len() as u32;
     debug!("Processing {} points in encode_subarray()", points.len());
     debug!("Number of genes: {}", num_genes);
 
+    let mut nnz = 0_usize;
     // we'll make 2 passes, because we want to store the final results in
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
-    for j in 0..points[0].data.len() {
+    for j in 0..points[0].get_data().len() {
         // get the non-zero values and the non-zero indices
         let nz_values: Vec<u16> = points
             .iter()
-            .filter_map(|p| if p.data[j] > 0 { Some(p.data[j]) } else { None })
+            .filter_map(|p| {
+                let data = p.get_data();
+                if data[j] > 0 { Some(data[j]) } else { None }
+            })
             .collect();
-        nz_len += nz_values.len() as u32;
 
         // nonzero median values
         let median = if !nz_values.is_empty() {
+            nnz += nz_values.len();
             let mut sorted_values = nz_values.clone();
             sorted_values.sort_unstable();
             sorted_values[sorted_values.len() / 2] //median of the expressed values
@@ -335,69 +319,56 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         medians.push(median);
     }
 
-    let total_len = num_genes as u32 * points.len() as u32;
-    let sparsity = nz_len as f32 / total_len as f32;
+    let tot = num_genes as usize * points.len();
+    let sparsity = (nnz as f64) / (tot as f64);
 
     // for each cell
     for (cell_ind, gene_exp) in points.iter().enumerate() {
         let index_offset = cell_ind * num_genes as usize;
         // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
-        for ((gene_ind, val), med_val) in gene_exp.data.iter().enumerate().zip(&medians) {
+        let gene_data = gene_exp.get_data();
+        for ((gene_ind, val), med_val) in gene_data.iter().enumerate().zip(&medians) {
             // the median of **non-zero** expression values was zero, this
             // is recorded iff there were no cells in the current block expressing
             // this gene. Otherwise, if the original value itself is zero, then
             // don't record anything
             if *med_val == 0 || *val == 0 {
-                if sparsity >= 0.75 {
-                    let index = index_offset + gene_ind;
-                    indices.push(index as u32);
-                }else if sparsity >= 0.25 && sparsity < 0.75 {
-                    if *val == 0 {
-                        raw_diffs.push(0_u32);
-                    }else{
-                        let diff = encode_v(*val as i32, *med_val as i32);
-                        raw_diffs.push(diff as u32);
-                    }
-                }
+                continue;
             } else {
                 // we have a non-zero median value
-                let diff = encode_v(*val as i32, *med_val as i32);
+                let diff = *val as i32 - *med_val as i32;
+                let diff = if diff < 0 {
+                    (-2_i32 * diff) + 1
+                } else {
+                    2_i32 * diff
+                };
                 assert_eq!(*val as i32, decode_v(diff) + *med_val as i32);
                 raw_diffs.push(diff as u32);
                 let index = index_offset + gene_ind;
-                if sparsity < 0.25 {
-                indices.push(index as u32);
-                //gene_indices.push(gene_ind as u32);
-                //max_diff = max_diff.max(diff);
-                }
+                indices.push(index as u64);
+                max_diff = max_diff.max(diff);
             }
         }
-    } 
-    if sparsity >= 0.25 && sparsity < 0.75 {
-        sparse_type = 1;
-    }else if sparsity >= 0.75 {
-        sparse_type = 2;
     }
 
-    //let gene_indices = BitFieldVec::<usize>::from_slice(&gene_indices).expect("should fit");
-    //let cell_indices = BitFieldVec::<usize>::from_slice(&cell_indices).expect("should fit");
-    let indices = InnerEFVector::with_items_from_slice_s(&indices);
+    let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
     let medians = BitFieldVec::<usize>::from_slice(&medians).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
-    if sparsity < 0.25{assert_eq!(indices.len(), diffs.len());}
+    info!("sparsity : {}", sparsity);
+    assert_eq!(indices.len(), diffs.len());
 
     let enc_diffs = EncodedDiffs {
-        indices: EFVector(indices),
+        indices,
         ncells: points.len() as u32,
         diffs,
         medians,
-        sparse_type,
     };
 
     // validate!
-    for (cell_ind, gene_exp) in points.iter().enumerate() {
-        assert_eq!(enc_diffs.expression_vec(cell_ind), gene_exp.data);
+    for (recon_vec, orig_vec) in enc_diffs.expression_vec_iter().zip(points.iter()) {
+        let orig_data = orig_vec.get_data();
+        assert_eq!(recon_vec, orig_data);
     }
 
     info!(
@@ -410,27 +381,40 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub enum ErrorMetric {
+pub(crate) enum ErrorMetric {
     Mean,
+    #[allow(dead_code)]
     Median,
 }
 
-pub trait PointLike {
+pub(crate) trait PointLike {
     fn xpos(&self) -> f64;
     fn ypos(&self) -> f64;
 }
 
-#[derive(Debug, Clone, Encode, Decode)]
-pub struct Point {
-    pub x: f64,
-    pub y: f64,
-    pub data: Vec<u16>,
+/*
+pub(crate) enum ArrayData {
+    Vector(Vec<u16>),
+    Optional(Option<ArrayData>),
+}
+*/
+
+#[derive(Clone)]
+pub(crate) struct Point {
+    pub(crate) x: f64,
+    pub(crate) y: f64,
+    pub(crate) data_arc: Arc<ArrayData>,
+    pub(crate) data_slice: std::ops::Range<usize>,
 }
 
 impl Point {
     #[inline(always)]
-    pub const fn new(x: f64, y: f64, data: Vec<u16>) -> Self {
-        Self { x, y, data }
+    pub(crate) fn new(x: f64, y: f64, data_arc: Arc<ArrayData>, data_slice: std::ops::Range<usize>) -> Self {
+        Self { x, y, data_arc, data_slice }
+    }
+
+    pub(crate) fn get_data(&self) -> Vec<u16> {
+        extract_numeric_data(&self.data_arc)
     }
 }
 
@@ -448,7 +432,8 @@ impl PointLike for Point {
 /// A point that has just its 2D coordinates, but does not
 /// carry with it any additional data.
 #[derive(Debug, Clone, Encode, Decode)]
-pub struct DatalessPoint {
+
+pub(crate) struct DatalessPoint {
     x: f64,
     y: f64,
 }
@@ -491,7 +476,6 @@ fn get_child_rects(parent: &Rect) -> (Rect, Rect, Rect, Rect) {
     let center_x = parent.cx;
     let center_y = parent.cy;
 
-    // pub const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64)
     let nw_boundary = Rect::new_from_bounds(west_child_west, center_x, north_child_north, center_y);
     let ne_boundary = Rect::new_from_bounds(center_x, east_child_east, north_child_north, center_y);
 
@@ -501,7 +485,7 @@ fn get_child_rects(parent: &Rect) -> (Rect, Rect, Rect, Rect) {
 }
 
 #[derive(Debug, Clone)]
-pub struct Rect {
+pub(crate) struct Rect {
     cx: f64,
     cy: f64,
     west_edge: f64,
@@ -512,7 +496,7 @@ pub struct Rect {
 
 impl Rect {
     #[inline(always)]
-    pub const fn new(cx: f64, cy: f64, w: f64, h: f64) -> Self {
+    pub(crate) const fn new(cx: f64, cy: f64, w: f64, h: f64) -> Self {
         Self {
             cx,
             cy,
@@ -524,7 +508,7 @@ impl Rect {
     }
 
     #[inline(always)]
-    pub const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64) -> Self {
+    pub(crate) const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64) -> Self {
         let w = west - east;
         let h = north - south;
         let cx = west + (w / 2_f64);
@@ -598,7 +582,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for Rect {
 }
 
 #[derive(Clone)]
-pub struct BitField {
+pub(crate) struct BitField {
     bit_field: BitFieldVec,
 }
 
@@ -652,19 +636,20 @@ impl<'de, Context> BorrowDecode<'de, Context> for BitField {
 }
 
 #[derive(Encode, Decode, Clone)]
-pub struct BitFieldQuadTree {
-    pub boundary: Rect,
-    pub encoded_diffs: EncodedDiffs,
+pub(crate) struct BitFieldQuadTree {
+    pub(crate) boundary: Rect,
+    pub(crate) encoded_diffs: EncodedDiffs,
     divided: bool,
     nw: Option<Box<BitFieldQuadTree>>,
     ne: Option<Box<BitFieldQuadTree>>,
     se: Option<Box<BitFieldQuadTree>>,
     sw: Option<Box<BitFieldQuadTree>>,
-    pub positions: Vec<DatalessPoint>,
+    pub(crate) positions: Vec<DatalessPoint>,
 }
 
 impl BitFieldQuadTree {
-    pub fn new(boundary: Rect) -> Self {
+    #[allow(dead_code)]
+    pub(crate) fn new(boundary: Rect) -> Self {
         Self {
             boundary,
             encoded_diffs: EncodedDiffs::empty(),
@@ -676,8 +661,7 @@ impl BitFieldQuadTree {
             positions: Vec::new(),
         }
     }
-
-    pub fn visit(&self, fun: &mut impl FnMut(&BitFieldQuadTree)) {
+    pub(crate) fn visit(&self, fun: &mut impl FnMut(&BitFieldQuadTree)) {
         fun(self);
         if self.divided {
             self.children().iter().for_each(|c| {
@@ -688,11 +672,12 @@ impl BitFieldQuadTree {
         }
     }
 
-    pub fn children(&self) -> [&Option<Box<BitFieldQuadTree>>; 4] {
+    pub(crate) fn children(&self) -> [&Option<Box<BitFieldQuadTree>>; 4] {
         [&self.nw, &self.ne, &self.sw, &self.se]
     }
 
-    pub fn calculate_expense(&self) -> usize {
+    #[allow(dead_code)]
+    pub(crate) fn calculate_expense(&self) -> usize {
         info!(
             "Calculating expense for BitFieldQuadTree node with {} total points and size {} bytes",
             self.encoded_diffs.len(),
@@ -703,7 +688,7 @@ impl BitFieldQuadTree {
     }
 
     /*
-    pub fn to_quad_tree(&self) -> QuadTree {
+    pub(crate) fn to_quad_tree(&self) -> QuadTree {
         let mut quadtree = QuadTree::new(self.boundary.clone(), Vec::new(), 0);
         quadtree.divided = self.divided;
         // Convert the raw parts into f64 values to meet the QuadTree requirements
@@ -734,7 +719,8 @@ impl BitFieldQuadTree {
     }
     */
 
-    pub fn calculate_size(&self) -> (usize, usize) {
+    #[allow(dead_code)]
+    pub(crate) fn calculate_size(&self) -> (usize, usize) {
         let mut total_size = 0;
         let mut total_bitfields = 0;
 
@@ -775,7 +761,8 @@ impl BitFieldQuadTree {
         (total_size, total_bitfields)
     }
 
-    pub fn print_size_info(&self, depth: usize) {
+    #[allow(dead_code)]
+    pub(crate) fn print_size_info(&self, depth: usize) {
         let indent = "  ".repeat(depth);
         let (size, bitfields) = self.calculate_size();
         info!(
@@ -800,8 +787,7 @@ impl BitFieldQuadTree {
     }
 }
 
-#[derive(Debug, Encode, Decode)]
-pub struct QuadTree {
+pub(crate) struct QuadTree {
     boundary: Rect,
     points: Vec<Point>,
     depth: usize,
@@ -813,11 +799,13 @@ pub struct QuadTree {
     sw: Option<Box<Self>>,
     data: Vec<f64>,
     positions: Vec<DatalessPoint>,
+    // External data storage - maps cell_id to ArrayData
+    data_store: std::collections::HashMap<u32, ArrayData>,
 }
 
 impl QuadTree {
     #[inline(always)]
-    pub const fn new(boundary: Rect, points: Vec<Point>, depth: usize) -> Self {
+    pub(crate) fn new(boundary: Rect, points: Vec<Point>, depth: usize, data_store: std::collections::HashMap<u32, ArrayData>) -> Self {
         Self {
             boundary,
             points,
@@ -829,11 +817,29 @@ impl QuadTree {
             se: None,
             sw: None,
             data: Vec::new(),
+            //index: Vec::new(),
             positions: Vec::new(),
+            data_store,
         }
     }
 
-    pub fn query(&self, boundary: &Rect) -> Vec<Point> {
+    /// Get the expression data for a specific cell
+    pub(crate) fn get_cell_data(&self, cell_id: u32) -> Option<&ArrayData> {
+        self.data_store.get(&cell_id)
+    }
+
+    /// Get the expression data for a point
+    pub(crate) fn get_point_data<'a>(&self, point: &'a Point) -> Option<&'a ArrayData> {
+        Some(&point.data_arc)
+    }
+
+    /// Get all expression data for a point
+    pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> Vec<&'a ArrayData> {
+        // Since we now store data directly in Point, just return it as a single element
+        vec![&point.data_arc]
+    }
+
+    pub(crate) fn query(&self, boundary: &Rect) -> Vec<Point> {
         let mut found_points = Vec::new();
         if !self.boundary.intersects(boundary) {
             return found_points;
@@ -866,6 +872,7 @@ impl QuadTree {
         found_points
     }
 
+/*
     pub fn block_data_repr(&self, method: ErrorMetric) -> Vec<f64> {
         if self.points.is_empty() {
             return Vec::new();
@@ -889,7 +896,7 @@ impl QuadTree {
         }
         block_mean
     }
-    /*
+    
         pub fn calculate_error(&self, method: ErrorMetric, mind: &[u16], maxd: &[u16], _prob: f64) -> f64 {
             let mut found_points = Vec::new();
             self.query(&self.boundary);
@@ -924,12 +931,17 @@ impl QuadTree {
         }
     */
 
-    pub fn divide(&mut self) {
+    pub(crate) fn divide(&mut self) {
         info!("Processing block with {} points", self.points.len());
 
         debug!("self.points.len(): {}", self.points.len());
         if !self.points.is_empty() {
-            println!("Initial number of genes: {}", self.points[0].data.len());
+            println!("Initial number of genes: {}", self.points[0].get_data().len());
+        }
+
+        // nothing to do if this subtree is empty
+        if self.points.is_empty() {
+            return;
         }
 
         // nothing to do if this subtree is empty
@@ -945,7 +957,7 @@ impl QuadTree {
             .collect();
 
         // Compute the expense of encoding the current block
-        let current_expense = encode_subarray(&self.points).map_or(0, |x| x.bytes());
+        let current_expense = encode_subarray(&self.points, &self.data_store).map_or(0, |x| x.bytes());
         info!(
             "expense of current block consisting of {} points is {}",
             self.points.len(),
@@ -955,16 +967,22 @@ impl QuadTree {
         // Find the children of the current node
         let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&self.boundary);
         let nw_points = self.query(&nw_boundary);
-        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
+        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1, self.data_store.clone());
 
         let ne_points = self.query(&ne_boundary);
-        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
+        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1, self.data_store.clone());
 
         let se_points = self.query(&se_boundary);
-        let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
+        let se = QuadTree::new(se_boundary, se_points, self.depth + 1, self.data_store.clone());
 
         let sw_points = self.query(&sw_boundary);
-        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
+        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1, self.data_store.clone());
+
+        // make sure we're not losing any points
+        assert_eq!(
+            nw.points.len() + ne.points.len() + se.points.len() + sw.points.len(),
+            self.points.len()
+        );
 
         // make sure we're not losing any points
         assert_eq!(
@@ -973,10 +991,10 @@ impl QuadTree {
         );
 
         // Convert children to BitFieldQuadTree to calculate their expenses
-        let nw_expense = encode_subarray(&nw.points).map_or(0, |x| x.bytes());
-        let ne_expense = encode_subarray(&ne.points).map_or(0, |x| x.bytes());
-        let se_expense = encode_subarray(&se.points).map_or(0, |x| x.bytes());
-        let sw_expense = encode_subarray(&sw.points).map_or(0, |x| x.bytes());
+        let nw_expense = encode_subarray(&nw.points, &self.data_store).map_or(0, |x| x.bytes());
+        let ne_expense = encode_subarray(&ne.points, &self.data_store).map_or(0, |x| x.bytes());
+        let se_expense = encode_subarray(&se.points, &self.data_store).map_or(0, |x| x.bytes());
+        let sw_expense = encode_subarray(&sw.points, &self.data_store).map_or(0, |x| x.bytes());
 
         info!("NW expense: {}", nw_expense);
         info!("NE expense: {}", ne_expense);
@@ -1014,7 +1032,7 @@ impl QuadTree {
                 info!(
                     "Leaf node - points: {}, genes: {}",
                     self.points.len(),
-                    self.points[0].data.len()
+                    self.points[0].get_data().len()
                 );
                 self.positions = positions; // Use the stored positions
                                             // Keep the points for bit field representation
@@ -1023,7 +1041,7 @@ impl QuadTree {
         info!("self.depth: {}", self.depth);
     }
 
-    pub fn non_zero_blocks(&self) -> usize {
+    pub(crate) fn non_zero_blocks(&self) -> usize {
         let mut npoints = 0;
         if !self.divided {
             if !self.points.is_empty() {
@@ -1046,74 +1064,7 @@ impl QuadTree {
         npoints
     }
 
-    /* This is simply a bit vector across genes for each block */
-    pub fn block_data_to_sarray(&self, _sparse: bool) -> (Vec<u16>, Vec<BitField>) {
-        let mut sarray = Vec::new();
-        let mut diffs = Vec::new();
-
-        if self.points.is_empty() {
-            debug!("Empty points array in block_data_to_sarray");
-            return (sarray, diffs);
-        }
-
-        debug!(
-            "Processing {} points in block_data_to_sarray",
-            self.points.len()
-        );
-        debug!("Number of genes: {}", self.points[0].data.len());
-
-        for j in 0..self.points[0].data.len() {
-            // for each gene
-            let nz_values: Vec<u16> = self
-                .points
-                .iter()
-                .filter_map(|p| if p.data[j] > 0 { Some(p.data[j]) } else { None })
-                .collect(); // Keep only non-zero values
-
-            let median = if !nz_values.is_empty() {
-                let mut sorted_values = nz_values.clone();
-                sorted_values.sort_unstable();
-                sorted_values[sorted_values.len() / 2] //median of the expressed values
-            } else {
-                0
-            };
-
-            if median != 0 {
-                sarray.push(median); // Use push instead of append
-                let mut max_diff = 0;
-                let mut min_diff = 0;
-
-                // Find min and max diffs
-                for &value in &nz_values {
-                    let diff = value.wrapping_sub(median);
-                    min_diff = min_diff.min(diff as usize);
-                    max_diff = max_diff.max(diff as usize);
-                }
-
-                let bit_width = (max_diff as u16).ilog2() as usize + 1;
-                //println!("Gene {}: median={}, bit_width={}, min_diff={}, max_diff={}",
-                //    j, median, bit_width, min_diff, max_diff);
-
-                let mut bit_field = BitFieldVec::new(bit_width, nz_values.len());
-                // Calculate and store differences
-                for (i, &value) in nz_values.iter().enumerate() {
-                    let diff = value.wrapping_sub(median);
-                    bit_field.set(i, diff as usize);
-                }
-
-                diffs.push(BitField::new(bit_field));
-            }
-        }
-
-        info!(
-            "Generated {} medians and {} diffs",
-            sarray.len(),
-            diffs.len()
-        );
-        (sarray, diffs)
-    }
-
-    pub fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
+    pub(crate) fn compute_quadtree_bit_fields(&self) -> BitFieldQuadTree {
         debug!(
             "Computing bit fields - points available: {}",
             self.points.len()
@@ -1121,7 +1072,7 @@ impl QuadTree {
         if !self.points.is_empty() {
             debug!(
                 "Computing bit fields - genes per point: {}",
-                self.points[0].data.len()
+                self.points[0].get_data().len()
             );
         }
 
@@ -1166,3 +1117,4 @@ impl QuadTree {
         node
     }
 }
+
