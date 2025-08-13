@@ -1,14 +1,11 @@
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 pub mod quad_tree;
+pub mod bits;
 use clap::{Args, Parser, Subcommand};
 use csv::ReaderBuilder;
-use hdf5::types::FixedAscii;
-use hdf5::File;
-use ndarray::Array1;
 use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
-use std::collections::HashMap;
 use std::error::Error;
-use std::fs::File as StdFile;
+use std::fs::File;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::info;
@@ -17,10 +14,14 @@ use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use std::sync::Arc;
-use hdf5::{File as Hdf5File, Group, Dataset};
+use hdf5::File as Hdf5File;
 use hdf5::types::FixedAscii;
-use ndarray::{Array1, ArrayD, s};
-use tracing::{debug, info, warn};
+use ndarray::{Array1, ArrayD};
+use flate2::Compression;
+use flate2::write::GzEncoder;
+use parquet::file::reader::{FileReader, SerializedFileReader};
+use parquet::record::RowAccessor;
+// removed unused bincode::{Encode, Decode} import
 
 // Simple ArrayData type to replace anndata::ArrayData
 #[derive(Clone)]
@@ -83,9 +84,6 @@ fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
 }
 
 //use af_anndata::H5 as H52;
-use std::fs::File;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
 
 fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
     println!("Reading features from 10x HDF5 file: {}", h5_path.as_ref().display());
@@ -95,7 +93,7 @@ fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> 
     
     let matrix_group = file.group("matrix")?;
     println!("Found matrix group");
-    
+     
     let features_group = matrix_group.group("features")?;
     println!("Found features group");
     
@@ -304,8 +302,8 @@ fn tree_from_csv<T: AsRef<Path>>(
             }
         }
         
-        let sparse_data = SparseGeneData::new(gene_indices, expression_values, dense_data.len());
-        coords.push(Point::new(x, y, Arc::new(sparse_data)));
+        let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
+        coords.push(Point::new(x, y, Arc::new(array_data)));
     }
 
     let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
@@ -319,7 +317,33 @@ fn tree_from_csv<T: AsRef<Path>>(
 
     // No need to convert since we're already using u16
     let mut qtree = QuadTree::new(domain, coords, 0);
-    qtree.divide();
+    
+    // Divide the quadtree and get cost log
+    let division_cost_log = qtree.divide();
+    info!("Division cost log contains {} steps", division_cost_log.steps.len());
+    info!("Total nodes processed: {}", division_cost_log.total_nodes);
+    info!("Total cost: {}", division_cost_log.total_cost);
+
+    // Serialize division cost log to file
+    let division_cost_log_filename = PathBuf::from("division_costs.bin");
+    let cost_config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+    let mut division_cost_file = File::create(&division_cost_log_filename)?;
+    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
+    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
+/*
+    // Optimize the quadtree and get cost log
+    let optimization_cost_log = qtree.optimize_quadtree();
+    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
+    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
+
+    // Serialize optimization cost log to file
+    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
+    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
+    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
+    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
+    */
     Ok(qtree)
 }
 
@@ -408,7 +432,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     while let Some(Ok(parquet_row)) = iter.next() {
         // Extract spatial coordinates from parquet
         let cell_id = parquet_row.get_string(0).unwrap();
-        assert_eq!(cell_id, row_idx.to_string());
+        //assert_eq!(*cell_id, row_idx.to_string());
         let x_coord = parquet_row.get_double(1).unwrap(); // Get x coordinate as f64
         let y_coord = parquet_row.get_double(2).unwrap(); // Get y coordinate as f64
         
@@ -445,7 +469,9 @@ fn tree_from_10X<T: AsRef<Path>>(
         }
         
         // Create Point with sparse data using Arc for shared ownership
-        coords.push(Point::new(x_coord, y_coord, Arc::new(sparse_data)));
+        let dense_data = sparse_data.to_dense();
+        let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
+        coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
         
         row_idx += 1;
     }
@@ -461,7 +487,33 @@ fn tree_from_10X<T: AsRef<Path>>(
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
-    qtree.divide();
+    
+    // Divide the quadtree and get cost log
+    let division_cost_log = qtree.divide();
+    info!("Division cost log contains {} steps", division_cost_log.steps.len());
+    info!("Total nodes processed: {}", division_cost_log.total_nodes);
+    info!("Total cost: {}", division_cost_log.total_cost);
+
+    // Serialize division cost log to file
+    let division_cost_log_filename = PathBuf::from("division_costs.bin");
+    let cost_config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+    let mut division_cost_file = File::create(&division_cost_log_filename)?;
+    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
+    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
+
+    // Optimize the quadtree and get cost log
+    let optimization_cost_log = qtree.optimize_quadtree();
+    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
+    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
+
+    // Serialize optimization cost log to file
+    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
+    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
+    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
+    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
+    
     Ok(qtree)
 }
 
@@ -534,6 +586,7 @@ impl Data {
         Self {
             data: Vec::new(),
             pos: Vec::new(),
+            sep: Vec::new(),
         }
     }
 }
@@ -619,8 +672,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .with_little_endian()
                 .with_fixed_int_encoding();
             let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-            let mut file = StdFile::create(ofname).unwrap();
-            //let mut encoder = GzEncoder::new(file, Compression::default());
+            let mut file = File::create(ofname).unwrap();
+            let mut encoder = GzEncoder::new(file, Compression::default());
             let bit_field_tree = qtree.compute_quadtree_bit_fields();
             let mut d = Data::new();
 
@@ -636,8 +689,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                 qtree.non_zero_blocks()
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
-            bincode::encode_into_std_write(&d.data, &mut file, config).unwrap();
-            bincode::encode_into_std_write(&d.pos, &mut file, config).unwrap();
+            bincode::encode_into_std_write(&d.data, &mut encoder, config).unwrap();
+            bincode::encode_into_std_write(&d.pos, &mut encoder, config).unwrap();
         }
         Commands::Dump(args) => {
             let ifile = std::fs::File::open(args.input)?;
@@ -656,7 +709,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let n = compressed_diffs.num_cells();
                 for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
                     let expression = compressed_diffs
-                        .expression_vec(cell_id)
+                        .expression_vec_iter().nth(cell_id).unwrap_or_default()
                         .iter()
                         .map(|x| x.to_string())
                         .collect::<Vec<_>>()
@@ -748,21 +801,4 @@ fn demonstrate_cell_names<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Check the `RUST_LOG` variable for the logger level and
-    // initialize the logger.
-    tracing_subscriber::fmt::init();
 
-    // Test reading HDF5 file directly with hdf5 crate
-    println!("Testing HDF5 file reading...");
-    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
-    
-    // Explore HDF5 structure first
-    explore_hdf5_structure(file_path)?;
-    
-    // Demonstrate reading cell names from HDF5
-    demonstrate_cell_names(file_path)?;
-    
-    println!("Done exploring HDF5 structure!");
-    Ok(())
-}
