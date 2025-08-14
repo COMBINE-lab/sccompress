@@ -402,6 +402,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     let data_dataset = matrix_group.dataset("data")?;
     let indices_dataset = matrix_group.dataset("indices")?;
     let indptr_dataset = matrix_group.dataset("indptr")?;
+    let barcodes_dataset = matrix_group.dataset("barcodes")?;
     
     let data_array = data_dataset.read_1d::<u16>()?;
     let data: Vec<u16> = data_array.to_vec();
@@ -432,7 +433,18 @@ fn tree_from_10X<T: AsRef<Path>>(
     while let Some(Ok(parquet_row)) = iter.next() {
         // Extract spatial coordinates from parquet
         let cell_id = parquet_row.get_string(0).unwrap();
-        //assert_eq!(*cell_id, row_idx.to_string());
+        // Check to make sure cell_id matches barcode otherwise return error
+        let barcode = barcodes_dataset.read_1d::<FixedAscii<23>>().unwrap()[row_idx]
+            .as_str()
+            .trim_end_matches('\0')
+            .to_string();
+        if *cell_id != barcode {
+            return Err(anyhow::anyhow!(
+                "Check input files. 
+                Cell ID mismatch at row {}: parquet cell_id '{}' does not match HDF5 barcode '{}'",
+                row_idx, cell_id, barcode
+            ));
+        }
         let x_coord = parquet_row.get_double(1).unwrap(); // Get x coordinate as f64
         let y_coord = parquet_row.get_double(2).unwrap(); // Get y coordinate as f64
         

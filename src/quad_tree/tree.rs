@@ -1010,12 +1010,12 @@ impl QuadTree {
         let mut stack = vec![self];
         let mut cost_log = CostLog::new();
         let mut node_counter = 0;
-        let max_depth = 10; 
+        //let max_depth = 10; 
          
         while let Some(node) = stack.pop() {
-            if node.depth >= max_depth {
-                continue;
-            }
+            //if node.depth >= max_depth {
+              //  continue;
+            //}
             node_counter += 1;
              
             // info!("Processing block with {} points at depth {}", node.points.len(), node.depth);
@@ -1407,7 +1407,7 @@ impl QuadTree {
                 node.sw = Some(Box::new(sw.compute_quadtree_bit_fields()));
             }
         } else {
-            node.encoded_diffs = encode_subarray(&self.points).expect("nonempty") ;
+            node.encoded_diffs = encode_subarray(&self.points).expect("expect nonempty") ;
             node.positions = self.positions.clone();
         }
         node
