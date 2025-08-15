@@ -138,32 +138,26 @@ impl EncodedDiffs {
     fn expression_vec_bitv(&self, cell_ind: usize, num_ones: &mut usize) -> Vec<u16> {
         match &self.indices {
             HybridSparseVec::Bit(indices) => {
-                // Check if diffs is empty first
-                if self.diffs.is_empty() {
+                if !self.precheck_cells(cell_ind) {
                     return vec![0_u16; self.num_genes()];
                 }
-                
+
                 let first_idx = self.num_genes() * cell_ind;
                 let mut diff_iter = self.diffs.iter_from(*num_ones);
 
-                // Check if diff_iter is empty
-                if self.is_diff_iter_empty(*num_ones) {
-                    // Return all zeros if no differences
-                    return vec![0_u16; self.num_genes()];
-                }
-
                 let mut expression = Vec::with_capacity(self.num_genes());
-                let mut next_diff = diff_iter.next().expect("at least one"); // write a function to iterate over the diffs!
+                let mut next_diff_opt = diff_iter.next();
                 let mut num_ones_in_cell = 0_usize;
                 for gidx in 0..self.num_genes() {
                     if !indices.get_bit(gidx + first_idx) {
                         expression.push(0);
                     } else {
                         num_ones_in_cell += 1;
+                        let next_diff = next_diff_opt.unwrap_or(0);
                         let ddiff = decode_v(next_diff as i32);
                         let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
                         expression.push(decoded_val);
-                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                        next_diff_opt = diff_iter.next();
                     }
                 }
                 *num_ones += num_ones_in_cell;
@@ -176,61 +170,53 @@ impl EncodedDiffs {
     fn expression_vec_ef(&self, cell_ind: usize, _num_ones: &mut usize) -> Vec<u16> {
         match &self.indices {
             HybridSparseVec::EF(indices) => {
-                // Check if diffs is empty first
+                // Early exit if there are no diffs at all
                 if self.diffs.is_empty() {
                     return vec![0_u16; self.num_genes()];
                 }
-                
+
                 let first_idx = self.num_genes() * cell_ind;
                 let last_idx = first_idx + self.num_genes();
 
+                // Use only the start cursor; avoid stop cursor entirely
                 let start_cur = indices.0.geq_cursor(first_idx as u64);
-                let stop_cur = indices.0.geq_cursor(last_idx as u64);
-
-                let start = if !start_cur.is_valid() {
-                    // No valid starting position found for this cell
-                    return vec![0_u16; self.num_genes()];
-                } else {
-                    start_cur.index()
-                };
-
-                let stop = if !stop_cur.is_valid() {
-                    self.diffs.len()
-                } else {
-                    stop_cur.index()
-                };
-                if start >= last_idx {
-                    warn!("SHOULD NOT HAPPEN!");
-                }
-
-                let n = stop - start;
-                
-                if n == 0 {
+                if !start_cur.is_valid() {
                     return vec![0_u16; self.num_genes()];
                 }
+                if let Some(start_val) = start_cur.value() {
+                    if start_val >= last_idx as u64 {
+                        return vec![0_u16; self.num_genes()];
+                    }
+                }
+                let start = start_cur.index();
 
                 let mut diff_iter = self.diffs.iter_from(start);
                 let mut nz_ind_iter = start_cur.clone();
 
-                // Check if diff_iter is empty
-                if diff_iter.clone().next().is_none() {
-                    // Return all zeros if no differences
-                    return vec![0_u16; self.num_genes()];
-                }
-
                 let mut expression = Vec::with_capacity(self.num_genes());
-                let mut next_diff = diff_iter.next().expect("at least one");
-                let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
+                let mut next_diff_opt = diff_iter.next();
+                let mut next_nz_val_opt = nz_ind_iter.value();
                 for gidx in 0..self.num_genes() {
-                    if gidx < next_nz_ind as usize {
-                        expression.push(0);
-                    } else {
-                        let ddiff = decode_v(next_diff as i32);
-                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
-                        expression.push(decoded_val);
-                        let _more = nz_ind_iter.advance();
-                        next_nz_ind = nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
-                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                    match next_nz_val_opt {
+                        Some(nz_val) if (nz_val - first_idx as u64) as usize == gidx => {
+                            let next_diff = next_diff_opt.unwrap_or(0);
+                            let ddiff = decode_v(next_diff as i32);
+                            let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                            expression.push(decoded_val);
+                            let _ = nz_ind_iter.advance();
+                            next_nz_val_opt = nz_ind_iter.value();
+                            // Stop advancing beyond the cell range
+                            if matches!(next_nz_val_opt, Some(v) if v >= last_idx as u64) {
+                                next_nz_val_opt = None;
+                            }
+                            next_diff_opt = diff_iter.next();
+                        }
+                        Some(nz_val) if (nz_val - first_idx as u64) as usize > gidx => {
+                            expression.push(0);
+                        }
+                        _ => {
+                            expression.push(0);
+                        }
                     }
                 }
                 expression
@@ -251,8 +237,8 @@ impl EncodedDiffs {
         self.diffs.iter_from(start_pos).next().is_none()
     }
 
-    /// Pre-check for Bit variant: does the given cell have any set bits?
-    pub(crate) fn cell_has_any_set_bits_bitv(&self, cell_ind: usize) -> bool {
+    /// Pre-check only for Bit variant: does the given cell have any set bits?
+    pub(crate) fn precheck_cells(&self, cell_ind: usize) -> bool {  
         match &self.indices {
             HybridSparseVec::Bit(indices) => {
                 let first_idx = self.num_genes() * cell_ind;
@@ -263,6 +249,7 @@ impl EncodedDiffs {
                 }
                 false
             }
+            // For EF, skip precheck; expression_vec_ef handles guards safely
             _ => true,
         }
     }
@@ -1010,11 +997,11 @@ impl QuadTree {
         let mut stack = vec![self];
         let mut cost_log = CostLog::new();
         let mut node_counter = 0;
-        let max_depth = 1; 
+        let max_depth = 10; 
          
         while let Some(node) = stack.pop() {
-            //if node.depth >= max_depth {
-              //  continue;
+           // if node.depth >= max_depth {
+            //    continue; // JUMPS BACK TO THE TOP OF THE WHILE LOOP,
             //}
             node_counter += 1;
              
@@ -1102,8 +1089,8 @@ impl QuadTree {
              };
              cost_log.add_step(cost_step);
              */
-
-             if optimal_cost < current_expense  && node.depth > max_depth {
+             info!("optimal_cost: {}, current_expense: {}, node.depth: {}", optimal_cost, current_expense, node.depth);
+            if optimal_cost < current_expense || node.depth < max_depth {
              node.divided = true;
              // Convert BitFieldQuadTree back to QuadTree and assign children
              node.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
@@ -1128,7 +1115,7 @@ impl QuadTree {
              if let Some(ref mut nw) = node.nw {
                  stack.push(nw);
              }
-             } else {
+            } else {
                  node.divided = false;
                  if !node.points.is_empty() {
                      info!(
@@ -1251,35 +1238,8 @@ impl QuadTree {
 
         // Determine optimal cost and decision
         let (optimal_cost, decision) = if children_expense >= parent_expense {
-            // Before collapsing, repopulate this node's points and positions from children
-            let mut merged_points: Vec<Point> = Vec::new();
-            let mut merged_positions: Vec<DatalessPoint> = Vec::new();
-
-            if let Some(nw_box) = self.nw.take() {
-                let mut child = *nw_box;
-                merged_points.append(&mut child.points);
-                merged_positions.append(&mut child.positions);
-            }
-            if let Some(ne_box) = self.ne.take() {
-                let mut child = *ne_box;
-                merged_points.append(&mut child.points);
-                merged_positions.append(&mut child.positions);
-            }
-            if let Some(se_box) = self.se.take() {
-                let mut child = *se_box;
-                merged_points.append(&mut child.points);
-                merged_positions.append(&mut child.positions);
-            }
-            if let Some(sw_box) = self.sw.take() {
-                let mut child = *sw_box;
-                merged_points.append(&mut child.points);
-                merged_positions.append(&mut child.positions);
-            }
-
-            // Assign merged data back to this node
-            self.points = merged_points;
-            self.positions = merged_positions;
-
+            //info!("Collapsing node at depth {}: parent={}, children={}", 
+            //      self.depth, parent_expense, children_expense);
             self.divided = false;
             self.nw = None;
             self.ne = None;

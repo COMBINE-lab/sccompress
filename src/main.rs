@@ -418,7 +418,8 @@ fn tree_from_10X<T: AsRef<Path>>(
     
    // println!("Reading from parquet file: {}", parquet_path.as_ref().display());
     // TODO: read from parquet file need to be a function by itself
-   // let reader = SerializedFileReader::new(coords).unwrap();
+    let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
+    let reader = SerializedFileReader::new(coords).unwrap();
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -427,26 +428,9 @@ fn tree_from_10X<T: AsRef<Path>>(
     coords.reserve(num_cells);
     xs.reserve(num_cells);
     ys.reserve(num_cells);
-    
-    let mut iter = match pos_type {
-        InputPosType::Csv => {
-            let mut rdr = ReaderBuilder::new()
-                .has_headers(false) // TODO: Add option to set to true to skip the header row
-                .flexible(true) // Allow varying number of fields
-                .from_path(parquet_path.as_ref())
-                .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
-            rdr.records().collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?
-        }
-        InputPosType::Parquet => {
-            let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
-            let reader = SerializedFileReader::new(coords).unwrap();
-            reader.get_row_iter(None).unwrap().collect::<Result<Vec<_>, _>>()
-                .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?
-        }
-    };
+
     // Iterate through parquet rows
-    //let mut iter = reader.get_row_iter(None).unwrap();
+    let mut iter = reader.get_row_iter(None).unwrap();
     let mut row_idx = 0;
     
     while let Some(Ok(parquet_row)) = iter.next() {
@@ -518,9 +502,10 @@ fn tree_from_10X<T: AsRef<Path>>(
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
-    /* 
+    
     // Divide the quadtree and get cost log
     let division_cost_log = qtree.divide();
+    /* 
     info!("Division cost log contains {} steps", division_cost_log.steps.len());
     info!("Total nodes processed: {}", division_cost_log.total_nodes);
     info!("Total cost: {}", division_cost_log.total_cost);
