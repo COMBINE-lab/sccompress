@@ -332,7 +332,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut division_cost_file = File::create(&division_cost_log_filename)?;
     bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
     info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-/*
+
     // Optimize the quadtree and get cost log
     let optimization_cost_log = qtree.optimize_quadtree();
     info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
@@ -343,7 +343,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
     bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
     info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    */
+    
     Ok(qtree)
 }
 
@@ -357,7 +357,7 @@ fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> {
 
 fn tree_from_10X<T: AsRef<Path>>(
     h5_path: T,
-    parquet_path: T,
+    pos_path: T,
     pos_type: InputPosType,
     data_type: InputDataType,
     _method: ErrorMetric,
@@ -388,7 +388,6 @@ fn tree_from_10X<T: AsRef<Path>>(
     println!("Feature types: {:?}", &feature_types[..5]);
     println!("Genomes: {:?}", &genomes[..5]);
     
-
     let matrix_group = file.group("matrix")?;
     
     // Read the shape of the matrix
@@ -415,11 +414,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     let indptr: Vec<usize> = indptr_array.to_vec();
     
     println!("Sparse matrix data: {} non-zero elements", data.len());
-    
-   // println!("Reading from parquet file: {}", parquet_path.as_ref().display());
-    // TODO: read from parquet file need to be a function by itself
-    let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
-    let reader = SerializedFileReader::new(coords).unwrap();
+    let pos_file = std::fs::File::open(pos_path.as_ref()).unwrap();
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -429,69 +424,96 @@ fn tree_from_10X<T: AsRef<Path>>(
     xs.reserve(num_cells);
     ys.reserve(num_cells);
 
-    // Iterate through parquet rows
-    let mut iter = reader.get_row_iter(None).unwrap();
-    let mut row_idx = 0;
-    
-    while let Some(Ok(parquet_row)) = iter.next() {
-        // Extract spatial coordinates from parquet
-        let cell_id = parquet_row.get_string(0).unwrap();
-        // Check to make sure cell_id matches barcode otherwise return error
-        let barcode = barcodes_dataset.read_1d::<FixedAscii<23>>().unwrap()[row_idx]
-            .as_str()
-            .trim_end_matches('\0')
-            .to_string();
-        if *cell_id != barcode {
-            return Err(anyhow::anyhow!(
-                "Check input files. 
-                Cell ID mismatch at row {}: parquet cell_id '{}' does not match HDF5 barcode '{}'",
-                row_idx, cell_id, barcode
-            ));
+    // Read all barcodes from HDF5 once
+    let barcodes_arr = barcodes_dataset.read_1d::<FixedAscii<23>>()?;
+    let barcodes: Vec<String> = barcodes_arr
+        .iter()
+        .map(|b| b.as_str().trim_end_matches('\0').to_string())
+        .collect();
+
+    // Build a map from barcode -> (x, y) from the positions file
+    use std::collections::HashMap;
+    let mut pos_map: HashMap<String, (f64, f64)> = HashMap::with_capacity(num_cells);
+
+    match pos_type {
+        InputPosType::Csv => {
+            // Visium tissue_positions_list.csv has no header and columns:
+            // [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(pos_file);
+            for rec in rdr.records() {
+                let rec = rec?;
+                if rec.len() < 6 { continue; }
+                let bc = rec.get(0).unwrap().to_string();
+                let x_str = rec.get(4).unwrap();
+                let y_str = rec.get(5).unwrap();
+                let x: f64 = x_str.parse()?;
+                let y: f64 = y_str.parse()?;
+                pos_map.insert(bc, (x, y));
+            }
         }
-        let x_coord = parquet_row.get_double(1).unwrap(); // Get x coordinate as f64
-        let y_coord = parquet_row.get_double(2).unwrap(); // Get y coordinate as f64
-        
+        InputPosType::Parquet => {
+            let reader = SerializedFileReader::new(pos_file).unwrap();
+            let mut iter = reader.get_row_iter(None).unwrap();
+            while let Some(Ok(parquet_row)) = iter.next() {
+                let bc = parquet_row.get_string(0).unwrap().to_string();
+                let x = parquet_row.get_double(1).unwrap();
+                let y = parquet_row.get_double(2).unwrap();
+                pos_map.insert(bc, (x, y));
+            }
+        }
+    }
+
+    // Walk HDF5 barcodes in order and look up positions by barcode
+    for row_idx in 0..num_cells {
+        let barcode = &barcodes[row_idx];
+        let (x_coord, y_coord) = pos_map
+            .get(barcode)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!(
+                "Missing position for HDF5 barcode '{}' at row {} in positions file",
+                barcode, row_idx
+            ))?;
+
         xs.push(x_coord);
         ys.push(y_coord);
-        
+
         // Extract gene expression data for this cell from the sparse matrix
         let start_idx = indptr[row_idx];
         let end_idx = indptr[row_idx + 1];
-        
-        // Create sparse representation - only store non-zero values!
+
+        // Create sparse representation - only store non-zero values
         let mut gene_indices = Vec::new();
         let mut expression_values = Vec::new();
-        
         for i in start_idx..end_idx {
             let gene_idx = indices[i];
             let expression_value = data[i];
-            if expression_value > 0 {  // Only store non-zero values
+            if expression_value > 0 {
                 gene_indices.push(gene_idx);
                 expression_values.push(expression_value);
             }
         }
-        
-        // Create sparse gene data
+
         let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
-        
-        // Log memory usage for first few cells
         if row_idx < 5 {
             let dense_memory = num_features * std::mem::size_of::<u16>();
             let sparse_memory = sparse_data.memory_usage();
-            println!("Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%", 
-                    row_idx, dense_memory, sparse_memory, 
-                    (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0);
+            println!(
+                "Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%",
+                row_idx,
+                dense_memory,
+                sparse_memory,
+                (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0
+            );
         }
-        
-        // Create Point with sparse data using Arc for shared ownership
+
         let dense_data = sparse_data.to_dense();
         let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
         coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
-        
-        row_idx += 1;
     }
     
-    println!("num_rows: {}", row_idx);
+    println!("num_rows: {}", num_cells);
 
     let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0; // |a, &b| pattern matching, does not need clone() 
     let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
