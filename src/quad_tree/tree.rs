@@ -1010,7 +1010,7 @@ impl QuadTree {
         let mut stack = vec![self];
         let mut cost_log = CostLog::new();
         let mut node_counter = 0;
-        //let max_depth = 10; 
+        let max_depth = 1; 
          
         while let Some(node) = stack.pop() {
             //if node.depth >= max_depth {
@@ -1082,12 +1082,6 @@ impl QuadTree {
                  total_children_expense
              };
              
-             let decision = if current_expense < total_children_expense {
-                 "merge".to_string()
-             } else {
-                 "divide".to_string()
-             };
-
              // Create node identifier
              let node_id = if node.depth == 0 {
                  "root".to_string()
@@ -1096,6 +1090,7 @@ impl QuadTree {
              };
 
              // Add cost step to log
+             /* 
              let cost_step = CostStep {
                  depth: node.depth,
                  points_count: node.points.len(),
@@ -1106,8 +1101,9 @@ impl QuadTree {
                  node_id,
              };
              cost_log.add_step(cost_step);
+             */
 
-             //if total_expense < current_expense {
+             if optimal_cost < current_expense  && node.depth > max_depth {
              node.divided = true;
              // Convert BitFieldQuadTree back to QuadTree and assign children
              node.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
@@ -1132,7 +1128,7 @@ impl QuadTree {
              if let Some(ref mut nw) = node.nw {
                  stack.push(nw);
              }
-             /* } else {
+             } else {
                  node.divided = false;
                  if !node.points.is_empty() {
                      info!(
@@ -1143,7 +1139,7 @@ impl QuadTree {
                      node.positions = positions; // Use the stored positions
                                                  // Keep the points for bit field representation
                  }
-             }*/
+             }
          }
          
          // Update totals

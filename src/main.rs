@@ -1,7 +1,7 @@
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 pub mod quad_tree;
 pub mod bits;
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use csv::ReaderBuilder;
 use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
 use std::error::Error;
@@ -358,6 +358,8 @@ fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> {
 fn tree_from_10X<T: AsRef<Path>>(
     h5_path: T,
     parquet_path: T,
+    pos_type: InputPosType,
+    data_type: InputDataType,
     _method: ErrorMetric,
     _lossless: bool,
 ) -> anyhow::Result<QuadTree> {
@@ -398,6 +400,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     
     println!("Matrix shape: {} cells x {} features", num_cells, num_features);
     
+    //TODO: read from h5ad file need to be a function by itself
     // Read the sparse matrix components
     let data_dataset = matrix_group.dataset("data")?;
     let indices_dataset = matrix_group.dataset("indices")?;
@@ -413,10 +416,9 @@ fn tree_from_10X<T: AsRef<Path>>(
     
     println!("Sparse matrix data: {} non-zero elements", data.len());
     
-    println!("Reading from parquet file: {}", parquet_path.as_ref().display());
-    
-    let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
-    let reader = SerializedFileReader::new(coords).unwrap();
+   // println!("Reading from parquet file: {}", parquet_path.as_ref().display());
+    // TODO: read from parquet file need to be a function by itself
+   // let reader = SerializedFileReader::new(coords).unwrap();
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -426,8 +428,25 @@ fn tree_from_10X<T: AsRef<Path>>(
     xs.reserve(num_cells);
     ys.reserve(num_cells);
     
+    let mut iter = match pos_type {
+        InputPosType::Csv => {
+            let mut rdr = ReaderBuilder::new()
+                .has_headers(false) // TODO: Add option to set to true to skip the header row
+                .flexible(true) // Allow varying number of fields
+                .from_path(parquet_path.as_ref())
+                .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
+            rdr.records().collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?
+        }
+        InputPosType::Parquet => {
+            let coords = std::fs::File::open(parquet_path.as_ref()).unwrap();
+            let reader = SerializedFileReader::new(coords).unwrap();
+            reader.get_row_iter(None).unwrap().collect::<Result<Vec<_>, _>>()
+                .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?
+        }
+    };
     // Iterate through parquet rows
-    let mut iter = reader.get_row_iter(None).unwrap();
+    //let mut iter = reader.get_row_iter(None).unwrap();
     let mut row_idx = 0;
     
     while let Some(Ok(parquet_row)) = iter.next() {
@@ -499,7 +518,7 @@ fn tree_from_10X<T: AsRef<Path>>(
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
-    
+    /* 
     // Divide the quadtree and get cost log
     let division_cost_log = qtree.divide();
     info!("Division cost log contains {} steps", division_cost_log.steps.len());
@@ -525,7 +544,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
     bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
     info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    
+    */
     Ok(qtree)
 }
 
@@ -543,6 +562,20 @@ enum Commands {
     Build(BuildCommand),
     #[command(arg_required_else_help = true)]
     Dump(DumpCommand),
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum InputPosType {
+    Csv,
+    Parquet,
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum InputDataType {
+    Csr,
+    Csc,
+    H5ad,
+    Mtx,
 }
 
 /// Build a quadtree representation of spatial transcriptomics data
@@ -570,9 +603,9 @@ struct BuildCommand {
     /// Output file (default "output.bin.gz")
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
-    /// Input file format (csv or hdf5)
-    #[arg(short = 'f', long, default_value = "csv")]
-    format: String,
+    /// Input file format (csv or csr, csc, h5ad, mtx)
+    #[arg(short = 'f', long, value_enum, default_value_t = InputDataType::Csr)]
+    format: InputDataType,
     /// Index of x coordinate, default 6
     #[arg(short = 'x', long, default_value_t = 6)]
     idx_x: usize,
@@ -585,6 +618,9 @@ struct BuildCommand {
     /// Index of gene end, default all remaining columns
     #[arg(short = 'e', long)]
     idx_gene_end: Option<usize>,
+    /// Input position file format (csv or parquet)
+    #[arg(long, value_enum, default_value_t = InputPosType::Parquet)]
+    pos_format: InputPosType,
 }
 
 struct Data {
@@ -648,9 +684,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli_args.command {
         Commands::Build(args) => {
-
-            let qtree = match args.format.as_str() {
-                "csv" => {
+//TODO: combine csv and 10x format function into one
+            let qtree = /* match args.format {
+                InputDataType::Csv => {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {
                     //    anyhow::anyhow!("Position file required for CSV format")
                     //})?;
@@ -665,19 +701,28 @@ fn main() -> Result<(), Box<dyn Error>> {
                         true,
                     )?
                 }
-                 "10x" => {
+                InputDataType::Csr => */{
                  let file_path_pos = args.input_pos.ok_or_else(|| {
                    anyhow::anyhow!("Position file required for HDF5 format")
                 })?;
                 tree_from_10X(
-                  &args.input,
+                &args.input,
                 &file_path_pos,
+                match args.pos_format {
+                    InputPosType::Csv => InputPosType::Csv,
+                    InputPosType::Parquet => InputPosType::Parquet,
+                },
+                match args.format {
+                    InputDataType::Csr => InputDataType::Csr,
+                    InputDataType::Csc => InputDataType::Csc,
+                    InputDataType::H5ad => InputDataType::H5ad,
+                    InputDataType::Mtx => InputDataType::Mtx,
+                },
                 ErrorMetric::Mean,
                 true,
                 )?
-                }
-                _ => return Err(anyhow::anyhow!("Unsupported format: {}", args.format).into()),
             };
+            //};
 
             // You can decide whether to serialize the original tree or the bit fields or both
             let config = bincode::config::standard()
