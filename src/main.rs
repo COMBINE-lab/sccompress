@@ -19,6 +19,10 @@ use hdf5::types::FixedAscii;
 use ndarray::{Array1, ArrayD};
 use flate2::Compression;
 use flate2::write::GzEncoder;
+use flate2::read::GzDecoder;
+use std::io::{BufRead, BufReader};
+use sprs::{CsMat, io::read_matrix_market};
+use tempfile::NamedTempFile;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 // removed unused bincode::{Encode, Decode} import
@@ -359,7 +363,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     h5_path: T,
     pos_path: T,
     pos_type: InputPosType,
-    data_type: InputDataType,
+    file_type: InputDataType,
     _method: ErrorMetric,
     _lossless: bool,
 ) -> anyhow::Result<QuadTree> {
@@ -387,8 +391,11 @@ fn tree_from_10X<T: AsRef<Path>>(
     println!("Gene IDs: {:?}", &gene_ids[..5]);
     println!("Feature types: {:?}", &feature_types[..5]);
     println!("Genomes: {:?}", &genomes[..5]);
-    
-    let matrix_group = file.group("matrix")?;
+    // Check if matrix group exists
+    let matrix_group = match file.group("matrix") {
+        Ok(g) => g,
+        Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
+    };
     
     // Read the shape of the matrix
     let shape_dataset = matrix_group.dataset("shape")?;
@@ -555,6 +562,150 @@ fn tree_from_10X<T: AsRef<Path>>(
     Ok(qtree)
 }
 
+fn open_text_or_gz<P: AsRef<Path>>(path: P) -> anyhow::Result<Box<dyn BufRead>> {
+    let p = path.as_ref();
+    let f = File::open(p)?;
+    if p.extension().map(|e| e == "gz").unwrap_or(false) {
+        let dec = GzDecoder::new(f);
+        Ok(Box::new(BufReader::new(dec)))
+    } else {
+        Ok(Box::new(BufReader::new(f)))
+    }
+}
+
+fn tree_from_mtx<T: AsRef<Path>>(
+    mtx_dir_or_file: T,
+    pos_path: T,
+    pos_type: InputPosType,
+    _method: ErrorMetric,
+    _lossless: bool,
+) -> anyhow::Result<QuadTree> {
+    let input_path = mtx_dir_or_file.as_ref();
+
+    // Resolve paths
+    let (mtx_path, barcodes_path, features_path) = if input_path.is_dir() {
+        let dir = input_path;
+        let mtx = ["matrix.mtx.gz", "matrix.mtx"]; // try gz first
+        let bc = ["barcodes.tsv.gz", "barcodes.tsv"];
+        let ft = ["features.tsv.gz", "features.tsv", "genes.tsv.gz", "genes.tsv"]; // some datasets use genes.tsv
+        let pick = |candidates: &[&str]| -> anyhow::Result<PathBuf> {
+            for name in candidates {
+                let p = dir.join(name);
+                if p.exists() { return Ok(p); }
+            }
+            Err(anyhow::anyhow!("Missing expected file in {:?}: {:?}", dir, candidates))
+        };
+        (pick(&mtx)?, pick(&bc)?, pick(&ft)?)
+    } else {
+        // File provided; infer siblings
+        let mtx = input_path.to_path_buf();
+        let dir = input_path.parent().unwrap_or_else(|| Path::new("."));
+        let bc = ["barcodes.tsv.gz", "barcodes.tsv"];
+        let ft = ["features.tsv.gz", "features.tsv", "genes.tsv.gz", "genes.tsv"]; 
+        let pick = |candidates: &[&str]| -> anyhow::Result<PathBuf> {
+            for name in candidates {
+                let p = dir.join(name);
+                if p.exists() { return Ok(p); }
+            }
+            Err(anyhow::anyhow!("Missing expected file in {:?}: {:?}", dir, candidates))
+        };
+        (mtx, pick(&bc)?, pick(&ft)?)
+    };
+
+    // Read barcodes
+    let mut barcodes: Vec<String> = Vec::new();
+    {
+        let reader = open_text_or_gz(&barcodes_path)?;
+        for line in reader.lines() {
+            let s = line?;
+            if !s.is_empty() { barcodes.push(s); }
+        }
+    }
+    let num_cells = barcodes.len();
+
+    // Read Matrix Market via path; if gz, decompress to a temp file first
+    let mut _tmp_holder: Option<NamedTempFile> = None;
+    let mtx_plain_path: PathBuf = if mtx_path.extension().map(|e| e == "gz").unwrap_or(false) {
+        let src = File::open(&mtx_path)?;
+        let mut dec = GzDecoder::new(src);
+        let mut tmp = NamedTempFile::new()?;
+        std::io::copy(&mut dec, &mut tmp)?;
+        let path = tmp.path().to_path_buf();
+        _tmp_holder = Some(tmp); // keep alive during parsing
+        path
+    } else {
+        mtx_path.clone()
+    };
+    let trimat = read_matrix_market::<i32, usize, _>(&mtx_plain_path)?; // values i32, indices usize
+    let csr: CsMat<i32> = trimat.to_csr();
+    let num_features = csr.cols();
+
+    // Build positions map from CSV/Parquet
+    let pos_file = std::fs::File::open(pos_path.as_ref())?;
+    use std::collections::HashMap;
+    let mut pos_map: HashMap<String, (f64, f64)> = HashMap::with_capacity(num_cells);
+    match pos_type {
+        InputPosType::Csv => {
+            // Visium tissue_positions_list.csv: [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
+            let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_reader(pos_file);
+            for rec in rdr.records() {
+                let rec = rec?;
+                if rec.len() < 6 { continue; }
+                let bc = rec.get(0).unwrap().to_string();
+                let x: f64 = rec.get(4).unwrap().parse()?;
+                let y: f64 = rec.get(5).unwrap().parse()?;
+                pos_map.insert(bc, (x, y));
+            }
+        }
+        InputPosType::Parquet => {
+            let reader = SerializedFileReader::new(pos_file).unwrap();
+            let mut iter = reader.get_row_iter(None).unwrap();
+            while let Some(Ok(parquet_row)) = iter.next() {
+                let bc = parquet_row.get_string(0).unwrap().to_string();
+                let x = parquet_row.get_double(1).unwrap();
+                let y = parquet_row.get_double(2).unwrap();
+                pos_map.insert(bc, (x, y));
+            }
+        }
+    }
+
+    // Build coords in barcode order
+    let mut coords = Vec::with_capacity(num_cells);
+    let mut xs = Vec::with_capacity(num_cells);
+    let mut ys = Vec::with_capacity(num_cells);
+
+    for (row_idx, bc) in barcodes.iter().enumerate() {
+        let (x_coord, y_coord) = pos_map
+            .get(bc)
+            .copied()
+            .ok_or_else(|| anyhow::anyhow!("Missing position for barcode '{}' at row {}", bc, row_idx))?;
+        xs.push(x_coord);
+        ys.push(y_coord);
+
+        // Sparse row -> dense u16 vector
+        let mut dense: Vec<u16> = vec![0u16; num_features];
+        for (col, val) in csr.outer_view(row_idx).unwrap().iter() {
+            let v = (*val).max(0) as u32;
+            dense[col] = u16::try_from(v.min(u16::MAX as u32)).unwrap_or(u16::MAX);
+        }
+        let array_data = ArrayData::new(Array1::from_vec(dense).into_dyn());
+        coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
+    }
+
+    // Build domain
+    let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
+    let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
+    let maxx = xs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
+    let maxy = ys.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
+    let w = maxx - minx;
+    let h = maxy - miny;
+
+    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
+    let mut qtree = QuadTree::new(domain, coords, 0);
+    let _division_cost_log = qtree.divide();
+    Ok(qtree)
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -583,6 +734,12 @@ enum InputDataType {
     Csc,
     H5ad,
     Mtx,
+    v2,
+}
+
+enum InputFileType {
+    v2,
+    HD,
 }
 
 /// Build a quadtree representation of spatial transcriptomics data
@@ -626,7 +783,7 @@ struct BuildCommand {
     #[arg(short = 'e', long)]
     idx_gene_end: Option<usize>,
     /// Input position file format (csv or parquet)
-    #[arg(long, value_enum, default_value_t = InputPosType::Parquet)]
+    #[arg(long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
 }
 
@@ -691,46 +848,33 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli_args.command {
         Commands::Build(args) => {
-//TODO: combine csv and 10x format function into one
-            let qtree = /* match args.format {
-                InputDataType::Csv => {
-                    // let file_path_pos = args.input_pos.ok_or_else(|| {
-                    //    anyhow::anyhow!("Position file required for CSV format")
-                    //})?;
-                    tree_from_csv(
+            let qtree = match args.format {
+                InputDataType::Mtx => {
+                    let file_path_pos = args.input_pos.ok_or_else(|| {
+                        anyhow::anyhow!("Position file required for MTX format")
+                    })?;
+                    tree_from_mtx(
                         &args.input,
-                        //file_path_pos,
-                        args.idx_x,          // idx_x
-                        args.idx_y,          // idx_y
-                        args.idx_gene_start, // idx_gene_start
-                        args.idx_gene_end,   // idx_gene_end (will use all remaining columns)
+                        &file_path_pos,
+                        args.pos_format,
                         ErrorMetric::Mean,
                         true,
                     )?
                 }
-                InputDataType::Csr => */{
-                 let file_path_pos = args.input_pos.ok_or_else(|| {
-                   anyhow::anyhow!("Position file required for HDF5 format")
-                })?;
-                tree_from_10X(
-                &args.input,
-                &file_path_pos,
-                match args.pos_format {
-                    InputPosType::Csv => InputPosType::Csv,
-                    InputPosType::Parquet => InputPosType::Parquet,
-                },
-                match args.format {
-                    InputDataType::Csr => InputDataType::Csr,
-                    InputDataType::Csc => InputDataType::Csc,
-                    InputDataType::H5ad => InputDataType::H5ad,
-                    InputDataType::Mtx => InputDataType::Mtx,
-                },
-                ErrorMetric::Mean,
-                true,
-                )?
+                _ => {
+                    let file_path_pos = args.input_pos.ok_or_else(|| {
+                        anyhow::anyhow!("Position file required for HDF5 format")
+                    })?;
+                    tree_from_10X(
+                        &args.input,
+                        &file_path_pos,
+                        args.pos_format,
+                        args.format,
+                        ErrorMetric::Mean,
+                        true,
+                    )?
+                }
             };
-            //};
-
             // You can decide whether to serialize the original tree or the bit fields or both
             let config = bincode::config::standard()
                 .with_little_endian()

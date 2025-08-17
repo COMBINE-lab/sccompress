@@ -1089,7 +1089,7 @@ impl QuadTree {
              */
             // if optimal_cost < current_expense || node.points.len() > max_pt {
             //if optimal_cost < current_expense || node.depth < max_depth {
-           if optimal_cost < current_expense {
+             if optimal_cost < current_expense {
              node.divided = true;
              // Convert BitFieldQuadTree back to QuadTree and assign children
              node.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
