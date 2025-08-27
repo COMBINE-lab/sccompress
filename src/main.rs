@@ -19,12 +19,12 @@ use hdf5::types::FixedAscii;
 use ndarray::{Array1, ArrayD};
 use flate2::Compression;
 use flate2::write::GzEncoder;
-use flate2::read::GzDecoder;
-use std::io::{BufRead, BufReader};
-use sprs::{CsMat, io::read_matrix_market};
-use tempfile::NamedTempFile;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
+use sprs::CsMat;
+use std::io::BufWriter;
+use std::thread;
+use std::time::Duration;
 // removed unused bincode::{Encode, Decode} import
 
 // Simple ArrayData type to replace anndata::ArrayData
@@ -234,7 +234,6 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
-    let mut data_store = std::collections::HashMap::new();
     //let mut mind = Vec::new();
     //let mut maxd = Vec::new();
 
@@ -288,26 +287,8 @@ fn tree_from_csv<T: AsRef<Path>>(
             }
             */
         }
-        // Store data in data_store and use cell_id
-        let cell_id = coords.len() as u32;
-        let array_data = ArrayData::new(Array1::from_vec(cells).into_dyn());
-        data_store.insert(cell_id, array_data);
-        // Pass the data directly to Point
-        // Convert ArrayData to SparseGeneData for compatibility
-        let array_data = &data_store[&cell_id];
-        let dense_data = extract_numeric_data(array_data);
-        let mut gene_indices = Vec::new();
-        let mut expression_values = Vec::new();
-        
-        for (idx, &value) in dense_data.iter().enumerate() {
-            if value > 0 {
-                gene_indices.push(idx);
-                expression_values.push(value);
-            }
-        }
-        
-        let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
-        coords.push(Point::new(x, y, Arc::new(array_data)));
+                 let array_data = ArrayData::new(Array1::from_vec(cells).into_dyn());
+         coords.push(Point::new(x, y, Arc::new(array_data)));
     }
 
     let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
@@ -323,21 +304,21 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut qtree = QuadTree::new(domain, coords, 0);
     
     // Divide the quadtree and get cost log
-    let division_cost_log = qtree.divide();
-    info!("Division cost log contains {} steps", division_cost_log.steps.len());
-    info!("Total nodes processed: {}", division_cost_log.total_nodes);
-    info!("Total cost: {}", division_cost_log.total_cost);
+    let division_cost_log = qtree.divide_recursive();
+    //info!("Division cost log contains {} steps", division_cost_log.steps.len());
+    //info!("Total nodes processed: {}", division_cost_log.total_nodes);
+    //info!("Total cost: {}", division_cost_log.total_cost);
 
     // Serialize division cost log to file
-    let division_cost_log_filename = PathBuf::from("division_costs.bin");
-    let cost_config = bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding();
-    let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
+//    let division_cost_log_filename = PathBuf::from("division_costs.bin");
+//    let cost_config = bincode::config::standard()
+//        .with_little_endian()
+//        .with_fixed_int_encoding();
+//    let mut division_cost_file = File::create(&division_cost_log_filename)?;
+//    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
+//    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
 
-    // Optimize the quadtree and get cost log
+ /*   // Optimize the quadtree and get cost log
     let optimization_cost_log = qtree.optimize_quadtree();
     info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
     info!("Optimization total cost: {}", optimization_cost_log.total_cost);
@@ -347,7 +328,7 @@ fn tree_from_csv<T: AsRef<Path>>(
     let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
     bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
     info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    
+    */ 
     Ok(qtree)
 }
 
@@ -364,6 +345,8 @@ fn tree_from_10X<T: AsRef<Path>>(
     pos_path: T,
     pos_type: InputPosType,
     file_type: InputDataType,
+    pos_x_col: usize,
+    pos_y_col: usize,
     _method: ErrorMetric,
     _lossless: bool,
 ) -> anyhow::Result<QuadTree> {
@@ -414,13 +397,16 @@ fn tree_from_10X<T: AsRef<Path>>(
     let barcodes_dataset = matrix_group.dataset("barcodes")?;
     
     let data_array = data_dataset.read_1d::<u16>()?;
-    let data: Vec<u16> = data_array.to_vec();
+    let data_u16: Vec<u16> = data_array.to_vec();
+    let data_i32: Vec<i32> = data_u16.iter().map(|&v| v as i32).collect();
     let indices_array = indices_dataset.read_1d::<usize>()?;
     let indices: Vec<usize> = indices_array.to_vec();
     let indptr_array = indptr_dataset.read_1d::<usize>()?;
     let indptr: Vec<usize> = indptr_array.to_vec();
     
-    println!("Sparse matrix data: {} non-zero elements", data.len());
+    println!("Sparse matrix data: {} non-zero elements", data_u16.len());
+    // Build CSR matrix for convenient row iteration
+    let csr: CsMat<i32> = CsMat::new((num_cells, num_features), indptr.clone(), indices.clone(), data_i32);
     let pos_file = std::fs::File::open(pos_path.as_ref()).unwrap();
     let mut coords = Vec::new();
     let mut xs = Vec::new();
@@ -446,17 +432,13 @@ fn tree_from_10X<T: AsRef<Path>>(
         InputPosType::Csv => {
             // Visium tissue_positions_list.csv has no header and columns:
             // [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(false)
-                .from_reader(pos_file);
+            let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(pos_file);
             for rec in rdr.records() {
                 let rec = rec?;
-                if rec.len() < 6 { continue; }
+                if rec.len() <= pos_y_col { continue; }
                 let bc = rec.get(0).unwrap().to_string();
-                let x_str = rec.get(4).unwrap();
-                let y_str = rec.get(5).unwrap();
-                let x: f64 = x_str.parse()?;
-                let y: f64 = y_str.parse()?;
+                let x = rec.get(pos_x_col).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                let y = rec.get(pos_y_col).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
                 pos_map.insert(bc, (x, y));
             }
         }
@@ -465,8 +447,8 @@ fn tree_from_10X<T: AsRef<Path>>(
             let mut iter = reader.get_row_iter(None).unwrap();
             while let Some(Ok(parquet_row)) = iter.next() {
                 let bc = parquet_row.get_string(0).unwrap().to_string();
-                let x = parquet_row.get_double(1).unwrap();
-                let y = parquet_row.get_double(2).unwrap();
+                let x = parquet_row.get_double(pos_x_col).unwrap();
+                let y = parquet_row.get_double(pos_y_col).unwrap();
                 pos_map.insert(bc, (x, y));
             }
         }
@@ -486,37 +468,15 @@ fn tree_from_10X<T: AsRef<Path>>(
         xs.push(x_coord);
         ys.push(y_coord);
 
-        // Extract gene expression data for this cell from the sparse matrix
-        let start_idx = indptr[row_idx];
-        let end_idx = indptr[row_idx + 1];
-
-        // Create sparse representation - only store non-zero values
-        let mut gene_indices = Vec::new();
-        let mut expression_values = Vec::new();
-        for i in start_idx..end_idx {
-            let gene_idx = indices[i];
-            let expression_value = data[i];
-            if expression_value > 0 {
-                gene_indices.push(gene_idx);
-                expression_values.push(expression_value);
+        // Build dense vector from CSR row
+        let mut dense: Vec<u16> = vec![0u16; num_features];
+        if let Some(row) = csr.outer_view(row_idx) {
+            for (col, val) in row.iter() {
+                let v = (*val).max(0) as u32;
+                dense[col] = u16::try_from(v.min(u16::MAX as u32)).unwrap_or(u16::MAX);
             }
         }
-
-        let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
-        if row_idx < 5 {
-            let dense_memory = num_features * std::mem::size_of::<u16>();
-            let sparse_memory = sparse_data.memory_usage();
-            println!(
-                "Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%",
-                row_idx,
-                dense_memory,
-                sparse_memory,
-                (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0
-            );
-        }
-
-        let dense_data = sparse_data.to_dense();
-        let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
+        let array_data = ArrayData::new(Array1::from_vec(dense).into_dyn());
         coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
     }
     
@@ -533,7 +493,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     let mut qtree = QuadTree::new(domain, coords, 0);
     
     // Divide the quadtree and get cost log
-    let division_cost_log = qtree.divide();
+    let division_cost_log = qtree.divide_recursive();
     /* 
     info!("Division cost log contains {} steps", division_cost_log.steps.len());
     info!("Total nodes processed: {}", division_cost_log.total_nodes);
@@ -562,150 +522,6 @@ fn tree_from_10X<T: AsRef<Path>>(
     Ok(qtree)
 }
 
-fn open_text_or_gz<P: AsRef<Path>>(path: P) -> anyhow::Result<Box<dyn BufRead>> {
-    let p = path.as_ref();
-    let f = File::open(p)?;
-    if p.extension().map(|e| e == "gz").unwrap_or(false) {
-        let dec = GzDecoder::new(f);
-        Ok(Box::new(BufReader::new(dec)))
-    } else {
-        Ok(Box::new(BufReader::new(f)))
-    }
-}
-
-fn tree_from_mtx<T: AsRef<Path>>(
-    mtx_dir_or_file: T,
-    pos_path: T,
-    pos_type: InputPosType,
-    _method: ErrorMetric,
-    _lossless: bool,
-) -> anyhow::Result<QuadTree> {
-    let input_path = mtx_dir_or_file.as_ref();
-
-    // Resolve paths
-    let (mtx_path, barcodes_path, features_path) = if input_path.is_dir() {
-        let dir = input_path;
-        let mtx = ["matrix.mtx.gz", "matrix.mtx"]; // try gz first
-        let bc = ["barcodes.tsv.gz", "barcodes.tsv"];
-        let ft = ["features.tsv.gz", "features.tsv", "genes.tsv.gz", "genes.tsv"]; // some datasets use genes.tsv
-        let pick = |candidates: &[&str]| -> anyhow::Result<PathBuf> {
-            for name in candidates {
-                let p = dir.join(name);
-                if p.exists() { return Ok(p); }
-            }
-            Err(anyhow::anyhow!("Missing expected file in {:?}: {:?}", dir, candidates))
-        };
-        (pick(&mtx)?, pick(&bc)?, pick(&ft)?)
-    } else {
-        // File provided; infer siblings
-        let mtx = input_path.to_path_buf();
-        let dir = input_path.parent().unwrap_or_else(|| Path::new("."));
-        let bc = ["barcodes.tsv.gz", "barcodes.tsv"];
-        let ft = ["features.tsv.gz", "features.tsv", "genes.tsv.gz", "genes.tsv"]; 
-        let pick = |candidates: &[&str]| -> anyhow::Result<PathBuf> {
-            for name in candidates {
-                let p = dir.join(name);
-                if p.exists() { return Ok(p); }
-            }
-            Err(anyhow::anyhow!("Missing expected file in {:?}: {:?}", dir, candidates))
-        };
-        (mtx, pick(&bc)?, pick(&ft)?)
-    };
-
-    // Read barcodes
-    let mut barcodes: Vec<String> = Vec::new();
-    {
-        let reader = open_text_or_gz(&barcodes_path)?;
-        for line in reader.lines() {
-            let s = line?;
-            if !s.is_empty() { barcodes.push(s); }
-        }
-    }
-    let num_cells = barcodes.len();
-
-    // Read Matrix Market via path; if gz, decompress to a temp file first
-    let mut _tmp_holder: Option<NamedTempFile> = None;
-    let mtx_plain_path: PathBuf = if mtx_path.extension().map(|e| e == "gz").unwrap_or(false) {
-        let src = File::open(&mtx_path)?;
-        let mut dec = GzDecoder::new(src);
-        let mut tmp = NamedTempFile::new()?;
-        std::io::copy(&mut dec, &mut tmp)?;
-        let path = tmp.path().to_path_buf();
-        _tmp_holder = Some(tmp); // keep alive during parsing
-        path
-    } else {
-        mtx_path.clone()
-    };
-    let trimat = read_matrix_market::<i32, usize, _>(&mtx_plain_path)?; // values i32, indices usize
-    let csr: CsMat<i32> = trimat.to_csr();
-    let num_features = csr.cols();
-
-    // Build positions map from CSV/Parquet
-    let pos_file = std::fs::File::open(pos_path.as_ref())?;
-    use std::collections::HashMap;
-    let mut pos_map: HashMap<String, (f64, f64)> = HashMap::with_capacity(num_cells);
-    match pos_type {
-        InputPosType::Csv => {
-            // Visium tissue_positions_list.csv: [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
-            let mut rdr = csv::ReaderBuilder::new().has_headers(false).from_reader(pos_file);
-            for rec in rdr.records() {
-                let rec = rec?;
-                if rec.len() < 6 { continue; }
-                let bc = rec.get(0).unwrap().to_string();
-                let x: f64 = rec.get(4).unwrap().parse()?;
-                let y: f64 = rec.get(5).unwrap().parse()?;
-                pos_map.insert(bc, (x, y));
-            }
-        }
-        InputPosType::Parquet => {
-            let reader = SerializedFileReader::new(pos_file).unwrap();
-            let mut iter = reader.get_row_iter(None).unwrap();
-            while let Some(Ok(parquet_row)) = iter.next() {
-                let bc = parquet_row.get_string(0).unwrap().to_string();
-                let x = parquet_row.get_double(1).unwrap();
-                let y = parquet_row.get_double(2).unwrap();
-                pos_map.insert(bc, (x, y));
-            }
-        }
-    }
-
-    // Build coords in barcode order
-    let mut coords = Vec::with_capacity(num_cells);
-    let mut xs = Vec::with_capacity(num_cells);
-    let mut ys = Vec::with_capacity(num_cells);
-
-    for (row_idx, bc) in barcodes.iter().enumerate() {
-        let (x_coord, y_coord) = pos_map
-            .get(bc)
-            .copied()
-            .ok_or_else(|| anyhow::anyhow!("Missing position for barcode '{}' at row {}", bc, row_idx))?;
-        xs.push(x_coord);
-        ys.push(y_coord);
-
-        // Sparse row -> dense u16 vector
-        let mut dense: Vec<u16> = vec![0u16; num_features];
-        for (col, val) in csr.outer_view(row_idx).unwrap().iter() {
-            let v = (*val).max(0) as u32;
-            dense[col] = u16::try_from(v.min(u16::MAX as u32)).unwrap_or(u16::MAX);
-        }
-        let array_data = ArrayData::new(Array1::from_vec(dense).into_dyn());
-        coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
-    }
-
-    // Build domain
-    let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
-    let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
-    let maxx = xs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
-    let maxy = ys.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
-    let w = maxx - minx;
-    let h = maxy - miny;
-
-    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0);
-    let _division_cost_log = qtree.divide();
-    Ok(qtree)
-}
-
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -731,11 +547,14 @@ enum InputPosType {
 #[derive(Debug, Clone, ValueEnum)]
 enum InputDataType {
     Csr,
-    Csc,
+    Csv,
     H5ad,
     Mtx,
     v2,
 }
+
+#[derive(Debug, Clone, ValueEnum)]
+enum Platform { Visium, Xenium }
 
 enum InputFileType {
     v2,
@@ -770,6 +589,12 @@ struct BuildCommand {
     /// Input file format (csv or csr, csc, h5ad, mtx)
     #[arg(short = 'f', long, value_enum, default_value_t = InputDataType::Csr)]
     format: InputDataType,
+    /// Positions file x column index (0-based)
+    #[arg(long = "pos-x-col")]
+    pos_x_col: Option<usize>,
+    /// Positions file y column index (0-based)
+    #[arg(long = "pos-y-col")]
+    pos_y_col: Option<usize>,
     /// Index of x coordinate, default 6
     #[arg(short = 'x', long, default_value_t = 6)]
     idx_x: usize,
@@ -785,6 +610,8 @@ struct BuildCommand {
     /// Input position file format (csv or parquet)
     #[arg(long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
+    #[arg(long, value_enum)]
+    platform: Option<Platform>,
 }
 
 struct Data {
@@ -848,40 +675,62 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli_args.command {
         Commands::Build(args) => {
-            let qtree = match args.format {
-                InputDataType::Mtx => {
-                    let file_path_pos = args.input_pos.ok_or_else(|| {
-                        anyhow::anyhow!("Position file required for MTX format")
-                    })?;
-                    tree_from_mtx(
-                        &args.input,
-                        &file_path_pos,
-                        args.pos_format,
-                        ErrorMetric::Mean,
-                        true,
-                    )?
-                }
-                _ => {
-                    let file_path_pos = args.input_pos.ok_or_else(|| {
-                        anyhow::anyhow!("Position file required for HDF5 format")
-                    })?;
-                    tree_from_10X(
-                        &args.input,
-                        &file_path_pos,
-                        args.pos_format,
-                        args.format,
-                        ErrorMetric::Mean,
-                        true,
-                    )?
-                }
+//TODO: combine csv and 10x format function into one
+            let (pos_x_col, pos_y_col) = match (args.platform.as_ref(), args.pos_x_col, args.pos_y_col) {
+                (Some(Platform::Visium), None, None) => (4, 5),
+                (Some(Platform::Xenium), None, None) => (1, 2),
+                _ => (args.pos_x_col.unwrap_or(1), args.pos_y_col.unwrap_or(2)),
             };
+            let qtree = match args.format {
+                InputDataType::Csv => {
+                    // let file_path_pos = args.input_pos.ok_or_else(|| {
+                    //    anyhow::anyhow!("Position file required for CSV format")
+                    //})?;
+                    tree_from_csv(
+                        &args.input,
+                        //file_path_pos,
+                        args.idx_x,          // idx_x
+                        args.idx_y,          // idx_y
+                        args.idx_gene_start, // idx_gene_start
+                        args.idx_gene_end,   // idx_gene_end (will use all remaining columns)
+                        ErrorMetric::Mean,
+                        true,
+                    )?
+                }
+                InputDataType::Csr | InputDataType::H5ad | InputDataType::Mtx | InputDataType::v2 => {
+                 let file_path_pos = args.input_pos.ok_or_else(|| {
+                   anyhow::anyhow!("Position file required for HDF5 format")
+                })?;
+                tree_from_10X(
+                &args.input,
+                &file_path_pos,
+                match args.pos_format {
+                    InputPosType::Csv => InputPosType::Csv,
+                    InputPosType::Parquet => InputPosType::Parquet,
+                },
+                match args.format {
+                    InputDataType::Csr => InputDataType::Csr,
+                    InputDataType::Csv => InputDataType::Csv,
+                    InputDataType::H5ad => InputDataType::H5ad,
+                    InputDataType::Mtx => InputDataType::Mtx,
+                    InputDataType::v2 => InputDataType::v2,
+                },
+                pos_x_col,
+                pos_y_col,
+                ErrorMetric::Mean,
+                true,
+                )?
+            }
+            };
+
             // You can decide whether to serialize the original tree or the bit fields or both
             let config = bincode::config::standard()
                 .with_little_endian()
                 .with_fixed_int_encoding();
             let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
             let mut file = File::create(ofname).unwrap();
-            let mut encoder = GzEncoder::new(file, Compression::default());
+            let mut writer = BufWriter::new(file);
+            let mut encoder = GzEncoder::new(writer, Compression::default());
             let bit_field_tree = qtree.compute_quadtree_bit_fields();
             let mut d = Data::new();
 
