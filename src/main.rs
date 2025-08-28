@@ -25,6 +25,8 @@ use sprs::CsMat;
 use std::io::BufWriter;
 use std::thread;
 use std::time::Duration;
+use flate2::bufread::GzDecoder;
+use std::io::BufReader;
 // removed unused bincode::{Encode, Decode} import
 
 // Simple ArrayData type to replace anndata::ArrayData
@@ -267,6 +269,7 @@ fn tree_from_csv<T: AsRef<Path>>(
         })?;
         xs.push(x);
         ys.push(y);
+        //println!("x: {}, y: {}", x, y);
 
         // Read gene expression data
         let mut cells = Vec::new();
@@ -299,8 +302,6 @@ fn tree_from_csv<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-
-    // No need to convert since we're already using u16
     let mut qtree = QuadTree::new(domain, coords, 0);
     
     // Divide the quadtree and get cost log
@@ -432,13 +433,17 @@ fn tree_from_10X<T: AsRef<Path>>(
         InputPosType::Csv => {
             // Visium tissue_positions_list.csv has no header and columns:
             // [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
-            let mut rdr = csv::ReaderBuilder::new().has_headers(true).from_reader(pos_file);
+            let mut rdr = csv::ReaderBuilder::new().has_headers(true)
+                .has_headers(false)
+                .from_reader(pos_file);
             for rec in rdr.records() {
                 let rec = rec?;
-                if rec.len() <= pos_y_col { continue; }
+                if rec.len() <= pos_y_col { return Err(anyhow::anyhow!("Invalid number of columns in positions file")); }
                 let bc = rec.get(0).unwrap().to_string();
-                let x = rec.get(pos_x_col).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
-                let y = rec.get(pos_y_col).and_then(|s| s.parse::<f64>().ok()).unwrap_or(0.0);
+                let x_str = rec.get(pos_x_col).ok_or_else(|| anyhow::anyhow!("Missing x column {}", pos_x_col))?;
+                let y_str = rec.get(pos_y_col).ok_or_else(|| anyhow::anyhow!("Missing y column {}", pos_y_col))?;
+                let x: f64 = x_str.parse()?;
+                let y: f64 = y_str.parse()?;
                 pos_map.insert(bc, (x, y));
             }
         }
@@ -468,15 +473,37 @@ fn tree_from_10X<T: AsRef<Path>>(
         xs.push(x_coord);
         ys.push(y_coord);
 
-        // Build dense vector from CSR row
-        let mut dense: Vec<u16> = vec![0u16; num_features];
-        if let Some(row) = csr.outer_view(row_idx) {
-            for (col, val) in row.iter() {
-                let v = (*val).max(0) as u32;
-                dense[col] = u16::try_from(v.min(u16::MAX as u32)).unwrap_or(u16::MAX);
+        // Extract gene expression data for this cell from the sparse matrix
+        let start_idx = indptr[row_idx];
+        let end_idx = indptr[row_idx + 1];
+
+        // Create sparse representation - only store non-zero values
+        let mut gene_indices = Vec::new();
+        let mut expression_values = Vec::new();
+        for i in start_idx..end_idx {
+            let gene_idx = indices[i];
+            let expression_value = data_u16[i];
+            if expression_value > 0 {
+                gene_indices.push(gene_idx);
+                expression_values.push(expression_value);
             }
         }
-        let array_data = ArrayData::new(Array1::from_vec(dense).into_dyn());
+
+        let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
+        if row_idx < 5 {
+            let dense_memory = num_features * std::mem::size_of::<u16>();
+            let sparse_memory = sparse_data.memory_usage();
+            println!(
+                "Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%",
+                row_idx,
+                dense_memory,
+                sparse_memory,
+                (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0
+            );
+        }
+
+        let dense_data = sparse_data.to_dense();
+        let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
         coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
     }
     
@@ -553,13 +580,13 @@ enum InputDataType {
     v2,
 }
 
-#[derive(Debug, Clone, ValueEnum)]
-enum Platform { Visium, Xenium }
-
 enum InputFileType {
     v2,
     HD,
 }
+
+#[derive(Debug, Clone, ValueEnum)]
+enum Platform { Visium, Xenium }
 
 /// Build a quadtree representation of spatial transcriptomics data
 #[derive(Debug, Args)]
@@ -686,6 +713,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {
                     //    anyhow::anyhow!("Position file required for CSV format")
                     //})?;
+                    //println!("tree_from_csv");
                     tree_from_csv(
                         &args.input,
                         //file_path_pos,
@@ -723,13 +751,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             }
             };
 
-            // You can decide whether to serialize the original tree or the bit fields or both
+            // only serialize the the bit fields
             let config = bincode::config::standard()
                 .with_little_endian()
                 .with_fixed_int_encoding();
             let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-            let mut file = File::create(ofname).unwrap();
-            let mut writer = BufWriter::new(file);
+            let file = File::create(ofname).unwrap();
+            let writer = BufWriter::new(file);
             let mut encoder = GzEncoder::new(writer, Compression::default());
             let bit_field_tree = qtree.compute_quadtree_bit_fields();
             let mut d = Data::new();
@@ -751,7 +779,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Commands::Dump(args) => {
             let ifile = std::fs::File::open(args.input)?;
-            let mut ifile = std::io::BufReader::new(ifile);
+            let ifile = std::io::BufReader::new(ifile);
+            let gz = GzDecoder::new(ifile);
+            let mut rdr = BufReader::new(gz);
+            
             let config = bincode::config::standard()
                 .with_little_endian()
                 .with_fixed_int_encoding();
@@ -759,8 +790,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let ofile = std::fs::File::create(args.output)?;
             let mut ofile = std::io::BufWriter::new(ofile);
             let mut d = Data::new();
-            d.data = bincode::decode_from_std_read(&mut ifile, config)?;
-            d.pos = bincode::decode_from_std_read(&mut ifile, config)?;
+            d.data = bincode::decode_from_std_read(&mut rdr, config)?;
+            d.pos = bincode::decode_from_std_read(&mut rdr, config)?;
             let mut start = 0;
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();

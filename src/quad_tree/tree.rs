@@ -995,6 +995,7 @@ impl QuadTree {
     */
 
     pub(crate) fn divide_recursive(&mut self) -> CostLog {
+        println!("divide_recursive");
         //let mut stack = vec![self];
         let mut cost_log = CostLog::new();
         //let max_depth = 3; 
@@ -1056,7 +1057,8 @@ impl QuadTree {
         info!("SW expense: {}", sw_expense);
 
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
-
+        println!("total_expense: {}", total_expense);
+        println!("current_expense: {}", current_expense);
         if total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
