@@ -802,7 +802,8 @@ fn main() -> Result<(), Box<dyn Error>> {
                         .map(|x| x.to_string())
                         .collect::<Vec<_>>()
                         .join(",");
-                    writeln!(ofile, "{},{},{}", loc.xpos(), loc.ypos(), expression)?;
+                    ofile.write_all(format!("{},{},{}\n", loc.xpos(), loc.ypos(), expression).as_bytes())?;
+                    //writeln!(ofile, "{},{},{}", loc.xpos(), loc.ypos(), expression)?;
                 }
                 start += n;
             }
