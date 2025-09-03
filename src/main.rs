@@ -23,8 +23,8 @@ use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 use sprs::CsMat;
 use std::io::BufWriter;
-use std::thread;
-use std::time::Duration;
+//use std::thread;
+//use std::time::Duration;
 use flate2::bufread::GzDecoder;
 use std::io::BufReader;
 // removed unused bincode::{Encode, Decode} import
@@ -46,43 +46,50 @@ impl ArrayData {
 }
 
 // Sparse gene expression data - much more memory efficient!
-#[derive(Clone)]
-pub struct SparseGeneData {
-    pub gene_indices: Vec<usize>,    // Which genes are expressed
-    pub expression_values: Vec<u16>,  // Expression counts
-    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
-}
+//#[derive(Clone)]
+//pub struct SparseGeneData {
+//    pub gene_indices: Vec<usize>,    // Which genes are expressed
+//    pub expression_values: Vec<u16>,  // Expression counts
+//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+//}
+//    pub expression_values: Vec<u16>,  // Expression counts
+//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+//}
+//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+//}
 
-impl SparseGeneData {
-    pub fn new(gene_indices: Vec<usize>, expression_values: Vec<u16>, num_genes: usize) -> Self {
-        Self { gene_indices, expression_values, num_genes }
-    }
+//impl SparseGeneData {
+//    pub fn new(gene_indices: Vec<usize>, expression_values: Vec<u16>, num_genes: usize) -> Self {
+//        Self { gene_indices, expression_values, num_genes }
+//    }
     
     // Convert to dense only when needed
-    pub fn to_dense(&self) -> Vec<u16> {
-        let mut dense = vec![0u16; self.num_genes];
-        for (idx, &value) in self.gene_indices.iter().zip(&self.expression_values) {
-            dense[*idx] = value;
-        }
-        dense
-    }
+//    pub fn to_dense(&self) -> Vec<u16> {
+//        let mut dense = vec![0u16; self.num_genes];
+//        for (idx, &value) in self.gene_indices.iter().zip(&self.expression_values) {
+//            dense[*idx] = value;
+//        }
+//        dense
+//    }
+//    }
     
     // Memory usage in bytes
-    pub fn memory_usage(&self) -> usize {
-        self.gene_indices.len() * std::mem::size_of::<usize>() +
-        self.expression_values.len() * std::mem::size_of::<u16>() +
-        std::mem::size_of::<usize>()
-    }
+//    pub fn memory_usage(&self) -> usize {
+//        self.gene_indices.len() * std::mem::size_of::<usize>() +
+//        self.expression_values.len() * std::mem::size_of::<u16>() +
+//        std::mem::size_of::<usize>()
+//    }
     
     // Get expression for a specific gene
-    pub fn get_gene_expression(&self, gene_idx: usize) -> u16 {
-        if let Some(pos) = self.gene_indices.binary_search(&gene_idx).ok() {
-            self.expression_values[pos]
-        } else {
-            0
-        }
-    }
-}
+//    pub fn get_gene_expression(&self, gene_idx: usize) -> u16 {
+//        if let Some(pos) = self.gene_indices.binary_search(&gene_idx).ok() {
+//            self.expression_values[pos]
+//        } else {
+//            0
+//        }
+//    }
+//    }
+//}
 
 // Helper function to extract numeric data from ArrayData
 fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
@@ -405,8 +412,8 @@ fn tree_from_10X<T: AsRef<Path>>(
     let indptr_array = indptr_dataset.read_1d::<usize>()?;
     let indptr: Vec<usize> = indptr_array.to_vec();
     
-    println!("Sparse matrix data: {} non-zero elements", data_u16.len());
-    // Build CSR matrix for convenient row iteration
+    info!("Sparse matrix data: {} non-zero elements", data_u16.len());
+    // Build CSR matrix
     let csr: CsMat<i32> = CsMat::new((num_cells, num_features), indptr.clone(), indices.clone(), data_i32);
     let pos_file = std::fs::File::open(pos_path.as_ref()).unwrap();
     let mut coords = Vec::new();
@@ -451,6 +458,7 @@ fn tree_from_10X<T: AsRef<Path>>(
             let reader = SerializedFileReader::new(pos_file).unwrap();
             let mut iter = reader.get_row_iter(None).unwrap();
             while let Some(Ok(parquet_row)) = iter.next() {
+                //println!("parquet_row: {:?}", parquet_row.get_string(0));
                 let bc = parquet_row.get_string(0).unwrap().to_string();
                 let x = parquet_row.get_double(pos_x_col).unwrap();
                 let y = parquet_row.get_double(pos_y_col).unwrap();
@@ -489,7 +497,8 @@ fn tree_from_10X<T: AsRef<Path>>(
             }
         }
 
-        let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
+       // let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
+        /* 
         if row_idx < 5 {
             let dense_memory = num_features * std::mem::size_of::<u16>();
             let sparse_memory = sparse_data.memory_usage();
@@ -501,13 +510,13 @@ fn tree_from_10X<T: AsRef<Path>>(
                 (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0
             );
         }
-
-        let dense_data = sparse_data.to_dense();
-        let array_data = ArrayData::new(Array1::from_vec(dense_data).into_dyn());
+        */
+      //  let array_data = ArrayData::new(csr.row(row_idx));
+        let array_data = ArrayData::new(Array1::from_vec(expression_values).into_dyn());
         coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
     }
     
-    println!("num_rows: {}", num_cells);
+    info!("num_rows: {}", num_cells);
 
     let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0; // |a, &b| pattern matching, does not need clone() 
     let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
@@ -608,7 +617,7 @@ struct BuildCommand {
     #[arg(short = 'i', long)]
     input: PathBuf,
     /// Input CSV file for position data (only needed for CSV input)
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p')]
     input_pos: Option<PathBuf>,
     /// Output file (default "output.bin.gz")
     #[arg(short = 'o', long)]
@@ -622,7 +631,8 @@ struct BuildCommand {
     /// Positions file y column index (0-based)
     #[arg(long = "pos-y-col")]
     pos_y_col: Option<usize>,
-    /// Index of x coordinate, default 6
+    // !!combine pos_x_col and pos_y_col into one argument!!
+    /// Index of x coordinate, default 6 
     #[arg(short = 'x', long, default_value_t = 6)]
     idx_x: usize,
     /// Index of y coordinate, default 7
@@ -635,16 +645,16 @@ struct BuildCommand {
     #[arg(short = 'e', long)]
     idx_gene_end: Option<usize>,
     /// Input position file format (csv or parquet)
-    #[arg(long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
+    #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
-    #[arg(long, value_enum)]
+    #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
 }
 
 struct Data {
     pub data: Vec<EncodedDiffs>,
     pub pos: Vec<DatalessPoint>,
-    pub sep: Vec<usize>,
+   // pub sep: Vec<usize>,
 }
 
 impl Data {
@@ -652,7 +662,7 @@ impl Data {
         Self {
             data: Vec::new(),
             pos: Vec::new(),
-            sep: Vec::new(),
+          //  sep: Vec::new(),
         }
     }
 }
@@ -703,10 +713,10 @@ fn main() -> Result<(), Box<dyn Error>> {
     match cli_args.command {
         Commands::Build(args) => {
 //TODO: combine csv and 10x format function into one
-            let (pos_x_col, pos_y_col) = match (args.platform.as_ref(), args.pos_x_col, args.pos_y_col) {
-                (Some(Platform::Visium), None, None) => (4, 5),
-                (Some(Platform::Xenium), None, None) => (1, 2),
-                _ => (args.pos_x_col.unwrap_or(1), args.pos_y_col.unwrap_or(2)),
+            let (pos_x_col, pos_y_col) = match args.platform {
+                Some(Platform::Visium) => (4, 5),
+                Some(Platform::Xenium) => (1, 2),
+                None => (args.idx_x, args.idx_y),
             };
             let qtree = match args.format {
                 InputDataType::Csv => {
@@ -778,10 +788,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             bincode::encode_into_std_write(&d.pos, &mut encoder, config).unwrap();
         }
         Commands::Dump(args) => {
+            info!("start dump");
             let ifile = std::fs::File::open(args.input)?;
             let ifile = std::io::BufReader::new(ifile);
             let gz = GzDecoder::new(ifile);
             let mut rdr = BufReader::new(gz);
+            
             
             let config = bincode::config::standard()
                 .with_little_endian()
@@ -793,6 +805,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             d.data = bincode::decode_from_std_read(&mut rdr, config)?;
             d.pos = bincode::decode_from_std_read(&mut rdr, config)?;
             let mut start = 0;
+
+            info!("d.data.len(): {}", d.data.len());
             for compressed_diffs in d.data.iter() {
                 let n = compressed_diffs.num_cells();
                 for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {

@@ -1,4 +1,3 @@
-
 use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
@@ -344,6 +343,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
 /// along that axis/coordinate.
 /// Returns a `Some(EncodedDiff)` struct representing the encoded differences or `None`
 /// if the slice is empty.
+/// 
 pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     if points.is_empty() {
         debug!("Empty points array in encode_subarray()");
@@ -361,6 +361,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
     let mut nnz = 0_usize;
     // we'll make 2 passes, because we want to store the final results in
     // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
+    debug!("points[0].get_data().len(): {}", points[0].get_data().len());
     for j in 0..points[0].get_data().len() {
         // get the non-zero values and the non-zero indices
         let nz_values: Vec<u16> = points
@@ -380,11 +381,15 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         } else {
             0
         };
+        if j == 20000 {
+            debug!("j: {}, median: {}", j, median);
+        }
         medians.push(median);
     }
 
     let tot = num_genes as usize * points.len();
     let sparsity = (nnz as f64) / (tot as f64);
+    debug!("sparsity: {}", sparsity);
 
     // for each cell
     for (cell_ind, gene_exp) in points.iter().enumerate() {
@@ -862,7 +867,7 @@ pub(crate) struct QuadTree {
     points: Vec<Point>,
     depth: usize,
     divided: bool,
-    maxerror: Option<f64>,
+    //maxerror: Option<f64>,
     nw: Option<Box<Self>>,
     ne: Option<Box<Self>>,
     se: Option<Box<Self>>,
@@ -879,7 +884,7 @@ impl QuadTree {
             points,
             depth,
             divided: false,
-            maxerror: None,
+            //maxerror: None,
             nw: None,
             ne: None,
             se: None,
@@ -888,12 +893,6 @@ impl QuadTree {
             //index: Vec::new(),
             positions: Vec::new(),
         }
-    }
-
-
-    /// Get the expression data for a point
-    pub(crate) fn get_point_data<'a>(&self, point: &'a Point) -> Option<&'a ArrayData> {
-        Some(&point.data_arc)
     }
 
     /// Get all expression data for a point
@@ -994,15 +993,18 @@ impl QuadTree {
         }
     */
 
-    pub(crate) fn divide_recursive(&mut self) -> CostLog {
-        println!("divide_recursive");
+    //pub(crate) fn divide_recursive(&mut self) -> CostLog {
+    pub(crate) fn divide_recursive(&mut self) {
+        info!("divide_recursive");
         //let mut stack = vec![self];
-        let mut cost_log = CostLog::new();
+        //let mut cost_log = CostLog::new();
         //let max_depth = 3; 
         //let max_pt: usize = 2000;
          // nothing to do if this subtree is empty
-         if self.points.is_empty() {
-            return cost_log;
+        if self.points.is_empty() {
+            //return cost_log;
+            info!("points is empty");
+            return;
         }
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self
@@ -1010,7 +1012,6 @@ impl QuadTree {
             .iter()
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
-
         // Compute the expense of encoding the current block
         let current_expense = encode_subarray(&self.points,).map_or(0, |x| x.bytes());
         info!(
@@ -1039,12 +1040,6 @@ impl QuadTree {
             self.points.len()
         );
 
-        // make sure we're not losing any points
-        assert_eq!(
-            nw.points.len() + ne.points.len() + se.points.len() + sw.points.len(),
-            self.points.len()
-        );
-
         // Convert children to BitFieldQuadTree to calculate their expenses
         let nw_expense = encode_subarray(&nw.points).map_or(0, |x| x.bytes());
         let ne_expense = encode_subarray(&ne.points).map_or(0, |x| x.bytes());
@@ -1057,8 +1052,8 @@ impl QuadTree {
         info!("SW expense: {}", sw_expense);
 
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
-        println!("total_expense: {}", total_expense);
-        println!("current_expense: {}", current_expense);
+        info!("total_expense: {}", total_expense);
+
         if total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
@@ -1095,7 +1090,7 @@ impl QuadTree {
             }
         }
         info!("self.depth: {}", self.depth);
-        return cost_log;
+        //return cost_log;
     }
 /* 
     pub(crate) fn divide(&mut self) -> CostLog {
@@ -1138,35 +1133,14 @@ impl QuadTree {
              */
              // Find the children of the current node
              let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&node.boundary);
-             
-             let mut nw = None;
-             let mut ne = None;
-             let mut se = None;
-             let mut sw = None;
-
-             scope(|s| {
-                 s.spawn(|_| {
-                     let nw_points = node.query(&nw_boundary);
-                     nw = Some(QuadTree::new(nw_boundary, nw_points, node.depth + 1));
-                 });
-                 s.spawn(|_| {
-                     let ne_points = node.query(&ne_boundary);
-                     ne = Some(QuadTree::new(ne_boundary, ne_points, node.depth + 1));
-                 });
-                 s.spawn(|_| {
-                     let se_points = node.query(&se_boundary);
-                     se = Some(QuadTree::new(se_boundary, se_points, node.depth + 1));
-                 });
-                 s.spawn(|_| {
-                     let sw_points = node.query(&sw_boundary);
-                     sw = Some(QuadTree::new(sw_boundary, sw_points, node.depth + 1));
-                 });
-             });
-
-             let nw = nw.unwrap();
-             let ne = ne.unwrap();
-             let se = se.unwrap();
-             let sw = sw.unwrap();
+             let nw_points = node.query(&nw_boundary);
+             let nw = QuadTree::new(nw_boundary, nw_points, node.depth + 1);
+             let ne_points = node.query(&ne_boundary);
+             let ne = QuadTree::new(ne_boundary, ne_points, node.depth + 1); 
+             let se_points = node.query(&se_boundary);
+             let se = QuadTree::new(se_boundary, se_points, node.depth + 1);
+             let sw_points = node.query(&sw_boundary);
+             let sw = QuadTree::new(sw_boundary, sw_points, node.depth + 1);
  
              // make sure we're not losing any points
              assert_eq!(
@@ -1235,31 +1209,11 @@ impl QuadTree {
              if total_children_expense < current_expense {
              node.divided = true;
              
-             // Convert BitFieldQuadTree back to QuadTree and assign children in parallel
-             rayon::scope(|s| {
-                 let mut nw_opt = None;
-                 let mut ne_opt = None;
-                 let mut se_opt = None;
-                 let mut sw_opt = None;
-
-                 s.spawn(|_| {
-                     nw_opt = (!nw.points.is_empty()).then_some(Box::new(nw));
-                 });
-                 s.spawn(|_| {
-                     ne_opt = (!ne.points.is_empty()).then_some(Box::new(ne));
-                 });
-                 s.spawn(|_| {
-                     se_opt = (!se.points.is_empty()).then_some(Box::new(se));
-                 });
-                 s.spawn(|_| {
-                     sw_opt = (!sw.points.is_empty()).then_some(Box::new(sw));
-                 });
-
-                 node.nw = nw_opt;
-                 node.ne = ne_opt;
-                 node.se = se_opt;
-                 node.sw = sw_opt;
-             });
+             // Convert BitFieldQuadTree back to QuadTree and assign children
+             node.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
+             node.ne = (!ne.points.is_empty()).then_some(Box::new(ne));
+             node.se = (!se.points.is_empty()).then_some(Box::new(se));
+             node.sw = (!sw.points.is_empty()).then_some(Box::new(sw));
  
              // Only clear points after we've used them for all necessary operations
              node.points.clear();
