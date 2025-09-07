@@ -5,10 +5,9 @@ use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info, warn};
-use crate::ArrayData;
-use std::sync::Arc;
 use rayon::join;
-use rayon::scope;
+//use rayon::scope;
+use sprs::CsVecViewI;
 
 // Cost tracking structures for serialization
 #[derive(Clone, Encode, Decode)]
@@ -47,13 +46,6 @@ impl CostLog {
         self.total_cost = cost;
     }
 }
-
-
-// Helper function to extract numeric data from ArrayData
-fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
-    data.data.as_slice().unwrap().to_vec()
-}
-
 
 #[derive(Clone)]
 pub(crate) struct EncodedDiffs {
@@ -473,17 +465,17 @@ pub(crate) enum ArrayData {
 pub(crate) struct Point {
     pub(crate) x: f64,
     pub(crate) y: f64,
-    pub(crate) data_arc: Arc<ArrayData>,
+    pub(crate) data_arc: CsVecViewI<u16>,
 }
 
 impl Point {
     #[inline(always)]
-    pub(crate) fn new(x: f64, y: f64, data_arc: Arc<ArrayData>) -> Self {
+    pub(crate) fn new(x: f64, y: f64, data_arc: CsVecViewI<u16>) -> Self {
         Self { x, y, data_arc }
     }
 
     pub(crate) fn get_data(&self) -> Vec<u16> {
-        extract_numeric_data(&self.data_arc)
+        self.data_arc.to_dense().to_vec()
     }
 }
 
@@ -896,7 +888,7 @@ impl QuadTree {
     }
 
     /// Get all expression data for a point
-    pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> Vec<&'a ArrayData> {
+    pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> CsVecViewI<u16> {
         // Since we now store data directly in Point, just return it as a single element
         vec![&point.data_arc]
     }

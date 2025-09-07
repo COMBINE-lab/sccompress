@@ -348,7 +348,7 @@ fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> {
     return reader;
 }*/
 
-fn tree_from_10X<T: AsRef<Path>>(
+fn tree_from_10x<T: AsRef<Path>>(
     h5_path: T,
     pos_path: T,
     pos_type: InputPosType,
@@ -366,6 +366,12 @@ fn tree_from_10X<T: AsRef<Path>>(
     // Read all feature information
     let file = Hdf5File::open(h5_path.as_ref())?;
 
+    // Check if matrix group exists
+    let matrix_group = match file.group("matrix") {
+        Ok(g) => g,
+        Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
+    };
+
     // Read gene names (23 chars each)
     let gene_names = read_strings_23(&file, "matrix/features/name")?;
 
@@ -382,11 +388,6 @@ fn tree_from_10X<T: AsRef<Path>>(
     println!("Gene IDs: {:?}", &gene_ids[..5]);
     println!("Feature types: {:?}", &feature_types[..5]);
     println!("Genomes: {:?}", &genomes[..5]);
-    // Check if matrix group exists
-    let matrix_group = match file.group("matrix") {
-        Ok(g) => g,
-        Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
-    };
     
     // Read the shape of the matrix
     let shape_dataset = matrix_group.dataset("shape")?;
@@ -406,7 +407,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     
     let data_array = data_dataset.read_1d::<u16>()?;
     let data_u16: Vec<u16> = data_array.to_vec();
-    let data_i32: Vec<i32> = data_u16.iter().map(|&v| v as i32).collect();
+    //let data_u16: Vec<u16> = data_u16.iter().map(|&v| v as u16).collect();
     let indices_array = indices_dataset.read_1d::<usize>()?;
     let indices: Vec<usize> = indices_array.to_vec();
     let indptr_array = indptr_dataset.read_1d::<usize>()?;
@@ -414,7 +415,7 @@ fn tree_from_10X<T: AsRef<Path>>(
     
     info!("Sparse matrix data: {} non-zero elements", data_u16.len());
     // Build CSR matrix
-    let csr: CsMat<i32> = CsMat::new((num_cells, num_features), indptr.clone(), indices.clone(), data_i32);
+    let csr: CsMat<u16> = CsMat::new((num_cells, num_features), indptr.clone(), indices.clone(), data_u16);
     let pos_file = std::fs::File::open(pos_path.as_ref()).unwrap();
     let mut coords = Vec::new();
     let mut xs = Vec::new();
@@ -512,8 +513,8 @@ fn tree_from_10X<T: AsRef<Path>>(
         }
         */
       //  let array_data = ArrayData::new(csr.row(row_idx));
-        let array_data = ArrayData::new(Array1::from_vec(expression_values).into_dyn());
-        coords.push(Point::new(x_coord, y_coord, Arc::new(array_data)));
+
+        coords.push(Point::new(x_coord, y_coord, csr.outer_view(row_idx).unwrap()));
     }
     
     info!("num_rows: {}", num_cells);
@@ -739,7 +740,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                  let file_path_pos = args.input_pos.ok_or_else(|| {
                    anyhow::anyhow!("Position file required for HDF5 format")
                 })?;
-                tree_from_10X(
+                tree_from_10x(
                 &args.input,
                 &file_path_pos,
                 match args.pos_format {
@@ -826,6 +827,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+
+/* 
 // Function to explore HDF5 file structure
 fn explore_hdf5_structure<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
     let file = Hdf5File::open(h5_path.as_ref())?;
@@ -904,4 +907,4 @@ fn demonstrate_cell_names<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
     Ok(())
 }
 
-
+*/
