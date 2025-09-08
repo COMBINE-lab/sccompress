@@ -7,7 +7,7 @@ use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info, warn};
 use rayon::join;
 //use rayon::scope;
-use sprs::CsVecViewI;
+use sprs::{CsVecBase, CsVecViewI};
 
 // Cost tracking structures for serialization
 #[derive(Clone, Encode, Decode)]
@@ -465,7 +465,7 @@ pub(crate) enum ArrayData {
 pub(crate) struct Point {
     pub(crate) x: f64,
     pub(crate) y: f64,
-    pub(crate) data_arc: CsVecViewI<u16>,
+    pub(crate) data_arc: ,
 }
 
 impl Point {
