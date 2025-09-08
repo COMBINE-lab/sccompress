@@ -17,6 +17,7 @@ sux = "0.7.4"
 cseq = "0.1.4"
 bitm = "0.5.1"
 parquet = "55.2.0"
-hdf5 = "0.8.1"
+hdf5 = { package = "hdf5-metno", version = "0.10.1" }
 sprs = "0.11"
 rayon = "1.11.0"
+mimalloc = "0.1.48"

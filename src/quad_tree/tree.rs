@@ -465,7 +465,7 @@ pub(crate) enum ArrayData {
 pub(crate) struct Point {
     pub(crate) x: f64,
     pub(crate) y: f64,
-    pub(crate) data_arc: ,
+    pub(crate) data_arc: CsVecBase<&[usize], &[u16], u16>,
 }
 
 impl Point {
