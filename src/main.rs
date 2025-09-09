@@ -244,112 +244,16 @@ fn read_strings_as_bytes(
 }
 
 fn tree_from_csv<T: AsRef<Path>>(
-    file_path: T,
-    idx_x: usize,
-    idx_y: usize,
-    idx_gene_start: usize,
-    idx_gene_end: Option<usize>,
+    _file_path: T,
+    _idx_x: usize,
+    _idx_y: usize,
+    _idx_gene_start: usize,
+    _idx_gene_end: Option<usize>,
     _method: ErrorMetric,
     _lossless: bool,
-) -> anyhow::Result<QuadTree> {
-    let mut coords = Vec::new();
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    //let mut mind = Vec::new();
-    //let mut maxd = Vec::new();
-
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true) // Set to true to skip the header row
-        .flexible(true) // Allow varying number of fields
-        .from_path(file_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
-
-    // Read all records into memory
-    let records: Vec<_> = rdr
-        .records()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?;
-
-    println!("Total records read: {}", records.len());
-
-    // Get the number of columns from the first record
-    let num_columns = records[0].len();
-    let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
-    println!("num_columns: {}", num_columns);
-    // Process all records
-    for record in records.iter() {
-        //println!("i: {:?}", i);
-        // Read coordinates
-        let x: f64 = record[idx_x].parse().map_err(|e| {
-            anyhow::anyhow!("Failed to parse x coordinate at column {}: {}", idx_x, e)
-        })?;
-        let y: f64 = record[idx_y].parse().map_err(|e| {
-            anyhow::anyhow!("Failed to parse y coordinate at column {}: {}", idx_y, e)
-        })?;
-        xs.push(x);
-        ys.push(y);
-        //println!("x: {}, y: {}", x, y);
-
-        // Read gene expression data
-        let mut cells = Vec::new();
-        for j in idx_gene_start..idx_gene_end {
-            let value: u16 = match record[j].parse::<f64>() {
-                Ok(v) => v as u16,
-                Err(_e) => 0,
-            };
-            cells.push(value);
-            // println!("cells: {:?}", cells);
-            /*
-            if mind.len() <= j - idx_gene_start {
-                mind.push(value);
-                maxd.push(value);
-            } else {
-                mind[j - idx_gene_start] = mind[j - idx_gene_start].min(value);
-                maxd[j - idx_gene_start] = maxd[j - idx_gene_start].max(value);
-            }
-            */
-        }
-        let array_data = ArrayData::new(Array1::from_vec(cells).into_dyn());
-        coords.push(Point::new(x, y, Arc::new(array_data)));
-    }
-
-    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
-    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
-    let w = maxx - minx;
-    let h = maxy - miny;
-
-    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0);
-
-    // Divide the quadtree and get cost log
-    let division_cost_log = qtree.divide_recursive();
-    //info!("Division cost log contains {} steps", division_cost_log.steps.len());
-    //info!("Total nodes processed: {}", division_cost_log.total_nodes);
-    //info!("Total cost: {}", division_cost_log.total_cost);
-
-    // Serialize division cost log to file
-    //    let division_cost_log_filename = PathBuf::from("division_costs.bin");
-    //    let cost_config = bincode::config::standard()
-    //        .with_little_endian()
-    //        .with_fixed_int_encoding();
-    //    let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    //    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-    //    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-
-    /*   // Optimize the quadtree and get cost log
-    let optimization_cost_log = qtree.optimize_quadtree();
-    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
-    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
-
-    // Serialize optimization cost log to file
-    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
-    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
-    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
-    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    */
-    Ok(qtree)
+) -> anyhow::Result<()> {
+    // CSV function needs to be implemented following the same pattern
+    todo!("CSV function needs to be restructured to use SpatialData pattern")
 }
 
 /*
@@ -360,136 +264,70 @@ fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> {
     return reader;
 }*/
 
-fn tree_from_10x<T: AsRef<Path>>(
+// Function to read 10X data and return owned data
+fn read_10x_data<T: AsRef<Path>>(
     h5_path: T,
     pos_path: T,
     pos_type: InputPosType,
-    file_type: InputDataType,
     pos_x_col: usize,
     pos_y_col: usize,
-    _method: ErrorMetric,
-    _lossless: bool,
-) -> anyhow::Result<QuadTree> {
-    // Read features from 10x HDF5 file
-    println!(
-        "Reading features from HDF5 file: {}",
-        h5_path.as_ref().display()
-    );
-    let features = read_10x_features(&h5_path)?;
-    println!(
-        "Found {} features: {:?}",
-        features.len(),
-        &features[..features.len().min(5)]
-    ); // Show first 5 features
-
-    // Read all feature information
+) -> anyhow::Result<(CsMat<u16>, Vec<(f64, f64)>)> {
+    // Read HDF5 and build CSR matrix
     let file = Hdf5File::open(h5_path.as_ref())?;
-
-    // Check if matrix group exists
     let matrix_group = match file.group("matrix") {
         Ok(g) => g,
         Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
     };
-
-    // Read gene names (23 chars each)
-    let gene_names = read_strings_23(&file, "matrix/features/name")?;
-
-    // Read gene IDs (23 chars each)
-    let gene_ids = read_strings_23(&file, "matrix/features/id")?;
-
-    // Read feature types (25 chars each)
-    let feature_types = read_strings_25(&file, "matrix/features/feature_type")?;
-
-    // Read genome references (7 chars each)
-    let genomes = read_strings_7(&file, "matrix/features/genome")?;
-
-    println!("Gene names: {:?}", &gene_names[..5]);
-    println!("Gene IDs: {:?}", &gene_ids[..5]);
-    println!("Feature types: {:?}", &feature_types[..5]);
-    println!("Genomes: {:?}", &genomes[..5]);
-    // Check if matrix group exists
-    let matrix_group = match file.group("matrix") {
-        Ok(g) => g,
-        Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
-    };
-
-    // Read the shape of the matrix
+    
     let shape_dataset = matrix_group.dataset("shape")?;
     let shape_array = shape_dataset.read_1d::<usize>()?;
     let shape: Vec<usize> = shape_array.to_vec();
     let num_features = shape[0];
     let num_cells = shape[1];
-
-    println!(
-        "Matrix shape: {} cells x {} features",
-        num_cells, num_features
-    );
-
-    //TODO: read from h5ad file need to be a function by itself
-    // Read the sparse matrix components
+    
     let data_dataset = matrix_group.dataset("data")?;
     let indices_dataset = matrix_group.dataset("indices")?;
     let indptr_dataset = matrix_group.dataset("indptr")?;
     let barcodes_dataset = matrix_group.dataset("barcodes")?;
-
+    
     let data_array = data_dataset.read_1d::<u16>()?;
     let data_u16: Vec<u16> = data_array.to_vec();
-    //let data_u16: Vec<u16> = data_u16.iter().map(|&v| v as u16).collect();
     let indices_array = indices_dataset.read_1d::<usize>()?;
     let indices: Vec<usize> = indices_array.to_vec();
     let indptr_array = indptr_dataset.read_1d::<usize>()?;
     let indptr: Vec<usize> = indptr_array.to_vec();
-
+    
     info!("Sparse matrix data: {} non-zero elements", data_u16.len());
+    
     // Build CSR matrix
-    let csr: CsMat<i32> = CsMat::new(
-        (num_cells, num_features),
-        indptr.clone(),
-        indices.clone(),
-        data_i32,
-    );
-    let pos_file = std::fs::File::open(pos_path.as_ref()).unwrap();
-    let mut coords = Vec::new();
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-
-    // Pre-allocate vectors with capacity
-    coords.reserve(num_cells);
-    xs.reserve(num_cells);
-    ys.reserve(num_cells);
-
-    // Read all barcodes from HDF5 once
+    let csr: CsMat<u16> = CsMat::new((num_cells, num_features), indptr, indices, data_u16);
+    
+    // Read barcodes
     let barcodes_arr = barcodes_dataset.read_1d::<FixedAscii<23>>()?;
     let barcodes: Vec<String> = barcodes_arr
         .iter()
         .map(|b| b.as_str().trim_end_matches('\0').to_string())
         .collect();
-
-    // Build a map from barcode -> (x, y) from the positions file
-    use std::collections::HashMap;
-    let mut pos_map: HashMap<String, (f64, f64)> = HashMap::with_capacity(num_cells);
+    
+    // Read positions
+    let pos_file = std::fs::File::open(pos_path.as_ref())?;
+    let mut pos_map: std::collections::HashMap<String, (f64, f64)> = 
+        std::collections::HashMap::with_capacity(num_cells);
 
     match pos_type {
         InputPosType::Csv => {
-            // Visium tissue_positions_list.csv has no header and columns:
-            // [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
             let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(true)
                 .has_headers(false)
                 .from_reader(pos_file);
             for rec in rdr.records() {
                 let rec = rec?;
                 if rec.len() <= pos_y_col {
-                    return Err(anyhow::anyhow!(
-                        "Invalid number of columns in positions file"
-                    ));
+                    return Err(anyhow::anyhow!("Invalid number of columns in positions file"));
                 }
                 let bc = rec.get(0).unwrap().to_string();
-                let x_str = rec
-                    .get(pos_x_col)
+                let x_str = rec.get(pos_x_col)
                     .ok_or_else(|| anyhow::anyhow!("Missing x column {}", pos_x_col))?;
-                let y_str = rec
-                    .get(pos_y_col)
+                let y_str = rec.get(pos_y_col)
                     .ok_or_else(|| anyhow::anyhow!("Missing y column {}", pos_y_col))?;
                 let x: f64 = x_str.parse()?;
                 let y: f64 = y_str.parse()?;
@@ -497,21 +335,20 @@ fn tree_from_10x<T: AsRef<Path>>(
             }
         }
         InputPosType::Parquet => {
-            let reader = SerializedFileReader::new(pos_file).unwrap();
-            let mut iter = reader.get_row_iter(None).unwrap();
+            let reader = SerializedFileReader::new(pos_file)?;
+            let mut iter = reader.get_row_iter(None)?;
             while let Some(Ok(parquet_row)) = iter.next() {
-                //println!("parquet_row: {:?}", parquet_row.get_string(0));
-                let bc = parquet_row.get_string(0).unwrap().to_string();
-                let x = parquet_row.get_double(pos_x_col).unwrap();
-                let y = parquet_row.get_double(pos_y_col).unwrap();
+                let bc = parquet_row.get_string(0)?.to_string();
+                let x = parquet_row.get_double(pos_x_col)?;
+                let y = parquet_row.get_double(pos_y_col)?;
                 pos_map.insert(bc, (x, y));
             }
         }
     }
-
-    // Walk HDF5 barcodes in order and look up positions by barcode
-    for row_idx in 0..num_cells {
-        let barcode = &barcodes[row_idx];
+    
+    // Create positions vector in the same order as barcodes
+    let mut positions = Vec::with_capacity(num_cells);
+    for (row_idx, barcode) in barcodes.iter().enumerate() {
         let (x_coord, y_coord) = pos_map.get(barcode).copied().ok_or_else(|| {
             anyhow::anyhow!(
                 "Missing position for HDF5 barcode '{}' at row {} in positions file",
@@ -519,48 +356,36 @@ fn tree_from_10x<T: AsRef<Path>>(
                 row_idx
             )
         })?;
+        positions.push((x_coord, y_coord));
+    }
+    
+    Ok((csr, positions))
+}
 
+// Function to build quadtree from CSR matrix and positions
+fn build_quadtree_from_data<'a>(csr: &'a CsMat<u16>, positions: &[(f64, f64)]) -> anyhow::Result<QuadTree<'a>> {
+    let mut coords = Vec::new();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+    
+    let num_cells = csr.rows();
+    coords.reserve(num_cells);
+    xs.reserve(num_cells);
+    ys.reserve(num_cells);
+    
+    // Create Points that borrow from the CSR matrix
+    for (row_idx, &(x_coord, y_coord)) in positions.iter().enumerate() {
         xs.push(x_coord);
         ys.push(y_coord);
-
-        // Extract gene expression data for this cell from the sparse matrix
-        let start_idx = indptr[row_idx];
-        let end_idx = indptr[row_idx + 1];
-
-        // Create sparse representation - only store non-zero values
-        let mut gene_indices = Vec::new();
-        let mut expression_values = Vec::new();
-        for i in start_idx..end_idx {
-            let gene_idx = indices[i];
-            let expression_value = data_u16[i];
-            if expression_value > 0 {
-                gene_indices.push(gene_idx);
-                expression_values.push(expression_value);
-            }
+        
+        if let Some(row_view) = csr.outer_view(row_idx) {
+            coords.push(Point::new(x_coord, y_coord, row_view));
         }
-
-        // let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
-        /*
-        if row_idx < 5 {
-            let dense_memory = num_features * std::mem::size_of::<u16>();
-            let sparse_memory = sparse_data.memory_usage();
-            println!(
-                "Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%",
-                row_idx,
-                dense_memory,
-                sparse_memory,
-                (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0
-            );
-        }
-        */
-      //  let array_data = ArrayData::new(csr.row(row_idx));
-
-        coords.push(Point::new(x_coord, y_coord, csr.outer_view(row_idx).unwrap()));
     }
-
+    
     info!("num_rows: {}", num_cells);
 
-    let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0; // |a, &b| pattern matching, does not need clone()
+    let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
     let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
     let maxx = xs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
     let maxy = ys.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
@@ -569,35 +394,40 @@ fn tree_from_10x<T: AsRef<Path>>(
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
+    
+    // Divide the quadtree
+    qtree.divide_recursive();
+    Ok(qtree)
+}
 
-    // Divide the quadtree and get cost log
-    let division_cost_log = qtree.divide_recursive();
-    /*
-    info!("Division cost log contains {} steps", division_cost_log.steps.len());
-    info!("Total nodes processed: {}", division_cost_log.total_nodes);
-    info!("Total cost: {}", division_cost_log.total_cost);
-
-    // Serialize division cost log to file
-    let division_cost_log_filename = PathBuf::from("division_costs.bin");
-    let cost_config = bincode::config::standard()
+// Function to serialize a quadtree to file
+fn serialize_quadtree(bit_field_tree: BitFieldQuadTree, output_path: &Option<PathBuf>) -> anyhow::Result<()> {
+    let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
-    let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-
-    // Optimize the quadtree and get cost log
-    let optimization_cost_log = qtree.optimize_quadtree();
-    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
-    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
-
-    // Serialize optimization cost log to file
-    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
-    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
-    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
-    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    */
-    Ok(qtree)
+    let ofname = output_path.as_ref()
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
+    let file = File::create(&ofname)?;
+    let writer = BufWriter::new(file);
+    let mut encoder = GzEncoder::new(writer, Compression::default());
+    
+    let mut d = Data::new();
+    
+    let mut collect_data = |n: &BitFieldQuadTree| {
+        if n.encoded_diffs.bytes() > 0 {
+            d.data.push(n.encoded_diffs.clone());
+            d.pos.extend_from_slice(&n.positions);
+        }
+    };
+    bit_field_tree.visit(&mut collect_data);
+    
+    info!("Collected Encoded Diffs : {}", d.data.len());
+    bincode::encode_into_std_write(&d.data, &mut encoder, config)?;
+    bincode::encode_into_std_write(&d.pos, &mut encoder, config)?;
+    
+    info!("Quadtree serialized to: {}", ofname.display());
+    Ok(())
 }
 
 #[derive(Parser)]
@@ -711,31 +541,6 @@ impl Data {
         }
     }
 }
-/*
-fn main() -> Result<(), Box<dyn Error>> {
-    // Check the `RUST_LOG` variable for the logger level and
-    // respect the value found there. If this environment
-    // variable is not set then set the logging level to
-    // INFO.
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy()
-                // we don't want to hear anything below a warning from ureq
-                .add_directive("ureq=warn".parse()?),
-        )
-        .init();
-
-    // Test reading HDF5 file directly with hdf5 crate
-    println!("Testing HDF5 file reading...");
-    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
-    let parquet_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cells.parquet";
-    tree_from_10X(file_path, parquet_path, ErrorMetric::Mean, true)?;
-    Ok(())
-}
-    */
 
 fn main() -> Result<(), Box<dyn Error>> {
     // Check the `RUST_LOG` variable for the logger level and
@@ -757,83 +562,49 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     match cli_args.command {
         Commands::Build(args) => {
-            //TODO: combine csv and 10x format function into one
             let (pos_x_col, pos_y_col) = match args.platform {
                 Some(Platform::Visium) => (4, 5),
                 Some(Platform::Xenium) => (1, 2),
                 None => (args.idx_x, args.idx_y),
             };
-            let qtree = match args.format {
+            
+            // Process the quadtree building and serialization within the same scope
+            // where the data lives, avoiding lifetime issues
+            match args.format {
                 InputDataType::Csv => {
-                    // let file_path_pos = args.input_pos.ok_or_else(|| {
-                    //    anyhow::anyhow!("Position file required for CSV format")
-                    //})?;
-                    //println!("tree_from_csv");
                     tree_from_csv(
                         &args.input,
-                        //file_path_pos,
                         args.idx_x,          // idx_x
                         args.idx_y,          // idx_y
                         args.idx_gene_start, // idx_gene_start
                         args.idx_gene_end,   // idx_gene_end (will use all remaining columns)
                         ErrorMetric::Mean,
                         true,
-                    )?
+                    )?;
                 }
-                InputDataType::Csr
-                | InputDataType::H5ad
-                | InputDataType::Mtx
-                | InputDataType::v2 => {
+                InputDataType::Csr | InputDataType::H5ad | InputDataType::Mtx | InputDataType::v2 => {
                     let file_path_pos = args
                         .input_pos
                         .ok_or_else(|| anyhow::anyhow!("Position file required for HDF5 format"))?;
-                    tree_from_10X(
+                    
+                    // Read data and process quadtree immediately
+                    let (csr, positions) = read_10x_data(
                         &args.input,
                         &file_path_pos,
                         match args.pos_format {
                             InputPosType::Csv => InputPosType::Csv,
                             InputPosType::Parquet => InputPosType::Parquet,
                         },
-                        match args.format {
-                            InputDataType::Csr => InputDataType::Csr,
-                            InputDataType::Csv => InputDataType::Csv,
-                            InputDataType::H5ad => InputDataType::H5ad,
-                            InputDataType::Mtx => InputDataType::Mtx,
-                            InputDataType::v2 => InputDataType::v2,
-                        },
                         pos_x_col,
                         pos_y_col,
-                        ErrorMetric::Mean,
-                        true,
-                    )?
+                    )?;
+                    
+                    // Build and serialize quadtree immediately while data is in scope
+                    let qtree = build_quadtree_from_data(&csr, &positions)?;
+                    let bit_field_tree = qtree.compute_quadtree_bit_fields();
+                    serialize_quadtree(bit_field_tree, &args.output)?;
                 }
-            };
-
-            // only serialize the the bit fields
-            let config = bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding();
-            let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-            let file = File::create(ofname).unwrap();
-            let writer = BufWriter::new(file);
-            let mut encoder = GzEncoder::new(writer, Compression::default());
-            let bit_field_tree = qtree.compute_quadtree_bit_fields();
-            let mut d = Data::new();
-
-            let mut collect_data = |n: &BitFieldQuadTree| {
-                if n.encoded_diffs.bytes() > 0 {
-                    d.data.push(n.encoded_diffs.clone());
-                    d.pos.extend_from_slice(&n.positions);
-                }
-            };
-            bit_field_tree.visit(&mut collect_data);
-            info!(
-                "QuadTree Blocks: (non-zero blocks: {})",
-                qtree.non_zero_blocks()
-            );
-            info!("Collected Encoded Diffs : {}", d.data.len());
-            bincode::encode_into_std_write(&d.data, &mut encoder, config).unwrap();
-            bincode::encode_into_std_write(&d.pos, &mut encoder, config).unwrap();
+            }
         }
         Commands::Dump(args) => {
             info!("start dump");

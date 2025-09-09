@@ -7,7 +7,7 @@ use sux::traits::BitFieldSliceMut;
 use tracing::{debug, info, warn};
 use rayon::join;
 //use rayon::scope;
-use sprs::{CsVecBase, CsVecViewI};
+use sprs::CsVecViewI;
 
 // Cost tracking structures for serialization
 #[derive(Clone, Encode, Decode)]
@@ -336,7 +336,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
 /// Returns a `Some(EncodedDiff)` struct representing the encoded differences or `None`
 /// if the slice is empty.
 /// 
-pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
+pub fn encode_subarray<'a>(points: &[Point<'a>]) -> Option<EncodedDiffs> {
     if points.is_empty() {
         debug!("Empty points array in encode_subarray()");
         return None;
@@ -376,6 +376,7 @@ pub fn encode_subarray(points: &[Point]) -> Option<EncodedDiffs> {
         if j == 20000 {
             debug!("j: {}, median: {}", j, median);
         }
+        debug!("j: {}, median: {}", j, median);
         medians.push(median);
     }
 
@@ -462,15 +463,15 @@ pub(crate) enum ArrayData {
 */
 
 #[derive(Clone)]
-pub(crate) struct Point {
+pub(crate) struct Point <'a> {
     pub(crate) x: f64,
     pub(crate) y: f64,
-    pub(crate) data_arc: CsVecBase<&[usize], &[u16], u16>,
+    pub(crate) data_arc: CsVecViewI<'a, u16, usize>,
 }
 
-impl Point {
+impl<'a> Point<'a> {
     #[inline(always)]
-    pub(crate) fn new(x: f64, y: f64, data_arc: CsVecViewI<u16>) -> Self {
+    pub(crate) fn new(x: f64, y: f64, data_arc: CsVecViewI<'a, u16, usize>) -> Self {
         Self { x, y, data_arc }
     }
 
@@ -479,7 +480,7 @@ impl Point {
     }
 }
 
-impl PointLike for Point {
+impl<'a> PointLike for Point<'a> {
     #[inline(always)]
     fn xpos(&self) -> f64 {
         self.x
@@ -854,9 +855,9 @@ impl BitFieldQuadTree {
 }
 
 
-pub(crate) struct QuadTree {
+pub(crate) struct QuadTree<'a> {
     boundary: Rect,
-    points: Vec<Point>,
+    points: Vec<Point<'a>>,
     depth: usize,
     divided: bool,
     //maxerror: Option<f64>,
@@ -868,9 +869,9 @@ pub(crate) struct QuadTree {
     positions: Vec<DatalessPoint>,
 }
 
-impl QuadTree {
+impl<'a> QuadTree<'a> {
     #[inline(always)]
-    pub(crate) fn new(boundary: Rect, points: Vec<Point>, depth: usize) -> Self {
+    pub(crate) fn new(boundary: Rect, points: Vec<Point<'a>>, depth: usize) -> Self {
         Self {
             boundary,
             points,
@@ -887,13 +888,14 @@ impl QuadTree {
         }
     }
 
-    /// Get all expression data for a point
+    /* 
     pub(crate) fn get_all_point_data<'a>(&self, point: &'a Point) -> CsVecViewI<u16> {
         // Since we now store data directly in Point, just return it as a single element
         vec![&point.data_arc]
     }
+    */
 
-    pub(crate) fn query(&self, boundary: &Rect) -> Vec<Point> {
+    pub(crate) fn query(&self, boundary: &Rect) -> Vec<Point<'a>> {
         let mut found_points = Vec::new();
         if !self.boundary.intersects(boundary) {
             return found_points;
