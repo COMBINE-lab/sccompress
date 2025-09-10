@@ -363,7 +363,7 @@ fn read_10x_data<T: AsRef<Path>>(
 }
 
 // Function to build quadtree from CSR matrix and positions
-fn build_quadtree_from_data<'a>(csr: &'a CsMat<u16>, positions: &[(f64, f64)]) -> anyhow::Result<QuadTree<'a>> {
+fn build_quadtree_from_data<'a>(csr: &'a CsMat<u16>, positions: &[(f64, f64)]) -> anyhow::Result<QuadTree> {
     let mut coords = Vec::new();
     let mut xs = Vec::new();
     let mut ys = Vec::new();
@@ -377,10 +377,7 @@ fn build_quadtree_from_data<'a>(csr: &'a CsMat<u16>, positions: &[(f64, f64)]) -
     for (row_idx, &(x_coord, y_coord)) in positions.iter().enumerate() {
         xs.push(x_coord);
         ys.push(y_coord);
-        
-        if let Some(row_view) = csr.outer_view(row_idx) {
-            coords.push(Point::new(x_coord, y_coord, row_view));
-        }
+        coords.push(Point::new(x_coord, y_coord, row_idx));
     }
     
     info!("num_rows: {}", num_cells);
@@ -396,7 +393,7 @@ fn build_quadtree_from_data<'a>(csr: &'a CsMat<u16>, positions: &[(f64, f64)]) -
     let mut qtree = QuadTree::new(domain, coords, 0);
     
     // Divide the quadtree
-    qtree.divide_recursive();
+    qtree.divide_recursive(csr);
     Ok(qtree)
 }
 
@@ -601,7 +598,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     
                     // Build and serialize quadtree immediately while data is in scope
                     let qtree = build_quadtree_from_data(&csr, &positions)?;
-                    let bit_field_tree = qtree.compute_quadtree_bit_fields();
+                    let bit_field_tree = qtree.compute_quadtree_bit_fields(&csr);
                     serialize_quadtree(bit_field_tree, &args.output)?;
                 }
             }
