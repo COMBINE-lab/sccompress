@@ -648,12 +648,7 @@ enum InputDataType {
     Csv,
     H5ad,
    // Mtx,
-    v2,
-}
-
-enum InputFileType {
-    v2,
-    HD,
+   // v2,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -801,8 +796,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?
                 }
                 InputDataType::Csr
-                | InputDataType::H5ad
-                | InputDataType::v2 => {
+                | InputDataType::H5ad => {
                     let file_path_pos = args
                         .input_pos
                         .ok_or_else(|| anyhow::anyhow!("Position file required for HDF5 format"))?;
@@ -818,7 +812,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             InputDataType::Csv => InputDataType::Csv,
                             InputDataType::H5ad => InputDataType::H5ad,
                             //InputDataType::Mtx => InputDataType::Mtx,
-                            InputDataType::v2 => InputDataType::v2,
+                            //InputDataType::v2 => InputDataType::v2,
                         },
                         pos_x_col,
                         pos_y_col,

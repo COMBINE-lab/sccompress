@@ -1,3 +1,5 @@
+
+
 use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
@@ -23,7 +25,7 @@ pub(crate) struct CostStep {
 
 #[derive(Clone, Encode, Decode)]
 pub(crate) struct CostLog {
-    pub steps: Vec<CostStep>,
+    //pub steps: Vec<CostStep>,
     pub total_nodes: usize,
     pub total_cost: usize,
 }
@@ -31,15 +33,15 @@ pub(crate) struct CostLog {
 impl CostLog {
     pub fn new() -> Self {
         Self {
-            steps: Vec::new(),
+            //steps: Vec::new(),
             total_nodes: 0,
             total_cost: 0,
         }
     }
     
-    pub fn add_step(&mut self, step: CostStep) {
-        self.steps.push(step);
-    }
+    //pub fn add_step(&mut self, step: CostStep) {
+    //    self.steps.push(step);
+    //}
     
     pub fn update_totals(&mut self, nodes: usize, cost: usize) {
         self.total_nodes = nodes;
@@ -343,7 +345,9 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
 
     let mut indices = Vec::<u64>::new();
-    let mut medians = Vec::<u16>::new();
+    //let mut medians = Vec::<u16>::new();
+    let mut mean = Vec::<u16>::new();
+    let mut n = 0_u16;
     let mut raw_diffs = Vec::<u32>::new();
     let mut max_diff = 0_i32;
     let num_genes = data.cols() as u32;
@@ -351,32 +355,22 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     debug!("Number of genes: {}", num_genes);
 
     let mut nnz = 0_usize;
-    // we'll make 2 passes, because we want to store the final results in
-    // "cell-major" order (i.e. all values for one cell first, then the next, etc.)
+    // This is calculating mean for each gene with online algorithm
     debug!("points[0].get_data().len(): {}", data.cols());
     for j in 0..data.cols() {
-        // get the non-zero values and the non-zero indices
-        let nz_values: Vec<u16> = points
-            .iter()
-            .filter_map(|p| {
-                p.get_gene_exp(data, j).map(|&val| val)
-            })
-            .collect();
-
-        // nonzero median values
-        let median = if !nz_values.is_empty() {
-            nnz += nz_values.len();
-            let mut sorted_values = nz_values.clone();
-            sorted_values.sort_unstable();
-            sorted_values[sorted_values.len() / 2] //median of the expressed values
-        } else {
-            0
-        };
-        if j == 20000 {
-            debug!("j: {}, median: {}", j, median);
+        let mut mean_j = 0_u16;
+        let mut count_j = 0_u32;
+        for p in points.iter() {
+            if let Some(&val) = p.get_gene_exp(data, j) {
+                count_j += 1;
+                let delta = val as f64 - mean_j as f64;
+                mean_j += (delta / count_j as f64) as u16;
+            }
         }
-       // debug!("j: {}, median: {}", j, median);
-        medians.push(median);
+        mean.push(mean_j as u16);
+        if j == 20000 {
+            debug!("j: {}, mean: {:?}", j, mean);
+        }
     }
 
     let tot = num_genes as usize * points.len();
@@ -391,16 +385,16 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
         let gene_data = gene_exp.get_data(data).unwrap();
         for gene_ind in 0..data.cols() {
             if let Some(&val) = gene_data.get(gene_ind) {
-                if medians[gene_ind] == 0 || val == 0 {
+                if mean[gene_ind] == 0 || val == 0 {
                     continue;
                 } else {
-                    let diff = val as i32 - medians[gene_ind] as i32;
+                    let diff = val as i32 - mean[gene_ind] as i32;
                     let diff = if diff < 0 {
                         (-2_i32 * diff) + 1
                     } else {
                         2_i32 * diff
                     };
-                    assert_eq!(val as i32, decode_v(diff) + medians[gene_ind] as i32);
+                    assert_eq!(val as i32, decode_v(diff) + mean[gene_ind] as i32);
                     raw_diffs.push(diff as u32);
                     let index = index_offset + gene_ind;
                     indices.push(index as u64);
@@ -411,7 +405,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
 
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
-    let medians = BitFieldVec::<usize>::from_slice(&medians).expect("should fit");
+    let medians = BitFieldVec::<usize>::from_slice(&mean).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
     //info!("sparsity : {}", sparsity);
     assert_eq!(indices.len(), diffs.len());
@@ -986,18 +980,18 @@ impl QuadTree {
         }
     */
 
-    //pub(crate) fn divide_recursive(&mut self) -> CostLog {
-    pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
+    pub(crate) fn divide_recursive(&mut self,data: &CsMat<u16>) -> CostLog {
+    //pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
         info!("divide_recursive");
         //let mut stack = vec![self];
-        //let mut cost_log = CostLog::new();
+        let mut cost_log = CostLog::new();
         //let max_depth = 3; 
         //let max_pt: usize = 2000;
          // nothing to do if this subtree is empty
         if self.points.is_empty() {
             //return cost_log;
             info!("points is empty");
-            return;
+            return CostLog::new();
         }
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self
@@ -1083,7 +1077,7 @@ impl QuadTree {
             }
         }
         info!("self.depth: {}", self.depth);
-        //return cost_log;
+        return cost_log;
     }
 
     /* 
