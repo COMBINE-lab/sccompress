@@ -347,7 +347,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     let mut indices = Vec::<u64>::new();
     //let mut medians = Vec::<u16>::new();
     let mut mean = Vec::<u16>::new();
-    let mut n = 0_u16;
+    //let mut n = 0_u16;
     let mut raw_diffs = Vec::<u32>::new();
     let mut max_diff = 0_i32;
     let num_genes = data.cols() as u32;
@@ -356,20 +356,20 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
 
     let mut nnz = 0_usize;
     // This is calculating mean for each gene with online algorithm
-    debug!("points[0].get_data().len(): {}", data.cols());
-    for j in 0..data.cols() {
-        let mut mean_j = 0_u16;
-        let mut count_j = 0_u32;
-        for p in points.iter() {
-            if let Some(&val) = p.get_gene_exp(data, j) {
-                count_j += 1;
-                let delta = val as f64 - mean_j as f64;
-                mean_j += (delta / count_j as f64) as u16;
+    //debug!("points[0].get_data().len(): {}", data.cols());
+    // Initialize mean vector with zeros
+    mean.resize(data.cols(), 0);
+    let mut gene_counts = vec![0u16; data.cols()];
+    
+    // Iterate over each point's sparse row
+    for p in points.iter() {
+        if let Some(row) = data.outer_view(p.ind) {
+            // Iterate only over non-zero entries in this row
+            for (gene_idx, &val) in row.iter() {
+                gene_counts[gene_idx] += 1;
+                let delta = val as f64 - mean[gene_idx] as f64;
+                mean[gene_idx] += (delta / gene_counts[gene_idx] as f64) as u16;
             }
-        }
-        mean.push(mean_j as u16);
-        if j == 20000 {
-            debug!("j: {}, mean: {:?}", j, mean);
         }
     }
 
