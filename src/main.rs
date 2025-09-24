@@ -520,8 +520,8 @@ fn tree_from_10x<T: AsRef<Path>>(
             let reader = SerializedFileReader::new(pos_file).unwrap();
             let mut iter = reader.get_row_iter(None).unwrap();
             while let Some(Ok(parquet_row)) = iter.next() {
-                //println!("parquet_row: {:?}", parquet_row.get_string(0));
                 let bc = parquet_row.get_string(0).unwrap().to_string();
+                //println!("x: {}", pos_x_col);
                 let x = parquet_row.get_double(pos_x_col).unwrap();
                 let y = parquet_row.get_double(pos_y_col).unwrap();
                 pos_map.insert(bc, (x, y));

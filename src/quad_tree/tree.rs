@@ -346,7 +346,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
 
     let mut indices = Vec::<u64>::new();
     //let mut medians = Vec::<u16>::new();
-    let mut mean = Vec::<u16>::new();
+    let mut mean = vec![0_f64; data.cols()];
     //let mut n = 0_u16;
     let mut raw_diffs = Vec::<u32>::new();
     let mut max_diff = 0_i32;
@@ -358,17 +358,19 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     // This is calculating mean for each gene with online algorithm
     //debug!("points[0].get_data().len(): {}", data.cols());
     // Initialize mean vector with zeros
-    mean.resize(data.cols(), 0);
+    //mean.resize(data.cols(), 0);
     let mut gene_counts = vec![0u16; data.cols()];
     
     // Iterate over each point's sparse row
     for p in points.iter() {
-        if let Some(row) = data.outer_view(p.ind) {
+        // outer_iterator(): Processes ALL 100,000+ rows in the matrix, outer_view(p.ind): Only processes the ~500 rows you actually need
+        if let Some(row) = p.get_data(data) {
             // Iterate only over non-zero entries in this row
             for (gene_idx, &val) in row.iter() {
+                nnz += 1;  
                 gene_counts[gene_idx] += 1;
                 let delta = val as f64 - mean[gene_idx] as f64;
-                mean[gene_idx] += (delta / gene_counts[gene_idx] as f64) as u16;
+                mean[gene_idx] += delta / gene_counts[gene_idx] as f64;
             }
         }
     }
@@ -376,36 +378,39 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     let tot = num_genes as usize * points.len();
     let sparsity = (nnz as f64) / (tot as f64);
     debug!("sparsity: {}", sparsity);
+    let mut mean_u16 = vec![0_u16; data.cols()];
 
     // for each cell
-    for (cell_ind, gene_exp) in points.iter().enumerate() {
+    for (cell_ind, p) in points.iter().enumerate() {
         let index_offset = cell_ind * num_genes as usize;
         // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
-        let gene_data = gene_exp.get_data(data).unwrap();
-        for gene_ind in 0..data.cols() {
-            if let Some(&val) = gene_data.get(gene_ind) {
-                if mean[gene_ind] == 0 || val == 0 {
+        let row = p.get_data(data).unwrap();
+        for (gene_idx, &val) in row.iter() {
+            //if let Some(&val) = gene_data.get(gene_ind) {
+                if mean[gene_idx] == 0.0 || val == 0 {
                     continue;
                 } else {
-                    let diff = val as i32 - mean[gene_ind] as i32;
+                    mean_u16[gene_idx] = mean[gene_idx].floor() as u16;
+                    let diff = val as i32 - mean_u16[gene_idx] as i32;
                     let diff = if diff < 0 {
                         (-2_i32 * diff) + 1
                     } else {
                         2_i32 * diff
                     };
-                    assert_eq!(val as i32, decode_v(diff) + mean[gene_ind] as i32);
+                    assert_eq!(val as i32, decode_v(diff) + mean_u16[gene_idx] as i32);
                     raw_diffs.push(diff as u32);
-                    let index = index_offset + gene_ind;
+                    let index = index_offset + gene_idx;
+                    debug!("index: {}, gene_idx: {}, index_offset: {}", index, gene_idx, index_offset);
                     indices.push(index as u64);
                     max_diff = max_diff.max(diff);
                 }
-            }
+            //}
         }
     }
 
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
-    let medians = BitFieldVec::<usize>::from_slice(&mean).expect("should fit");
+    let medians = BitFieldVec::<usize>::from_slice(&mean_u16).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
     //info!("sparsity : {}", sparsity);
     assert_eq!(indices.len(), diffs.len());
@@ -418,9 +423,25 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     };
 
     // validate!
-    for (recon_vec, orig_vec) in enc_diffs.expression_vec_iter().zip(points.iter()) {
-        let orig_data = orig_vec.get_data(data);
-        assert_eq!(recon_vec, orig_data.unwrap().to_dense().to_vec());
+    for (cell_idx, (recon_vec, orig_vec)) in enc_diffs.expression_vec_iter().zip(points.iter()).enumerate() {
+        let orig_data = orig_vec.get_data(data).unwrap().to_dense().to_vec();
+        
+        // Find differences instead of asserting equality
+        let differences: Vec<(usize, u16, u16)> = recon_vec.iter()
+            .zip(orig_data.iter())
+            .enumerate()
+            .filter(|(_, (&r, &o))| r != o)
+            .map(|(gene_idx, (&r, &o))| (gene_idx, r, o))
+            .collect();
+        
+        if !differences.is_empty() {
+            debug!("Cell {}: {} differences found", cell_idx, differences.len());
+            debug!("First 5 differences (gene_idx, reconstructed, original): {:?}", 
+                   &differences[..differences.len().min(5)]);
+            
+            // Optionally still panic if you want to stop on first error
+            panic!("Reconstruction validation failed for cell {}", cell_idx);
+        }
     }
 /* 
     info!(
@@ -986,7 +1007,7 @@ impl QuadTree {
         //let mut stack = vec![self];
         let mut cost_log = CostLog::new();
         //let max_depth = 3; 
-        //let max_pt: usize = 2000;
+        let max_pt: usize = 5;
          // nothing to do if this subtree is empty
         if self.points.is_empty() {
             //return cost_log;
