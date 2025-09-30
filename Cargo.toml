@@ -21,3 +21,11 @@ hdf5 = { package = "hdf5-metno", version = "0.10.1" }
 sprs = "0.11"
 rayon = "1.11.0"
 mimalloc = "0.1.48"
+
+[[bin]]
+name = "quadtree"
+path = "src/main.rs"
+
+[[bin]]
+name = "costlog"
+path = "src/costlog.rs"

@@ -11,43 +11,7 @@ use rayon::join;
 //use rayon::scope;
 use sprs::{CsMat, CsVecViewI};
 
-// Cost tracking structures for serialization
-#[derive(Clone, Encode, Decode)]
-pub(crate) struct CostStep {
-    pub depth: usize,
-    pub points_count: usize,
-    pub current_cost: usize,
-    pub children_cost: usize,
-    pub optimal_cost: usize,
-    pub decision: String,  // "merge" or "divide"
-    pub node_id: String,   // e.g., "root", "nw", "ne", "se", "sw"
-}
 
-#[derive(Clone, Encode, Decode)]
-pub(crate) struct CostLog {
-    //pub steps: Vec<CostStep>,
-    pub total_nodes: usize,
-    pub total_cost: usize,
-}
-
-impl CostLog {
-    pub fn new() -> Self {
-        Self {
-            //steps: Vec::new(),
-            total_nodes: 0,
-            total_cost: 0,
-        }
-    }
-    
-    //pub fn add_step(&mut self, step: CostStep) {
-    //    self.steps.push(step);
-    //}
-    
-    pub fn update_totals(&mut self, nodes: usize, cost: usize) {
-        self.total_nodes = nodes;
-        self.total_cost = cost;
-    }
-}
 
 #[derive(Clone)]
 pub(crate) struct EncodedDiffs {
@@ -345,7 +309,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
 
     let mut indices = Vec::<u64>::new();
-    //let mut medians = Vec::<u16>::new();
+    //let mut meadians = Vec::<u16>::new();
     let mut mean = vec![0_f64; data.cols()];
     //let mut n = 0_u16;
     let mut raw_diffs = Vec::<u32>::new();
@@ -361,11 +325,12 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     //mean.resize(data.cols(), 0);
     let mut gene_counts = vec![0u16; data.cols()];
     
-    // Iterate over each point's sparse row
+    // Calculating gene means for each gene because we suppose that mean for each genes in the near cells are the similar in gene expression
+    // Iterate over each cell, calculating the mean for each gene
     for p in points.iter() {
-        // outer_iterator(): Processes ALL 100,000+ rows in the matrix, outer_view(p.ind): Only processes the ~500 rows you actually need
+        // outer_iterator(): Processes ALL 100,000+ rows in the matrix, outer_view(p.ind): Only processes the ~500 rows actually need
         if let Some(row) = p.get_data(data) {
-            // Iterate only over non-zero entries in this row
+            // Iterate only over non-zero entries in this row and update the mean for each gene
             for (gene_idx, &val) in row.iter() {
                 nnz += 1;  
                 gene_counts[gene_idx] += 1;
@@ -374,35 +339,78 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             }
         }
     }
+    
+/* 
+    for j in 0..data.cols() {
+        // get the non-zero values and the non-zero indices
+        let nz_values: Vec<u16> = points
+            .iter()
+            .filter_map(|p| {
+                p.get_gene_exp(data, j).map(|&val| val)
+            })
+            .collect();
 
+        // nonzero median values
+        let median = if !nz_values.is_empty() {
+            nnz += nz_values.len();
+            let mut sorted_values = nz_values.clone();
+            sorted_values.sort_unstable();
+            sorted_values[sorted_values.len() / 2] //median of the expressed values
+        } else {
+            0
+        };
+        if j == 20000 {
+            debug!("j: {}, median: {}", j, median);
+        }
+       // debug!("j: {}, median: {}", j, median);
+        medians.push(median);
+    }
+    */
     let tot = num_genes as usize * points.len();
     let sparsity = (nnz as f64) / (tot as f64);
-    debug!("sparsity: {}", sparsity);
+    if sparsity > 0.75{
+        println!("sparsity: {}", sparsity);
+    } 
     let mut mean_u16 = vec![0_u16; data.cols()];
 
     // for each cell
+    //for (gene_idx, &val) in row.iter() {
+        
     for (cell_ind, p) in points.iter().enumerate() {
         let index_offset = cell_ind * num_genes as usize;
         // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
         let row = p.get_data(data).unwrap();
         for (gene_idx, &val) in row.iter() {
-            //if let Some(&val) = gene_data.get(gene_ind) {
-                if mean[gene_idx] == 0.0 || val == 0 {
-                    continue;
+            let mean_val = mean[gene_idx].max(0.0).min(65535.0) as u16;
+            
+            // Debug: log what we're skipping
+            //if gene_idx == 2326 && (mean_val == 0 || val == 0) {
+              //  debug!("Cell {}, Gene 2326: mean={}, val={} - SKIPPING", cell_ind, mean_val, val);
+            //}
+            
+            // Only skip if BOTH are zero
+            if mean_val == 0 && val == 0 {
+                continue;
+            } else {
+                mean_u16[gene_idx] = mean_val;
+                let diff = val as i32 - mean_val as i32;
+                let diff = if diff < 0 {
+                    (-2_i32 * diff) + 1
                 } else {
-                    mean_u16[gene_idx] = mean[gene_idx].floor() as u16;
-                    let diff = val as i32 - mean_u16[gene_idx] as i32;
-                    let diff = if diff < 0 {
-                        (-2_i32 * diff) + 1
-                    } else {
-                        2_i32 * diff
-                    };
-                    assert_eq!(val as i32, decode_v(diff) + mean_u16[gene_idx] as i32);
-                    raw_diffs.push(diff as u32);
-                    let index = index_offset + gene_idx;
-                    debug!("index: {}, gene_idx: {}, index_offset: {}", index, gene_idx, index_offset);
-                    indices.push(index as u64);
+                    2_i32 * diff
+                };
+                
+                // Debug: log encoding for gene 2326
+               // if gene_idx == 2326 {
+                 //   debug!("Cell {}, Gene 2326: ENCODING val={}, mean={}, diff={}, index={}", 
+                   //        cell_ind, val, mean_val, diff, index_offset + gene_idx);
+                //}
+                
+                assert_eq!(val as i32, decode_v(diff) + mean_u16[gene_idx] as i32);
+                raw_diffs.push(diff as u32);
+                let index = index_offset + gene_idx;
+                indices.push(index as u64);
                     max_diff = max_diff.max(diff);
                 }
             //}
@@ -435,8 +443,8 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             .collect();
         
         if !differences.is_empty() {
-            debug!("Cell {}: {} differences found", cell_idx, differences.len());
-            debug!("First 5 differences (gene_idx, reconstructed, original): {:?}", 
+            info!("Cell {}: {} differences found", cell_idx, differences[0].0);
+            info!("First 5 differences (gene_idx, reconstructed, original): {:?}", 
                    &differences[..differences.len().min(5)]);
             
             // Optionally still panic if you want to stop on first error
