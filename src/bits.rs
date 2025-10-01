@@ -53,6 +53,7 @@ impl HybridSparseVec {
             for i in inds {
                 v.set_bit(*i as usize);
             }
+            assert_eq!(v.count_bit_ones(), inds.len());
             Self::Bit(v)
         }
     }

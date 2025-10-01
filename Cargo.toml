@@ -26,6 +26,6 @@ mimalloc = "0.1.48"
 name = "quadtree"
 path = "src/main.rs"
 
-[[bin]]
-name = "costlog"
-path = "src/costlog.rs"
+#[[bin]]
+#name = "costlog"
+#path = "src/costlog.rs"

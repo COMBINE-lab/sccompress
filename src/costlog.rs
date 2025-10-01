@@ -411,6 +411,7 @@ impl Data {
     }
 }
 
+/*
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -533,4 +534,4 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-}
+*/
