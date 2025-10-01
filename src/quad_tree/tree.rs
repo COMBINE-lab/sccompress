@@ -155,12 +155,18 @@ impl EncodedDiffs {
                 let start_cur = indices.0.geq_cursor(first_idx as u64);
                 // the first value in our sparse list that is >= last_idx
                 let stop_cur = indices.0.geq_cursor(last_idx as u64);
+                /*println!(
+                    "first_idx = {first_idx}, last_idx = {last_idx}, start_cur = {:?}, stop_cur = {:?}",
+                    start_cur.index(),
+                    stop_cur.index()
+                );*/
 
                 // if the first value is >= last_idx, then there are no
                 // non-zeros stored for this gene
                 if !start_cur.is_valid() || start_cur.value().unwrap_or(u64::MAX) >= last_idx as u64
                 {
-                    warn!("no values stored for cell {}", cell_ind);
+                    //warn!("no values stored for cell {}", cell_ind);
+                    //warn!("start_cur.value() =  {:?}", start_cur.value());
                     return vec![0_u16; self.num_genes()];
                 }
 
@@ -194,6 +200,7 @@ impl EncodedDiffs {
                     } else {
                         let ddiff = decode_v(next_diff as i32);
                         let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                        //println!("pushing {decoded_val} at index {gidx}");
                         expression.push(decoded_val);
                         if nz_ind_iter.advance() {
                             next_nz_ind =
@@ -349,7 +356,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     //debug!("points[0].get_data().len(): {}", data.cols());
     // Initialize mean vector with zeros
     //mean.resize(data.cols(), 0);
-    let mut gene_counts = vec![0u16; data.cols()];
+    let mut gene_counts = vec![0u32; data.cols()];
 
     // Calculating gene means for each gene because we suppose that mean for each genes in the near cells are the similar in gene expression
     // Iterate over each cell, calculating the mean for each gene
@@ -360,8 +367,8 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             for (gene_idx, &val) in row.iter() {
                 nnz += 1;
                 gene_counts[gene_idx] += 1;
-                let delta = val as f64 - mean[gene_idx] as f64;
-                mean[gene_idx] += delta / gene_counts[gene_idx] as f64;
+                //let delta = val as f64 - mean[gene_idx] as f64;
+                mean[gene_idx] += val as f64; //delta / gene_counts[gene_idx] as f64;
             }
         }
     }
@@ -407,15 +414,17 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
         // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
         let row = p.get_data(data).unwrap();
+        let mut recorded_values_for_cell = 0;
         for (gene_idx, &val) in row.iter() {
             let raw_mean = mean[gene_idx];
-            let mean_val = mean[gene_idx].max(0.0).min(65535.0) as u16;
+            let mean_val =
+                (mean[gene_idx] / (gene_counts[gene_idx] as f64)).clamp(0.0, 65535.0) as u16;
 
             // Debug: log what we're skipping
             //if gene_idx == 2326 && (mean_val == 0 || val == 0) {
             //  debug!("Cell {}, Gene 2326: mean={}, val={} - SKIPPING", cell_ind, mean_val, val);
             //}
-
+            // ENCODING val=1, mean=20, diff=39, index=11900257856
             // no observation for this gene
             if raw_mean == 0. || val == 0 {
                 continue;
@@ -429,10 +438,18 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
                 };
 
                 // Debug: log encoding for gene 2326
-                // if gene_idx == 2326 {
-                //   debug!("Cell {}, Gene 2326: ENCODING val={}, mean={}, diff={}, index={}",
-                //        cell_ind, val, mean_val, diff, index_offset + gene_idx);
-                //}
+                /*
+                if gene_idx == 2326 {
+                    info!(
+                        "Cell {}, Gene 2326: ENCODING val={}, mean={}, diff={}, index={}",
+                        cell_ind,
+                        val,
+                        mean_val,
+                        diff,
+                        index_offset + gene_idx
+                    );
+                }
+                */
 
                 assert_eq!(
                     val as u16,
@@ -442,6 +459,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
                 let index = index_offset + gene_idx;
                 indices.push(index as u64);
                 max_diff = max_diff.max(diff);
+                recorded_values_for_cell += 1;
             }
             //}
         }
@@ -481,7 +499,22 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             info!("recon_vec: {:?}", recon_vec);
             info!("differences: {:?}", differences);
             // Optionally still panic if you want to stop on first error
-            assert_eq!(recon_vec, orig_data.to_vec());
+            // assert_eq!(recon_vec, orig_data.to_vec());
+            /*
+            use std::io::Write;
+            let f = std::fs::File::create("bad_cells.coo").expect("Should be able to create file");
+            let mut f = std::io::BufWriter::new(f);
+            writeln!(f, "%%MatrixMarket matrix coordinate real general");
+            writeln!(f, "{}\t{}\t{}", points.len(), num_genes, nnz);
+            for (cell_ind, p) in points.iter().enumerate() {
+                let index_offset = cell_ind * num_genes as usize;
+                let row = p.get_data(data).unwrap();
+                for (gene_idx, &val) in row.iter() {
+                    writeln!(f, "{}\t{}\t{}", cell_ind + 1, gene_idx + 1, val);
+                }
+            }
+            */
+            panic!("Failed to reconstruct!");
         }
         //dump this problematic cell to a file
         //unit test for encode/decode
@@ -1574,5 +1607,27 @@ impl QuadTree {
             node.positions = self.positions.clone();
         }
         node
+    }
+}
+
+#[cfg(test)]
+mod tests {
+
+    use super::*;
+
+    #[test]
+    fn encode_failing_vec() {
+        let matrix = sprs::io::read_matrix_market::<i32, usize, _>("bad_cells.coo").unwrap();
+        let mut matrix_new: sprs::TriMatBase<Vec<usize>, Vec<u16>> =
+            sprs::TriMatBase::new(matrix.shape());
+        for v in matrix.triplet_iter() {
+            matrix_new.add_triplet(v.1 .0, v.1 .1, *v.0 as u16);
+        }
+        let csr = matrix_new.to_csr();
+        let mut points = Vec::<Point>::new();
+        for i in 0..csr.rows() {
+            points.push(Point::new(0., 0., i));
+        }
+        encode_subarray(&points, &csr);
     }
 }
