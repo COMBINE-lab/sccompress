@@ -349,14 +349,14 @@ fn tree_from_csv<T: AsRef<Path>>(
     //info!("Total nodes processed: {}", division_cost_log.total_nodes);
     //info!("Total cost: {}", division_cost_log.total_cost);
 
-    // Serialize division cost log to file
-    //    let division_cost_log_filename = PathBuf::from("division_costs.bin");
-    //    let cost_config = bincode::config::standard()
-    //        .with_little_endian()
-    //        .with_fixed_int_encoding();
-    //    let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    //    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-    //    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
+    //Serialize division cost log to file
+        let division_cost_log_filename = PathBuf::from("division_costs.bin");
+        let cost_config = bincode::config::standard()
+            .with_little_endian()
+            .with_fixed_int_encoding();
+        let mut division_cost_file = File::create(&division_cost_log_filename)?;
+        bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
+        info!("Division cost log serialized to: {}", division_cost_log_filename.display());
 
     /*   // Optimize the quadtree and get cost log
     let optimization_cost_log = qtree.optimize_quadtree();
@@ -592,10 +592,6 @@ fn tree_from_10x<T: AsRef<Path>>(
 
     // Divide the quadtree and get cost log
     let division_cost_log = qtree.divide_recursive(&csr);
-    /*
-    info!("Division cost log contains {} steps", division_cost_log.steps.len());
-    info!("Total nodes processed: {}", division_cost_log.total_nodes);
-    info!("Total cost: {}", division_cost_log.total_cost);
 
     // Serialize division cost log to file
     let division_cost_log_filename = PathBuf::from("division_costs.bin");
@@ -605,11 +601,11 @@ fn tree_from_10x<T: AsRef<Path>>(
     let mut division_cost_file = File::create(&division_cost_log_filename)?;
     bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
     info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-
+/* 
     // Optimize the quadtree and get cost log
-    let optimization_cost_log = qtree.optimize_quadtree();
-    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
-    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
+   // let optimization_cost_log = qtree.optimize_quadtree();
+    //info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
+    //info!("Optimization total cost: {}", optimization_cost_log.total_cost);
 
     // Serialize optimization cost log to file
     let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");

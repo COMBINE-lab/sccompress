@@ -1,5 +1,3 @@
-
-
 use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
@@ -11,7 +9,18 @@ use rayon::join;
 //use rayon::scope;
 use sprs::{CsMat, CsVecViewI};
 
+// Cost tracking structure
+#[derive(Clone, Encode, Decode)]
+pub(crate) struct CostLog {
+    pub total_nodes: usize,
+    pub total_cost: usize,
+}
 
+impl CostLog {
+    pub fn new() -> Self {
+        Self { total_nodes: 0, total_cost: 0 }
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct EncodedDiffs {
@@ -389,8 +398,8 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
               //  debug!("Cell {}, Gene 2326: mean={}, val={} - SKIPPING", cell_ind, mean_val, val);
             //}
             
-            // Only skip if BOTH are zero
-            if mean_val == 0 && val == 0 {
+            // no observation for this gene
+            if mean_val == 0 || val == 0 {
                 continue;
             } else {
                 mean_u16[gene_idx] = mean_val;
@@ -433,7 +442,6 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     // validate!
     for (cell_idx, (recon_vec, orig_vec)) in enc_diffs.expression_vec_iter().zip(points.iter()).enumerate() {
         let orig_data = orig_vec.get_data(data).unwrap().to_dense().to_vec();
-        
         // Find differences instead of asserting equality
         let differences: Vec<(usize, u16, u16)> = recon_vec.iter()
             .zip(orig_data.iter())
@@ -443,13 +451,13 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             .collect();
         
         if !differences.is_empty() {
-            info!("Cell {}: {} differences found", cell_idx, differences[0].0);
-            info!("First 5 differences (gene_idx, reconstructed, original): {:?}", 
-                   &differences[..differences.len().min(5)]);
-            
+            info!("orig_data: {:?}", orig_data);
+            info!("recon_vec: {:?}", recon_vec);
             // Optionally still panic if you want to stop on first error
-            panic!("Reconstruction validation failed for cell {}", cell_idx);
+            assert_eq!(recon_vec, orig_data.to_vec());
         }
+        //dump this problematic cell to a file
+        //unit test for encode/decode 
     }
 /* 
     info!(
@@ -1010,104 +1018,105 @@ impl QuadTree {
     */
 
     pub(crate) fn divide_recursive(&mut self,data: &CsMat<u16>) -> CostLog {
-    //pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
-        info!("divide_recursive");
-        //let mut stack = vec![self];
-        let mut cost_log = CostLog::new();
-        //let max_depth = 3; 
-        let max_pt: usize = 5;
-         // nothing to do if this subtree is empty
-        if self.points.is_empty() {
-            //return cost_log;
-            info!("points is empty");
-            return CostLog::new();
+        //pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
+            info!("divide_recursive");
+            //let mut stack = vec![self];
+            let mut cost_log = CostLog::new();
+            //let max_depth = 3; 
+            let max_pt: usize = 5;
+             // nothing to do if this subtree is empty
+            if self.points.is_empty() {
+                //return cost_log;
+                info!("points is empty");
+                return CostLog::new();
+            }
+            // Store the current points' positions before clearing them
+            let positions: Vec<DatalessPoint> = self
+                .points
+                .iter()
+                .map(|p| DatalessPoint::new(p.x, p.y))
+                .collect();
+            // Compute the expense of encoding the current block
+            let current_expense = encode_subarray(&self.points, data).map_or(0, |x| x.bytes());
+            info!(
+                "expense of current block consisting of {} points is {}",
+                self.points.len(),
+                current_expense
+            );
+    
+            // Find the children of the current node
+            let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&self.boundary);
+            let nw_points = self.query(&nw_boundary);
+            let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
+    
+            let ne_points = self.query(&ne_boundary);
+            let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
+    
+            let se_points = self.query(&se_boundary);
+            let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
+    
+            let sw_points = self.query(&sw_boundary);
+            let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
+    
+            // make sure we're not losing any points
+            assert_eq!(
+                nw.points.len() + ne.points.len() + se.points.len() + sw.points.len(),
+                self.points.len()
+            );
+    
+            // Convert children to BitFieldQuadTree to calculate their expenses
+            let nw_expense = encode_subarray(&nw.points, data).map_or(0, |x| x.bytes());
+            let ne_expense = encode_subarray(&ne.points, data).map_or(0, |x| x.bytes());
+            let se_expense = encode_subarray(&se.points, data).map_or(0, |x| x.bytes());
+            let sw_expense = encode_subarray(&sw.points, data).map_or(0, |x| x.bytes());
+    
+            info!("NW expense: {}", nw_expense);
+            info!("NE expense: {}", ne_expense);
+            info!("SE expense: {}", se_expense);
+            info!("SW expense: {}", sw_expense);
+    
+            let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
+            info!("total_expense: {}", total_expense);
+    
+            //if self.points.len() > 1 {
+            if total_expense < current_expense {
+                self.divided = true;
+                // Convert BitFieldQuadTree back to QuadTree and assign children
+                self.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
+                self.ne = (!ne.points.is_empty()).then_some(Box::new(ne));
+                self.se = (!se.points.is_empty()).then_some(Box::new(se));
+                self.sw = (!sw.points.is_empty()).then_some(Box::new(sw));
+    
+                // Only clear points after we've used them for all necessary operations
+                self.points.clear();
+    
+                if let Some(ref mut nw) = self.nw {
+                    nw.divide_recursive(data);
+                }
+                if let Some(ref mut ne) = self.ne {
+                    ne.divide_recursive(data);
+                }
+                if let Some(ref mut se) = self.se {
+                    se.divide_recursive(data);
+                }
+                if let Some(ref mut sw) = self.sw {
+                    sw.divide_recursive(data);
+                }
+            } else {
+                self.divided = false;
+                if !self.points.is_empty() {
+                    info!(
+                        "Leaf node - points: {}, genes: {}",
+                        self.points.len(),
+                        data.cols()
+                    );
+                    self.positions = positions; // Use the stored positions
+                                                // Keep the points for bit field representation
+                }
+            }
+            info!("self.depth: {}", self.depth);
+            return cost_log;
         }
-        // Store the current points' positions before clearing them
-        let positions: Vec<DatalessPoint> = self
-            .points
-            .iter()
-            .map(|p| DatalessPoint::new(p.x, p.y))
-            .collect();
-        // Compute the expense of encoding the current block
-        let current_expense = encode_subarray(&self.points, data).map_or(0, |x| x.bytes());
-        info!(
-            "expense of current block consisting of {} points is {}",
-            self.points.len(),
-            current_expense
-        );
-
-        // Find the children of the current node
-        let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&self.boundary);
-        let nw_points = self.query(&nw_boundary);
-        let nw = QuadTree::new(nw_boundary, nw_points, self.depth + 1);
-
-        let ne_points = self.query(&ne_boundary);
-        let ne = QuadTree::new(ne_boundary, ne_points, self.depth + 1);
-
-        let se_points = self.query(&se_boundary);
-        let se = QuadTree::new(se_boundary, se_points, self.depth + 1);
-
-        let sw_points = self.query(&sw_boundary);
-        let sw = QuadTree::new(sw_boundary, sw_points, self.depth + 1);
-
-        // make sure we're not losing any points
-        assert_eq!(
-            nw.points.len() + ne.points.len() + se.points.len() + sw.points.len(),
-            self.points.len()
-        );
-
-        // Convert children to BitFieldQuadTree to calculate their expenses
-        let nw_expense = encode_subarray(&nw.points, data).map_or(0, |x| x.bytes());
-        let ne_expense = encode_subarray(&ne.points, data).map_or(0, |x| x.bytes());
-        let se_expense = encode_subarray(&se.points, data).map_or(0, |x| x.bytes());
-        let sw_expense = encode_subarray(&sw.points, data).map_or(0, |x| x.bytes());
-
-        info!("NW expense: {}", nw_expense);
-        info!("NE expense: {}", ne_expense);
-        info!("SE expense: {}", se_expense);
-        info!("SW expense: {}", sw_expense);
-
-        let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
-        info!("total_expense: {}", total_expense);
-
-        if total_expense < current_expense {
-            self.divided = true;
-            // Convert BitFieldQuadTree back to QuadTree and assign children
-            self.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
-            self.ne = (!ne.points.is_empty()).then_some(Box::new(ne));
-            self.se = (!se.points.is_empty()).then_some(Box::new(se));
-            self.sw = (!sw.points.is_empty()).then_some(Box::new(sw));
-
-            // Only clear points after we've used them for all necessary operations
-            self.points.clear();
-
-            if let Some(ref mut nw) = self.nw {
-                nw.divide_recursive(data);
-            }
-            if let Some(ref mut ne) = self.ne {
-                ne.divide_recursive(data);
-            }
-            if let Some(ref mut se) = self.se {
-                se.divide_recursive(data);
-            }
-            if let Some(ref mut sw) = self.sw {
-                sw.divide_recursive(data);
-            }
-        } else {
-            self.divided = false;
-            if !self.points.is_empty() {
-                info!(
-                    "Leaf node - points: {}, genes: {}",
-                    self.points.len(),
-                    data.cols()
-                );
-                self.positions = positions; // Use the stored positions
-                                            // Keep the points for bit field representation
-            }
-        }
-        info!("self.depth: {}", self.depth);
-        return cost_log;
-    }
 
     /* 
 //    pub(crate) fn divide(&mut self) -> CostLog {
