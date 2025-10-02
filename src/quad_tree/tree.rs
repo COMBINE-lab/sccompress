@@ -5,7 +5,7 @@ use rayon::join;
 use sux::prelude::{BitFieldSlice, BitFieldVec};
 use sux::traits::BitFieldSliceCore;
 use sux::traits::BitFieldSliceMut;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 //use rayon::scope;
 use sprs::{CsMat, CsVecViewI};
 
@@ -140,7 +140,7 @@ impl EncodedDiffs {
     fn expression_vec_ef(&self, cell_ind: usize, _num_ones: &mut usize) -> Vec<u16> {
         match &self.indices {
             HybridSparseVec::EF(indices) => {
-                if !self.precheck_cells(cell_ind) {
+                if !self.precheck_cells(cell_ind) || self.diffs.is_empty() {
                     return vec![0_u16; self.num_genes()];
                 }
 
@@ -151,67 +151,85 @@ impl EncodedDiffs {
                 // should end
                 let last_idx = first_idx + self.num_genes();
 
-                // the first value in our sparse list that is >= first_idx
-                let start_cur = indices.0.geq_cursor(first_idx as u64);
-                // the first value in our sparse list that is >= last_idx
-                let stop_cur = indices.0.geq_cursor(last_idx as u64);
-                /*println!(
-                    "first_idx = {first_idx}, last_idx = {last_idx}, start_cur = {:?}, stop_cur = {:?}",
-                    start_cur.index(),
-                    stop_cur.index()
-                );*/
-
-                // if the first value is >= last_idx, then there are no
-                // non-zeros stored for this gene
-                if !start_cur.is_valid() || start_cur.value().unwrap_or(u64::MAX) >= last_idx as u64
+                // we checked that self.diffs is not empty above, so the len must be
+                // at least 1. Get a cursor to the last element
+                if let Some(last_stored_cursor) =
+                    unsafe { indices.0.cursor_at(self.diffs.len() - 1) }
                 {
-                    //warn!("no values stored for cell {}", cell_ind);
-                    //warn!("start_cur.value() =  {:?}", start_cur.value());
-                    return vec![0_u16; self.num_genes()];
-                }
+                    // the index stored at the last position
+                    let last_stored_index = last_stored_cursor.value().unwrap();
+                    // the cseq API seems to have a problem if you ask for geq_cursor
+                    // past the last stored element, so don't even try to do that
+                    if first_idx > last_stored_index as usize {
+                        return vec![0_u16; self.num_genes()];
+                    }
 
-                let start = start_cur.index();
+                    // the first value in our sparse list that is >= first_idx
+                    let start_cur = indices.0.geq_cursor(first_idx as u64);
+                    // the first value in our sparse list that is >= last_idx
+                    let stop_cur = indices.0.geq_cursor(last_idx as u64);
 
-                let stop = if !stop_cur.is_valid() {
-                    self.diffs.len()
-                } else {
-                    stop_cur.index()
-                };
+                    // if the first value is >= last_idx, then there are no
+                    // non-zeros stored for this gene
+                    if !start_cur.is_valid()
+                        || start_cur.value().unwrap_or(u64::MAX) >= last_idx as u64
+                    {
+                        //warn!("no values stored for cell {}", cell_ind);
+                        //warn!("start_cur.value() =  {:?}", start_cur.value());
+                        return vec![0_u16; self.num_genes()];
+                    }
 
-                if start >= last_idx {
-                    warn!("SHOULD NOT HAPPEN!");
-                }
+                    let start = start_cur.index();
 
-                let n = stop - start;
-
-                if n == 0 {
-                    return vec![0_u16; self.num_genes()];
-                }
-
-                let mut diff_iter = self.diffs.iter_from(start);
-                let mut nz_ind_iter = start_cur.clone();
-
-                let mut expression = Vec::with_capacity(self.num_genes());
-                let mut next_diff = diff_iter.next().expect("at least one");
-                let mut next_nz_ind = nz_ind_iter.value().expect("at least one") - first_idx as u64;
-                for gidx in 0..self.num_genes() {
-                    if gidx < next_nz_ind as usize {
-                        expression.push(0);
+                    let stop = if !stop_cur.is_valid() || cell_ind == self.num_cells() - 1 {
+                        self.diffs.len()
                     } else {
-                        let ddiff = decode_v(next_diff as i32);
-                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
-                        //println!("pushing {decoded_val} at index {gidx}");
-                        expression.push(decoded_val);
-                        if nz_ind_iter.advance() {
-                            next_nz_ind =
-                                nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
-                            next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                        stop_cur.index()
+                    };
+                    if start >= last_idx {
+                        warn!("SHOULD NOT HAPPEN!");
+                    }
+                    if start >= stop {
+                        error!(
+                            "start = {start}, but stop = {stop}, diffs len = {}",
+                            self.diffs.len()
+                        );
+                    }
+
+                    let n = stop - start;
+
+                    if n == 0 {
+                        return vec![0_u16; self.num_genes()];
+                    }
+
+                    let mut diff_iter = self.diffs.iter_from(start);
+                    let mut nz_ind_iter = start_cur.clone();
+
+                    let mut expression = Vec::with_capacity(self.num_genes());
+                    let mut next_diff = diff_iter.next().expect("at least one");
+                    let mut next_nz_ind =
+                        nz_ind_iter.value().expect("at least one") - first_idx as u64;
+                    for gidx in 0..self.num_genes() {
+                        if gidx < next_nz_ind as usize {
+                            expression.push(0);
                         } else {
-                            next_nz_ind = self.num_genes() as u64 + 1;
+                            let ddiff = decode_v(next_diff as i32);
+                            let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                            //println!("pushing {decoded_val} at index {gidx}");
+                            expression.push(decoded_val);
+                            if nz_ind_iter.advance() {
+                                next_nz_ind =
+                                    nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
+                                next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                            } else {
+                                next_nz_ind = self.num_genes() as u64 + 1;
+                            }
                         }
                     }
+                    expression
+                } else {
+                    vec![0_u16; self.num_genes()]
                 }
-                expression
             }
             _ => unimplemented!(),
         }
@@ -406,6 +424,14 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
     let mut mean_u16 = vec![0_u16; data.cols()];
 
+    for gene_idx in 0..data.cols() {
+        let mean_val = if gene_counts[gene_idx] > 0 {
+            (mean[gene_idx] / (gene_counts[gene_idx] as f64)).clamp(0.0, 65535.0) as u16
+        } else {
+            0_u16
+        };
+        mean_u16[gene_idx] = mean_val;
+    }
     // for each cell
     //for (gene_idx, &val) in row.iter() {
 
@@ -413,55 +439,34 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
         let index_offset = cell_ind * num_genes as usize;
         // cell_indices.push(gene_indices.len() as u32);
         // for each gene in this cell
-        let row = p.get_data(data).unwrap();
-        let mut recorded_values_for_cell = 0;
-        for (gene_idx, &val) in row.iter() {
-            let raw_mean = mean[gene_idx];
-            let mean_val =
-                (mean[gene_idx] / (gene_counts[gene_idx] as f64)).clamp(0.0, 65535.0) as u16;
+        if let Some(row) = p.get_data(data) {
+            let mut recorded_values_for_cell = 0;
+            for (gene_idx, &val) in row.iter() {
+                let raw_mean = mean[gene_idx];
+                let mean_val = mean_u16[gene_idx];
 
-            // Debug: log what we're skipping
-            //if gene_idx == 2326 && (mean_val == 0 || val == 0) {
-            //  debug!("Cell {}, Gene 2326: mean={}, val={} - SKIPPING", cell_ind, mean_val, val);
-            //}
-            // ENCODING val=1, mean=20, diff=39, index=11900257856
-            // no observation for this gene
-            if raw_mean == 0. || val == 0 {
-                continue;
-            } else {
-                mean_u16[gene_idx] = mean_val;
-                let diff = val as i32 - mean_val as i32;
-                let diff = if diff < 0 {
-                    (-2_i32 * diff) + 1
+                // no observation for this gene
+                if raw_mean == 0. || val == 0 {
+                    continue;
                 } else {
-                    2_i32 * diff
-                };
+                    let diff = val as i32 - mean_val as i32;
+                    let diff = if diff < 0 {
+                        (-2_i32 * diff) + 1
+                    } else {
+                        2_i32 * diff
+                    };
 
-                // Debug: log encoding for gene 2326
-                /*
-                if gene_idx == 2326 {
-                    info!(
-                        "Cell {}, Gene 2326: ENCODING val={}, mean={}, diff={}, index={}",
-                        cell_ind,
-                        val,
-                        mean_val,
-                        diff,
-                        index_offset + gene_idx
+                    assert_eq!(
+                        val as u16,
+                        (decode_v(diff) + mean_u16[gene_idx] as i32) as u16
                     );
+                    raw_diffs.push(diff as u32);
+                    let index = index_offset + gene_idx;
+                    indices.push(index as u64);
+                    max_diff = max_diff.max(diff);
+                    recorded_values_for_cell += 1;
                 }
-                */
-
-                assert_eq!(
-                    val as u16,
-                    (decode_v(diff) + mean_u16[gene_idx] as i32) as u16
-                );
-                raw_diffs.push(diff as u32);
-                let index = index_offset + gene_idx;
-                indices.push(index as u64);
-                max_diff = max_diff.max(diff);
-                recorded_values_for_cell += 1;
             }
-            //}
         }
     }
 
@@ -495,16 +500,17 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             .collect();
 
         if !differences.is_empty() {
-            info!("orig_data: {:?}", orig_data);
-            info!("recon_vec: {:?}", recon_vec);
+            //info!("orig_data: {:?}", orig_data);
+            //info!("recon_vec: {:?}", recon_vec);
             info!("differences: {:?}", differences);
+            info!("type: {:?}", enc_diffs.indices.tyname());
             // Optionally still panic if you want to stop on first error
             // assert_eq!(recon_vec, orig_data.to_vec());
-            /*
+
             use std::io::Write;
             let f = std::fs::File::create("bad_cells.coo").expect("Should be able to create file");
             let mut f = std::io::BufWriter::new(f);
-            writeln!(f, "%%MatrixMarket matrix coordinate real general");
+            writeln!(f, "%%MatrixMarket matrix coordinate integer general");
             writeln!(f, "{}\t{}\t{}", points.len(), num_genes, nnz);
             for (cell_ind, p) in points.iter().enumerate() {
                 let index_offset = cell_ind * num_genes as usize;
@@ -513,7 +519,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
                     writeln!(f, "{}\t{}\t{}", cell_ind + 1, gene_idx + 1, val);
                 }
             }
-            */
+
             panic!("Failed to reconstruct!");
         }
         //dump this problematic cell to a file
@@ -1614,9 +1620,25 @@ impl QuadTree {
 mod tests {
 
     use super::*;
+    use tracing::info;
+    use tracing_subscriber::filter::LevelFilter;
+    use tracing_subscriber::fmt;
+    use tracing_subscriber::prelude::*;
+    use tracing_subscriber::EnvFilter;
 
     #[test]
     fn encode_failing_vec() {
+        tracing_subscriber::registry()
+            .with(fmt::layer())
+            .with(
+                EnvFilter::builder()
+                    .with_default_directive(LevelFilter::INFO.into())
+                    .from_env_lossy()
+                    // we don't want to hear anything below a warning from ureq
+                    .add_directive("ureq=warn".parse().unwrap()),
+            )
+            .init();
+
         let matrix = sprs::io::read_matrix_market::<i32, usize, _>("bad_cells.coo").unwrap();
         let mut matrix_new: sprs::TriMatBase<Vec<usize>, Vec<u16>> =
             sprs::TriMatBase::new(matrix.shape());

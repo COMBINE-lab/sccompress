@@ -39,6 +39,13 @@ impl Iterator for HybridSparseIterator<'_> {
 }
 
 impl HybridSparseVec {
+    pub fn tyname(&self) -> &'static str {
+        match self {
+            Self::EF(_) => "EFVector",
+            Self::Bit(_) => "Bitvector",
+        }
+    }
+
     pub fn empty() -> Self {
         Self::Bit(Vec::new())
     }
@@ -46,8 +53,10 @@ impl HybridSparseVec {
     pub fn from_indices(inds: &[u64], _s: f64, tot: usize) -> Self {
         let ef = InnerEFVector::with_items_from_slice_s(inds);
         let nw = bitm::ceiling_div(tot, 64);
-        if true {
-            //ef.write_bytes() < nw * 8 {
+        if ef.write_bytes() < nw * 8 {
+            for v in ef.iter().zip(inds.iter()) {
+                assert_eq!(v.0, *v.1);
+            }
             Self::EF(EFVector(ef))
         } else {
             let mut v = vec![0; nw];
