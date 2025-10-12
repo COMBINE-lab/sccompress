@@ -1,6 +1,6 @@
-use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 pub mod bits;
 pub mod quad_tree;
+use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;

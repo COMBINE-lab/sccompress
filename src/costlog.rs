@@ -1,11 +1,11 @@
-// Import shared modules
+mod tree_costlog;
 mod bits;
-mod quad_tree;
-
-use quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect,BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
+use tree_costlog::{ErrorMetric, Point, QuadTree, Rect, BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;
 use hdf5::File as Hdf5File;
+use ndarray::ArrayD;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
 //use std::error::Error;
@@ -22,47 +22,221 @@ use tracing_subscriber::EnvFilter;
 use flate2::Compression;
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
-use bincode::{Decode, Encode};
-use sprs::{CsMat, CsVecViewI};
+use sprs::CsMat;
+// removed unused bincode::{Encode, Decode} import
 
-// Cost tracking structures for serialization
-#[derive(Clone, Encode, Decode)]
-pub(crate) struct CostStep {
-    pub depth: usize,
-    pub points_count: usize,
-    pub current_cost: usize,
-    pub children_cost: usize,
-    pub optimal_cost: usize,
-    pub decision: String,  // "merge" or "divide"
-    pub node_id: String,   // e.g., "root", "nw", "ne", "se", "sw"
+use mimalloc::MiMalloc;
+
+#[global_allocator]
+static GLOBAL: MiMalloc = MiMalloc;
+
+// Simple ArrayData type to replace anndata::ArrayData
+#[derive(Clone)]
+pub struct ArrayData {
+    pub data: ArrayD<u16>,
 }
 
-#[derive(Clone, Encode, Decode)]
-pub(crate) struct CostLog {
-    //pub steps: Vec<CostStep>,
-    pub total_nodes: usize,
-    pub total_cost: usize,
+impl ArrayData {
+    pub fn new(data: ArrayD<u16>) -> Self {
+        Self { data }
+    }
+    
+    pub fn shape(&self) -> &[usize] {
+        self.data.shape()
+    }
 }
 
-impl CostLog {
-    pub fn new() -> Self {
-        Self {
-            //steps: Vec::new(),
-            total_nodes: 0,
-            total_cost: 0,
+// Sparse gene expression data - much more memory efficient!
+//#[derive(Clone)]
+//pub struct SparseGeneData {
+//    pub gene_indices: Vec<usize>,    // Which genes are expressed
+//    pub expression_values: Vec<u16>,  // Expression counts
+//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+//}
+//    pub expression_values: Vec<u16>,  // Expression counts
+//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+//}
+//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
+//}
+
+//impl SparseGeneData {
+//    pub fn new(gene_indices: Vec<usize>, expression_values: Vec<u16>, num_genes: usize) -> Self {
+//        Self { gene_indices, expression_values, num_genes }
+//    }
+
+// Convert to dense only when needed
+//    pub fn to_dense(&self) -> Vec<u16> {
+//        let mut dense = vec![0u16; self.num_genes];
+//        for (idx, &value) in self.gene_indices.iter().zip(&self.expression_values) {
+//            dense[*idx] = value;
+//        }
+//        dense
+//    }
+//    }
+
+// Memory usage in bytes
+//    pub fn memory_usage(&self) -> usize {
+//        self.gene_indices.len() * std::mem::size_of::<usize>() +
+//        self.expression_values.len() * std::mem::size_of::<u16>() +
+//        std::mem::size_of::<usize>()
+//    }
+
+// Get expression for a specific gene
+//    pub fn get_gene_expression(&self, gene_idx: usize) -> u16 {
+//        if let Some(pos) = self.gene_indices.binary_search(&gene_idx).ok() {
+//            self.expression_values[pos]
+//        } else {
+//            0
+//        }
+//    }
+//    }
+//}
+
+// Helper function to extract numeric data from ArrayData
+fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
+    data.data.as_slice().unwrap().to_vec()
+}
+
+//use af_anndata::H5 as H52;
+
+fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
+    println!(
+        "Reading features from 10x HDF5 file: {}",
+        h5_path.as_ref().display()
+    );
+
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    println!("Successfully opened HDF5 file");
+
+    let matrix_group = file.group("matrix")?;
+    println!("Found matrix group");
+
+    let features_group = matrix_group.group("features")?;
+    println!("Found features group");
+
+    // Try to read feature names
+    match features_group.dataset("name") {
+        Ok(name_dataset) => {
+            println!("Found name dataset, attempting to read...");
+            match name_dataset.read_1d::<u8>() {
+                Ok(names_bytes) => {
+                    println!(
+                        "Successfully read {} bytes from name dataset",
+                        names_bytes.len()
+                    );
+
+                    // Convert to Vec<u8> to avoid version conflicts
+                    let names_vec: Vec<u8> = names_bytes.to_vec();
+
+                    // Convert bytes to strings - each string is 23 bytes
+                    let mut names = Vec::new();
+                    for i in 0..541 {
+                        let start = i * 23;
+                        let end = start + 23;
+                        if end <= names_vec.len() {
+                            let string_bytes = &names_vec[start..end];
+                            // Convert bytes to string, removing null padding
+                            let name = String::from_utf8_lossy(string_bytes)
+                                .trim_matches('\0')
+                                .to_string();
+                            names.push(name);
+                        }
+                    }
+
+                    println!("Successfully read {} feature names from HDF5", names.len());
+                    if names.len() > 0 {
+                        println!("First 5 features: {:?}", &names[..names.len().min(5)]);
+                    }
+
+                    Ok(names)
+                }
+                Err(e) => {
+                    println!("Failed to read name dataset: {:?}", e);
+                    // Fallback to placeholder features
+                    let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
+                    println!("Using {} placeholder features", names.len());
+                    Ok(names)
+                }
+            }
+        }
+        Err(e) => {
+            println!("Failed to find name dataset: {:?}", e);
+            // Fallback to placeholder features
+            let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
+            println!("Using {} placeholder features", names.len());
+            Ok(names)
         }
     }
-    
-    //pub fn add_step(&mut self, step: CostStep) {
-    //    self.steps.push(step);
-    //}
-    
-    pub fn update_totals(&mut self, nodes: usize, cost: usize) {
-        self.total_nodes = nodes;
-        self.total_cost = cost;
+}
+
+// Helper functions to read fixed-length strings from HDF5
+fn read_strings_7(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<7>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 7, 541),
     }
 }
 
+fn read_strings_23(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<23>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 23, 541),
+    }
+}
+
+fn read_strings_25(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    match dataset.read_1d::<FixedAscii<25>>() {
+        Ok(strings_array) => {
+            let strings: Vec<String> = strings_array
+                .iter()
+                .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                .collect();
+            Ok(strings)
+        }
+        Err(_) => read_strings_as_bytes(file, dataset_path, 25, 541),
+    }
+}
+
+fn read_strings_as_bytes(
+    file: &Hdf5File,
+    dataset_path: &str,
+    string_length: usize,
+    num_strings: usize,
+) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(dataset_path)?;
+    let bytes = dataset.read_1d::<u8>()?;
+    let bytes_vec: Vec<u8> = bytes.to_vec();
+    
+    let mut strings = Vec::new();
+    for i in 0..num_strings {
+        let start = i * string_length;
+        let end = start + string_length;
+        if end <= bytes_vec.len() {
+            let string_bytes = &bytes_vec[start..end];
+            let string = String::from_utf8_lossy(string_bytes)
+                .trim_matches('\0')
+                .to_string();
+            strings.push(string);
+        }
+    }
+
+    Ok(strings)
+}
 
 fn tree_from_10x<T: AsRef<Path>>(
     h5_path: T,
@@ -274,33 +448,14 @@ fn tree_from_10x<T: AsRef<Path>>(
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
 
-    // Divide the quadtree and get cost log
-    let division_cost_log = qtree.divide_recursive(&csr);
-    /*
-    info!("Division cost log contains {} steps", division_cost_log.steps.len());
-    info!("Total nodes processed: {}", division_cost_log.total_nodes);
-    info!("Total cost: {}", division_cost_log.total_cost);
+    // Divide the quadtree
+    qtree.divide(&csr);
+    info!("Quadtree division complete");
 
-    // Serialize division cost log to file
-    let division_cost_log_filename = PathBuf::from("division_costs.bin");
-    let cost_config = bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding();
-    let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-
-    // Optimize the quadtree and get cost log
-    let optimization_cost_log = qtree.optimize_quadtree();
-    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
-    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
-
-    // Serialize optimization cost log to file
-    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
-    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
-    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
-    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    */
+    // Optimize the quadtree
+    qtree.optimize_quadtree(&csr);
+    info!("Quadtree optimization complete");
+    
     Ok((qtree, csr))
 }
 
@@ -329,7 +484,7 @@ enum InputPosType {
 #[derive(Debug, Clone, ValueEnum)]
 enum InputDataType {
     Csr,
-    Csv,
+//    Csv,
     H5ad,
    // Mtx,
    // v2,
@@ -410,8 +565,32 @@ impl Data {
         }
     }
 }
+/* 
+fn main() -> Result<(), Box<dyn Error>> {
+    // Check the `RUST_LOG` variable for the logger level and
+    // respect the value found there. If this environment
+    // variable is not set then set the logging level to
+    // INFO.
+    tracing_subscriber::registry()
+        .with(fmt::layer())
+        .with(
+            EnvFilter::builder()
+                .with_default_directive(LevelFilter::INFO.into())
+                .from_env_lossy()
+                // we don't want to hear anything below a warning from ureq
+                .add_directive("ureq=warn".parse()?),
+        )
+        .init();
 
-/*
+    // Test reading HDF5 file directly with hdf5 crate
+    println!("Testing HDF5 file reading...");
+    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
+    let parquet_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cells.parquet";
+    tree_from_10X(file_path, parquet_path, ErrorMetric::Mean, true)?;
+    Ok(())
+}
+    */
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Check the `RUST_LOG` variable for the logger level and
     // respect the value found there. If this environment
@@ -438,9 +617,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Platform::Xenium) => (1, 2),
                 None => (args.idx_x, args.idx_y),
             };
-            //let (qtree, csr) = match args.format {
-               // InputDataType::Csr
-                //| InputDataType::H5ad => {
+            let (qtree, csr) = match args.format {
+                InputDataType::Csr
+                | InputDataType::H5ad => {
                     let file_path_pos = args
                         .input_pos
                         .ok_or_else(|| anyhow::anyhow!("Position file required for HDF5 format"))?;
@@ -453,7 +632,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         match args.format {
                             InputDataType::Csr => InputDataType::Csr,
-                            InputDataType::Csv => InputDataType::Csv,
+                            //InputDataType::Csv => InputDataType::Csv,
                             InputDataType::H5ad => InputDataType::H5ad,
                             //InputDataType::Mtx => InputDataType::Mtx,
                             //InputDataType::v2 => InputDataType::v2,
@@ -463,7 +642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         ErrorMetric::Mean,
                         true,
                     )?
-                //}
+                }
             };
 
             // only serialize the the bit fields
@@ -525,6 +704,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = write!(&mut str_out, "{e}, ");
                     }
                     str_out.pop();
+                    str_out.pop();
                     ofile.write_all(
                         format!("{},{},{}\n", loc.xpos(), loc.ypos(), str_out).as_bytes(),
                     )?;
@@ -534,4 +714,89 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+    Ok(())
+}
+
+
+/* 
+// Function to explore HDF5 file structure
+fn explore_hdf5_structure<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
+    let file = Hdf5File::open(h5_path.as_ref())?;
+
+    println!("=== HDF5 File Structure ===");
+    println!("File: {}", h5_path.as_ref().display());
+
+    // Try to access common paths
+    let common_paths = [
+        "matrix/obs/name",
+        "matrix/obs/_index", 
+        "obs/name",
+        "matrix/features/name",
+        "matrix/data",
+        "matrix/indices",
+        "matrix/indptr",
+        "matrix/shape",
+    ];
+
+    for path in &common_paths {
+        if let Ok(dataset) = file.dataset(path) {
+            let shape = dataset.shape();
+            let dtype = dataset.dtype()?;
+            println!("✅ {} (shape: {:?}, dtype: {:?})", path, shape, dtype);
+        } else {
+            println!("❌ {} (not found)", path);
+        }
+    }
+
+    println!("=== End Structure ===");
+
+    Ok(())
+}
+
+// Simple function to demonstrate reading cell names from HDF5
+fn demonstrate_cell_names<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
+    println!("\n=== Trying to read cell names from HDF5 ===");
+
+    let file = Hdf5File::open(h5_path.as_ref())?;
+
+    // Try common paths for cell names
+    let cell_name_paths = [
+        "matrix/obs/name",
+        "matrix/obs/_index", 
+        "obs/name",
+        "matrix/obs/id",
+    ];
+
+    for path in &cell_name_paths {
+        match file.dataset(path) {
+            Ok(dataset) => {
+                let shape = dataset.shape();
+                let dtype = dataset.dtype()?;
+                println!(
+                    "✅ Found cell names at '{}' (shape: {:?}, dtype: {:?})",
+                    path, shape, dtype
+                );
+
+                // Try to read a few sample cell names
+                if shape.len() == 1 && shape[0] > 0 {
+                    let num_cells = shape[0];
+                    let sample_size = std::cmp::min(5, num_cells);
+
+                    // Try to read as strings
+                    if let Ok(strings) = read_strings_as_bytes(&file, path, 23, sample_size) {
+                        println!("   Sample cell names: {:?}", strings);
+                    } else {
+                        println!("   Could not read as strings");
+                    }
+                }
+            }
+            Err(_) => {
+                println!("❌ No cell names found at '{}'", path);
+            }
+        }
+    }
+
+    println!("=== End cell names exploration ===\n");
+    Ok(())
+}
 */
