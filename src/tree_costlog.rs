@@ -1187,6 +1187,18 @@ impl QuadTree {
         }
       }
 
+    /// Helper function to recursively collect all points from a node's descendants
+    fn collect_all_descendant_points(&self, points: &mut Vec<Point>) {
+        if !self.divided {
+            points.extend_from_slice(&self.points);
+        } else {
+            if let Some(ref nw) = self.nw { nw.collect_all_descendant_points(points); }
+            if let Some(ref ne) = self.ne { ne.collect_all_descendant_points(points); }
+            if let Some(ref se) = self.se { se.collect_all_descendant_points(points); }
+            if let Some(ref sw) = self.sw { sw.collect_all_descendant_points(points); }
+        }
+    }
+
     /// Traverse to all leaf nodes first, then compare children expenses to parent expenses
     /// Returns a tuple: (parent_expense, children_expense, should_divide)
     pub(crate) fn compare_parent_vs_children_expenses(
@@ -1280,22 +1292,20 @@ impl QuadTree {
             let (optimal_cost, decision) = if children_expense >= parent_expense {
                 //info!("Collapsing node at depth {}: parent={}, children={}",
                 //      self.depth, parent_expense, children_expense);
-                 // why is this not a issue for the 10X data?
                 // Repopulate this parent's points from all descendants before collapsing
                 let mut collected_points: Vec<Point> = Vec::new();
-                if let Some(ref mut nw) = self.nw { nw.query(&nw.boundary); }
-                if let Some(ref mut ne) = self.ne { ne.query(&ne.boundary); }
-                if let Some(ref mut se) = self.se { se.query(&se.boundary); }
-                if let Some(ref mut sw) = self.sw { sw.query(&sw.boundary); }
+                if let Some(ref nw) = self.nw { nw.collect_all_descendant_points(&mut collected_points); }
+                if let Some(ref ne) = self.ne { ne.collect_all_descendant_points(&mut collected_points); }
+                if let Some(ref se) = self.se { se.collect_all_descendant_points(&mut collected_points); }
+                if let Some(ref sw) = self.sw { sw.collect_all_descendant_points(&mut collected_points); }
 
-                if !collected_points.is_empty() {
-                    self.points = collected_points;
-                    self.positions = self
-                        .points
-                        .iter()
-                        .map(|p| DatalessPoint::new(p.xpos(), p.ypos()))
-                        .collect();
-                }
+                self.points = collected_points;
+                self.positions = self
+                    .points
+                    .iter()
+                    .map(|p| DatalessPoint::new(p.xpos(), p.ypos()))
+                    .collect();
+                    
                 self.divided = false;
                 self.nw = None;
                 self.ne = None;
