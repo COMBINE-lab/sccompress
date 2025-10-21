@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use sprs::{CsMat, CsVecViewI};
 use sucds::int_vectors::{DacsOpt, Access};
 use sucds::Serializable;
+use medians::medianu64;
 
 // Cost tracking structure
 #[derive(Clone, Encode, Decode)]
@@ -375,8 +376,8 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
 
     let mut indices = Vec::<u64>::new();
-    //let mut meadians = Vec::<u16>::new();
-    let mut mean = vec![0_f64; data.cols()];
+    let mut median_vec = Vec::<u16>::new();
+    //let mut mean = vec![0_f64; data.cols()];
     //let mut n = 0_u16;
     let mut raw_diffs = Vec::<u32>::new();
     let mut max_diff = 0_i32;
@@ -401,27 +402,26 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
                 nnz += 1;
                 gene_counts[gene_idx] += 1;
                 //let delta = val as f64 - mean[gene_idx] as f64;
-                mean[gene_idx] += val as f64; //delta / gene_counts[gene_idx] as f64;
+                //mean[gene_idx] += val as f64; //delta / gene_counts[gene_idx] as f64;
             }
         }
     }
 
-    /*
     for j in 0..data.cols() {
         // get the non-zero values and the non-zero indices
-        let nz_values: Vec<u16> = points
+        let mut nz_values: Vec<u64> = points
             .iter()
             .filter_map(|p| {
-                p.get_gene_exp(data, j).map(|&val| val)
+                p.get_gene_exp(data, j).map(|&val| val as u64)
             })
             .collect();
 
         // nonzero median values
         let median = if !nz_values.is_empty() {
-            nnz += nz_values.len();
-            let mut sorted_values = nz_values.clone();
-            sorted_values.sort_unstable();
-            sorted_values[sorted_values.len() / 2] //median of the expressed values
+            match medianu64(&mut nz_values).unwrap() {
+                medians::Medians::Even(v) => *v.0 as u16,
+                medians::Medians::Odd(v) => *v as u16,
+            }   
         } else {
             0
         };
@@ -429,14 +429,15 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             debug!("j: {}, median: {}", j, median);
         }
        // debug!("j: {}, median: {}", j, median);
-        medians.push(median);
+        median_vec.push(median);
     }
-    */
+    
     let tot = num_genes as usize * points.len();
     let sparsity = (nnz as f64) / (tot as f64);
     if sparsity > 0.75 {
         println!("sparsity: {}", sparsity);
     }
+    /* 
     let mut mean_u16 = vec![0_u16; data.cols()];
 
     for gene_idx in 0..data.cols() {
@@ -446,7 +447,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             0_u16
         };
         mean_u16[gene_idx] = mean_val;
-    }
+    }*/
     // for each cell
     //for (gene_idx, &val) in row.iter() {
 
@@ -457,14 +458,15 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
         if let Some(row) = p.get_data(data) {
             let mut recorded_values_for_cell = 0;
             for (gene_idx, &val) in row.iter() {
-                let raw_mean = mean[gene_idx];
-                let mean_val = mean_u16[gene_idx];
+                //let raw_mean = mean[gene_idx];
+                //let mean_val = mean_u16[gene_idx];
+                let median_val = median_vec[gene_idx];
 
                 // no observation for this gene
-                if raw_mean == 0. || val == 0 {
+                if median_val == 0 || val == 0 {
                     continue;
                 } else {
-                    let diff = val as i32 - mean_val as i32;
+                    let diff = val as i32 - median_val as i32;
                     let diff = if diff < 0 {
                         (-2_i32 * diff) + 1
                     } else {
@@ -473,7 +475,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
 
                     assert_eq!(
                         val as u16,
-                        (decode_v(diff) + mean_u16[gene_idx] as i32) as u16
+                        (decode_v(diff) + median_val as i32) as u16
                     );
                     raw_diffs.push(diff as u32);
                     let index = index_offset + gene_idx;
@@ -486,13 +488,13 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
 
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
-    let medians = BitFieldVec::<usize>::from_slice(&mean_u16).expect("should fit");
+    let medians = BitFieldVec::<usize>::from_slice(&median_vec).expect("should fit");
     // changed to DacsOpts Directly Addressable Codes variable length encoding to save space that is affected by large outliers
     //let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
     // max_levels max_levels: Maximum number of levels. 
     //     The resulting number of levels is related to the access time. The smaller this value is, the faster operations can be, 
     //     but the larger the memory can be. If None, it computes configuration without limitation in the number of levels.
-    let diffs = DacsOpt::from_slice(&raw_diffs, Some(3)).expect("should fit");
+    let diffs = DacsOpt::from_slice(&raw_diffs, Some(1)).expect("should fit");
     //info!("sparsity : {}", sparsity);
     assert_eq!(indices.len(), diffs.len());
 
@@ -516,7 +518,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             .zip(orig_data.iter())
             .enumerate()
             .filter(|(_, (&r, &o))| r != o)
-            .map(|(gene_idx, (&r, &o))| (gene_idx, r, o, mean_u16[gene_idx]))
+            .map(|(gene_idx, (&r, &o))| (gene_idx, r, o, median_vec[gene_idx]))
             .collect();
 
         if !differences.is_empty() {
@@ -1102,7 +1104,7 @@ impl QuadTree {
         }
     */
 
-    pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) -> CostLog {
+    pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
         //pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
         info!("divide_recursive");
         //let mut stack = vec![self];
@@ -1113,7 +1115,7 @@ impl QuadTree {
         if self.points.is_empty() {
             //return cost_log;
             info!("points is empty");
-            return CostLog::new();
+            //return CostLog::new();
         }
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self
@@ -1200,7 +1202,7 @@ impl QuadTree {
             }
         }
         info!("self.depth: {}", self.depth);
-        return cost_log;
+        //return cost_log;
     }
 
     /*
