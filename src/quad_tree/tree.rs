@@ -8,6 +8,8 @@ use sux::traits::BitFieldSliceMut;
 use tracing::{debug, error, info, warn};
 //use rayon::scope;
 use sprs::{CsMat, CsVecViewI};
+use sucds::int_vectors::{DacsOpt, Access};
+use sucds::Serializable;
 
 // Cost tracking structure
 #[derive(Clone, Encode, Decode)]
@@ -29,7 +31,7 @@ impl CostLog {
 pub(crate) struct EncodedDiffs {
     pub(crate) indices: HybridSparseVec,
     pub(crate) ncells: u32,
-    pub(crate) diffs: BitFieldVec,
+    pub(crate) diffs: DacsOpt,
     pub(crate) medians: BitFieldVec,
 }
 
@@ -80,7 +82,7 @@ impl EncodedDiffs {
         EncodedDiffs {
             indices: HybridSparseVec::empty(),
             ncells: 0,
-            diffs: BitFieldVec::with_capacity(0, 0),
+            diffs: DacsOpt::default(),
             medians: BitFieldVec::with_capacity(0, 0),
         }
     }
@@ -114,10 +116,14 @@ impl EncodedDiffs {
                 }
 
                 let first_idx = self.num_genes() * cell_ind;
-                let mut diff_iter = self.diffs.iter_from(*num_ones);
+                // the first index to start iterating from
+                info!("num_ones: {}", *num_ones);
+                
+                //let mut diff_iter = self.diffs.iter().skip(*num_ones);
+                let mut diff_pos = *num_ones;
+                let mut next_diff = self.diffs.access(diff_pos).expect("valid");
 
                 let mut expression = Vec::with_capacity(self.num_genes());
-                let mut next_diff = diff_iter.next().expect("at least one");
                 let mut num_ones_in_cell = 0_usize;
                 for gidx in 0..self.num_genes() {
                     if !indices.get_bit(gidx + first_idx) {
@@ -127,7 +133,9 @@ impl EncodedDiffs {
                         let ddiff = decode_v(next_diff as i32);
                         let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
                         expression.push(decoded_val);
-                        next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                        diff_pos += 1;
+                        next_diff = self.diffs.access(diff_pos).unwrap_or(usize::MAX);
+                        //next_diff = diff_iter.next().unwrap_or(usize::MAX);
                     }
                 }
                 *num_ones += num_ones_in_cell;
@@ -202,11 +210,15 @@ impl EncodedDiffs {
                         return vec![0_u16; self.num_genes()];
                     }
 
-                    let mut diff_iter = self.diffs.iter_from(start);
+                    //info!("start: {}", start);
+                    // too slow
+                    //let mut diff_iter = self.diffs.iter().skip(start);
+                    let mut diff_pos = start;
+                    let mut next_diff = self.diffs.access(diff_pos).unwrap_or(usize::MAX);
+
                     let mut nz_ind_iter = start_cur.clone();
 
                     let mut expression = Vec::with_capacity(self.num_genes());
-                    let mut next_diff = diff_iter.next().expect("at least one");
                     let mut next_nz_ind =
                         nz_ind_iter.value().expect("at least one") - first_idx as u64;
                     for gidx in 0..self.num_genes() {
@@ -220,7 +232,8 @@ impl EncodedDiffs {
                             if nz_ind_iter.advance() {
                                 next_nz_ind =
                                     nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
-                                next_diff = diff_iter.next().unwrap_or(usize::MAX);
+                                diff_pos += 1;
+                                next_diff = self.diffs.access(diff_pos).unwrap_or(usize::MAX);
                             } else {
                                 next_nz_ind = self.num_genes() as u64 + 1;
                             }
@@ -243,10 +256,6 @@ impl EncodedDiffs {
         }
     }
 
-    pub(crate) fn is_diff_iter_empty(&self, start_pos: usize) -> bool {
-        self.diffs.iter_from(start_pos).next().is_none()
-    }
-
     /// Pre-check only for Bit variant: does the given cell have any set bits?
     pub(crate) fn precheck_cells(&self, cell_ind: usize) -> bool {
         if let HybridSparseVec::Bit(indices) = &self.indices {
@@ -262,7 +271,7 @@ impl EncodedDiffs {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        let diff_bits = self.diffs.len() * self.diffs.bit_width();
+        let diff_bits = self.diffs.size_in_bytes();
         let ibits = self.indices.num_bits(); //0.write_bytes() * 8;
 
         let ncbits = 32;
@@ -282,10 +291,10 @@ impl Encode for EncodedDiffs {
         Encode::encode(&self.indices, encoder)?;
         Encode::encode(&self.ncells, encoder)?;
 
-        let (b, w, l) = self.diffs.clone().into_raw_parts();
-        Encode::encode(&b, encoder)?;
-        Encode::encode(&w, encoder)?;
-        Encode::encode(&l, encoder)?;
+        let mut diffs_bytes = Vec::new();
+        self.diffs.serialize_into(&mut diffs_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
+        Encode::encode(&diffs_bytes, encoder)?;
 
         let (b, w, l) = self.medians.clone().into_raw_parts();
         Encode::encode(&b, encoder)?;
@@ -306,7 +315,10 @@ impl<Context> Decode<Context> for EncodedDiffs {
         let data = Decode::decode(decoder)?;
         let w = Decode::decode(decoder)?;
         let l = Decode::decode(decoder)?;
-        let diffs = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+
+        let diffs_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let diffs = DacsOpt::deserialize_from(&diffs_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
 
         let data = Decode::decode(decoder)?;
         let w = Decode::decode(decoder)?;
@@ -331,7 +343,10 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
         let data = BorrowDecode::borrow_decode(decoder)?;
         let width = BorrowDecode::borrow_decode(decoder)?;
         let len = BorrowDecode::borrow_decode(decoder)?;
-        let diffs = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+        let diffs_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let diffs = DacsOpt::deserialize_from(&diffs_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+
 
         let data = BorrowDecode::borrow_decode(decoder)?;
         let width = BorrowDecode::borrow_decode(decoder)?;
@@ -472,7 +487,12 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
 
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
     let medians = BitFieldVec::<usize>::from_slice(&mean_u16).expect("should fit");
-    let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
+    // changed to DacsOpts Directly Addressable Codes variable length encoding to save space that is affected by large outliers
+    //let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
+    // max_levels max_levels: Maximum number of levels. 
+    //     The resulting number of levels is related to the access time. The smaller this value is, the faster operations can be, 
+    //     but the larger the memory can be. If None, it computes configuration without limitation in the number of levels.
+    let diffs = DacsOpt::from_slice(&raw_diffs, Some(3)).expect("should fit");
     //info!("sparsity : {}", sparsity);
     assert_eq!(indices.len(), diffs.len());
 
