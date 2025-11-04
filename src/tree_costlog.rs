@@ -455,6 +455,38 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
     
 //    if !skip {
+    // Log diff statistics and optionally save to file
+    if !raw_diffs.is_empty() {
+        //let sum: u64 = raw_diffs.iter().map(|&d| d as u64).sum();
+        //let mean_diff = sum as f64 / raw_diffs.len() as f64;
+        //let max_diff = raw_diffs.iter().max().unwrap_or(&0);
+        //let min_diff = raw_diffs.iter().min().unwrap_or(&0);
+        
+        /* 
+        // Calculate variance and std dev
+        let variance: f64 = raw_diffs.iter()
+            .map(|&d| {
+                let diff = d as f64 - mean_diff;
+                diff * diff
+            })
+            .sum::<f64>() / raw_diffs.len() as f64;
+        let std_dev = variance.sqrt();
+        
+        info!("Block[cells={}, diffs={}]: mean={:.2}, std={:.2}, min={}, max={}, sum={}", 
+              points.len(), raw_diffs.len(), mean_diff, std_dev, min_diff, max_diff, sum);
+        */
+
+        // Optionally save diffs to file for detailed analysis
+        // Uncomment to enable:
+        use std::io::Write;
+        let filename = format!("diffs_block_{}cells.txt", points.len());
+        if let Ok(mut file) = std::fs::File::create(&filename) {
+            for diff in &raw_diffs {
+                writeln!(file, "{}", diff).ok();
+            }
+        }
+    }
+    
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot); //InnerEFVector::with_items_from_slice_s(&indices);
     let medians = BitFieldVec::<usize>::from_slice(&mean_u16).expect("should fit");
     let diffs = BitFieldVec::<usize>::from_slice(&raw_diffs).expect("should fit");
@@ -1116,6 +1148,10 @@ impl QuadTree {
             );
  
              // Convert children to BitFieldQuadTree to calculate their expenses
+             info!("nw.points.len(): {}", nw.points.len());
+             info!("ne.points.len(): {}", ne.points.len());
+             info!("se.points.len(): {}", se.points.len());
+             info!("sw.points.len(): {}", sw.points.len());
             let nw_expense = encode_subarray(&nw.points, data).map_or(0, |x| x.bytes());
             let ne_expense = encode_subarray(&ne.points, data).map_or(0, |x| x.bytes());
             let se_expense = encode_subarray(&se.points, data).map_or(0, |x| x.bytes());
@@ -1126,7 +1162,7 @@ impl QuadTree {
             // info!("SE expense: {} with {} points", se_expense, se.points.len());
             // info!("SW expense: {} with {} points", sw_expense, sw.points.len());
  
-            //let total_children_expense = nw_expense + ne_expense + se_expense + sw_expense;
+            let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
 
               // Create node identifier
             let node_id = if node.depth == 0 {
@@ -1135,7 +1171,7 @@ impl QuadTree {
                 format!("node_{}", node_counter)
             };
 
-             //if total_expense < current_expense {
+            if total_expense < current_expense {
              node.divided = true;
              
              // Set costs and create children
@@ -1184,6 +1220,7 @@ impl QuadTree {
                                                  // Keep the points for bit field representation
                  }
              }*/
+            }
         }
       }
 

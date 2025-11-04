@@ -10,7 +10,8 @@ use tracing::{debug, error, info, warn};
 use sprs::{CsMat, CsVecViewI};
 use sucds::int_vectors::{DacsOpt, Access};
 use sucds::Serializable;
-use medians::medianu64;
+//use medians::medianu64;
+//use adqselect::nth_element;
 
 // Cost tracking structure
 #[derive(Clone, Encode, Decode)]
@@ -386,49 +387,37 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     debug!("Number of genes: {}", num_genes);
 
     let mut nnz = 0_usize;
-    // This is calculating mean for each gene with online algorithm
-    //debug!("points[0].get_data().len(): {}", data.cols());
-    // Initialize mean vector with zeros
-    //mean.resize(data.cols(), 0);
-    let mut gene_counts = vec![0u32; data.cols()];
-
-    // Calculating gene means for each gene because we suppose that mean for each genes in the near cells are the similar in gene expression
-    // Iterate over each cell, calculating the mean for each gene
+    
+    // Collect non-zero values per gene in a single pass through sparse rows
+    // This is more efficient than iterating gene-by-gene for CSR matrices
+    let mut gene_values: Vec<Vec<u16>> = vec![Vec::new(); data.cols()];
+    
+    // Single pass: collect all non-zero values per gene from sparse rows
     for p in points.iter() {
-        // outer_iterator(): Processes ALL 100,000+ rows in the matrix, outer_view(p.ind): Only processes the ~500 rows actually need
         if let Some(row) = p.get_data(data) {
-            // Iterate only over non-zero entries in this row and update the mean for each gene
+            // Iterate only over non-zero entries in this sparse row
             for (gene_idx, &val) in row.iter() {
                 nnz += 1;
-                gene_counts[gene_idx] += 1;
-                //let delta = val as f64 - mean[gene_idx] as f64;
-                //mean[gene_idx] += val as f64; //delta / gene_counts[gene_idx] as f64;
+                gene_values[gene_idx].push(val);
             }
         }
     }
 
+    // Calculate median for each gene from collected values
     for j in 0..data.cols() {
-        // get the non-zero values and the non-zero indices
-        let mut nz_values: Vec<u64> = points
-            .iter()
-            .filter_map(|p| {
-                p.get_gene_exp(data, j).map(|&val| val as u64)
-            })
-            .collect();
-
-        // nonzero median values
+        let nz_values = &mut gene_values[j];
+        
+        // Calculate median using select_nth_unstable (O(n) average)
         let median = if !nz_values.is_empty() {
-            match medianu64(&mut nz_values).unwrap() {
-                medians::Medians::Even(v) => *v.0 as u16,
-                medians::Medians::Odd(v) => *v as u16,
-            }   
+            let mid = nz_values.len() / 2;
+            *nz_values.select_nth_unstable(mid).1
         } else {
             0
         };
+        
         if j == 20000 {
             debug!("j: {}, median: {}", j, median);
         }
-       // debug!("j: {}, median: {}", j, median);
         median_vec.push(median);
     }
     
@@ -494,7 +483,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     // max_levels max_levels: Maximum number of levels. 
     //     The resulting number of levels is related to the access time. The smaller this value is, the faster operations can be, 
     //     but the larger the memory can be. If None, it computes configuration without limitation in the number of levels.
-    let diffs = DacsOpt::from_slice(&raw_diffs, Some(1)).expect("should fit");
+    let diffs = DacsOpt::from_slice(&raw_diffs, Some(3)).expect("should fit");
     //info!("sparsity : {}", sparsity);
     assert_eq!(indices.len(), diffs.len());
 
@@ -1124,6 +1113,7 @@ impl QuadTree {
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
         // Compute the expense of encoding the current block
+        //info!("encoding current block");
         let current_expense = encode_subarray(&self.points, data).map_or(0, |x| x.bytes());
         info!(
             "expense of current block consisting of {} points is {}",
