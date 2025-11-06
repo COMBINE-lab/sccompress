@@ -15,7 +15,7 @@ use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tracing::info;
+use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
@@ -27,6 +27,8 @@ use sprs::CsMat;
 // removed unused bincode::{Encode, Decode} import
 
 use mimalloc::MiMalloc;
+use std::collections::HashMap;
+use std::io::BufRead;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -616,6 +618,157 @@ fn tree_from_10x<T: AsRef<Path>>(
     Ok((qtree, csr))
 }
 
+/// Read cluster assignments from a file where each line contains cell IDs separated by semicolons
+fn read_cluster_file<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<String>>> {
+    let file = File::open(cluster_path)?;
+    let reader = BufReader::new(file);
+    
+    let mut clusters = Vec::new();
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line?;
+        let cell_ids: Vec<String> = line
+            .split(';')
+            .map(|s| s.trim().trim_matches('"').trim().to_string())  // Strip quotes and whitespace
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        if !cell_ids.is_empty() {
+            info!("Cluster {}: {} cells", line_num, cell_ids.len());
+            clusters.push(cell_ids);
+        }
+    }
+    
+    info!("Total clusters loaded: {}", clusters.len());
+    Ok(clusters)
+}
+
+/// Encode clusters from HDF5 data
+fn encode_clusters_from_h5<T: AsRef<Path>>(
+    h5_path: T,
+    pos_path: T,
+    cluster_path: T,
+    pos_type: InputPosType,
+    pos_x_col: usize,
+    pos_y_col: usize,
+) -> anyhow::Result<Vec<(EncodedDiffs, Vec<DatalessPoint>)>> {
+    info!("Loading HDF5 data from: {}", h5_path.as_ref().display());
+    
+    // Read features from HDF5
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    let matrix_group = file.group("matrix")?;
+    
+    // Read matrix shape
+    let shape_dataset = matrix_group.dataset("shape")?;
+    let shape_array = shape_dataset.read_1d::<usize>()?;
+    let shape: Vec<usize> = shape_array.to_vec();
+    let num_features = shape[0];
+    let num_cells = shape[1];
+    
+    info!("Matrix shape: {} cells x {} features", num_cells, num_features);
+    
+    // Read sparse matrix components
+    let data_dataset = matrix_group.dataset("data")?;
+    let indices_dataset = matrix_group.dataset("indices")?;
+    let indptr_dataset = matrix_group.dataset("indptr")?;
+    let barcodes_dataset = matrix_group.dataset("barcodes")?;
+    
+    let data_array = data_dataset.read_1d::<u16>()?;
+    let data_slice = data_array.as_slice().unwrap();
+    let indices_array = indices_dataset.read_1d::<usize>()?;
+    let indices: Vec<usize> = indices_array.to_vec();
+    let indptr_array = indptr_dataset.read_1d::<usize>()?;
+    let indptr: Vec<usize> = indptr_array.to_vec();
+    
+    // Build CSR matrix
+    let csr: CsMat<u16> = CsMat::new(
+        (num_cells, num_features),
+        indptr.clone(),
+        indices.clone(),
+        data_slice.to_vec(),
+    );
+    
+    // Read position data into a map indexed by row number
+    let pos_file = File::open(pos_path.as_ref())?;
+    let mut pos_map: HashMap<usize, (f64, f64)> = HashMap::with_capacity(num_cells);
+    
+    match pos_type {
+        InputPosType::Csv => {
+            let mut rdr = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .from_reader(pos_file);
+            for (row_idx, rec) in rdr.records().enumerate() {
+                let rec = rec?;
+                let x: f64 = rec.get(pos_x_col).ok_or_else(|| anyhow::anyhow!("Missing x column"))?.parse()?;
+                let y: f64 = rec.get(pos_y_col).ok_or_else(|| anyhow::anyhow!("Missing y column"))?.parse()?;
+                pos_map.insert(row_idx, (x, y));
+            }
+        }
+        InputPosType::Parquet => {
+            let reader = SerializedFileReader::new(pos_file)?;
+            let mut iter = reader.get_row_iter(None)?;
+            let mut row_idx = 0;
+            while let Some(Ok(parquet_row)) = iter.next() {
+                let x = parquet_row.get_double(pos_x_col)
+                    .map_err(|e| anyhow::anyhow!("Failed to read x: {}", e))?;
+                let y = parquet_row.get_double(pos_y_col)
+                    .map_err(|e| anyhow::anyhow!("Failed to read y: {}", e))?;
+                pos_map.insert(row_idx, (x, y));
+                row_idx += 1;
+            }
+        }
+    }
+    
+    // Read cluster assignments
+    let clusters = read_cluster_file(cluster_path)?;
+    
+    // Encode each cluster
+    let mut encoded_clusters = Vec::new();
+    
+    for (cluster_idx, cell_ids) in clusters.iter().enumerate() {
+        info!("Encoding cluster {} with {} cells", cluster_idx, cell_ids.len());
+        
+        // Build Point vector for this cluster
+        let mut points = Vec::new();
+        let mut positions = Vec::new();
+        
+        for cell_id_str in cell_ids {
+            // Parse cell ID as row index
+            match cell_id_str.parse::<usize>() {
+                Ok(row_idx) => {
+                    // Check if row index is valid
+                    if row_idx >= num_cells {
+                        warn!("Cell row index {} out of bounds (max: {})", row_idx, num_cells - 1);
+                        continue;
+                    }
+                    
+                    // Look up position by row index
+                    if let Some(&(x, y)) = pos_map.get(&row_idx) {
+                        points.push(Point::new(x, y, row_idx));
+                        positions.push(DatalessPoint::new(x, y));
+                    } else {
+                        warn!("Cell row {} not found in position data", row_idx);
+                    }
+                }
+                Err(_) => {
+                    warn!("Cell ID '{}' is not a valid row index (must be integer)", cell_id_str);
+                }
+            }
+        }
+        
+        info!("Cluster {} has {} valid cells with positions", cluster_idx, points.len());
+        
+        // Encode this cluster
+        if let Some(encoded) = quad_tree::tree::encode_subarray(&points, &csr) {
+            info!("Cluster {} encoded: {} bytes", cluster_idx, encoded.bytes());
+            encoded_clusters.push((encoded, positions));
+        } else {
+            warn!("Failed to encode cluster {}", cluster_idx);
+        }
+    }
+    
+    Ok(encoded_clusters)
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 #[command(propagate_version = true)]
@@ -630,6 +783,8 @@ enum Commands {
     Build(BuildCommand),
     #[command(arg_required_else_help = true)]
     Dump(DumpCommand),
+    #[command(arg_required_else_help = true)]
+    EncodeClusters(EncodeClustersCommand),
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -663,6 +818,30 @@ struct DumpCommand {
     /// Output file
     #[arg(short = 'o', long)]
     output: PathBuf,
+}
+
+/// Encode clusters from a cluster assignment file
+#[derive(Debug, Args)]
+#[command(version, about, long_about = None)]
+struct EncodeClustersCommand {
+    /// HDF5 file with gene expression matrix
+    #[arg(short = 'i', long)]
+    input: PathBuf,
+    /// Position file (CSV or Parquet)
+    #[arg(short = 'p', long)]
+    input_pos: PathBuf,
+    /// Cluster assignment file (each line = cluster, cell IDs separated by semicolons)
+    #[arg(short = 'c', long)]
+    clusters: PathBuf,
+    /// Output file (default "clusters_encoded.bin.gz")
+    #[arg(short = 'o', long)]
+    output: Option<PathBuf>,
+    /// Input position file format (csv or parquet)
+    #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
+    pos_format: InputPosType,
+    /// Platform (visium or xenium)
+    #[arg(short = 'P', long = "platform", value_enum)]
+    platform: Option<Platform>,
 }
 
 /// Build a quadtree representation of spatial transcriptomics data
@@ -885,6 +1064,53 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 start += n;
             }
+        }
+        Commands::EncodeClusters(args) => {
+            info!("Starting cluster encoding");
+            
+            // Determine position columns based on platform
+            let (pos_x_col, pos_y_col) = match args.platform {
+                Some(Platform::Visium) => (4, 5),
+                Some(Platform::Xenium) => (1, 2),
+                None => (1, 2), // Default to Xenium format
+            };
+            
+            // Encode clusters
+            let encoded_clusters = encode_clusters_from_h5(
+                &args.input,
+                &args.input_pos,
+                &args.clusters,
+                args.pos_format,
+                pos_x_col,
+                pos_y_col,
+            )?;
+            
+            info!("Successfully encoded {} clusters", encoded_clusters.len());
+            
+            // Serialize to file
+            let config = bincode::config::standard()
+                .with_little_endian()
+                .with_fixed_int_encoding();
+            let ofname = args.output.unwrap_or(PathBuf::from("clusters_encoded.bin.gz"));
+            let file = File::create(&ofname)?;
+            let writer = BufWriter::new(file);
+            let mut encoder = GzEncoder::new(writer, Compression::default());
+            
+            // Separate encoded diffs and positions
+            let mut all_encoded_diffs = Vec::new();
+            let mut all_positions = Vec::new();
+            
+            for (encoded, positions) in encoded_clusters {
+                all_encoded_diffs.push(encoded);
+                all_positions.extend(positions);
+            }
+            
+            bincode::encode_into_std_write(&all_encoded_diffs, &mut encoder, config)?;
+            bincode::encode_into_std_write(&all_positions, &mut encoder, config)?;
+            
+            info!("Encoded clusters saved to: {}", ofname.display());
+            info!("Total encoded blocks: {}", all_encoded_diffs.len());
+            info!("Total positions: {}", all_positions.len());
         }
     }
     Ok(())

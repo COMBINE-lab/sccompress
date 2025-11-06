@@ -609,7 +609,7 @@ pub(crate) struct DatalessPoint {
 
 impl DatalessPoint {
     #[inline(always)]
-    const fn new(x: f64, y: f64) -> Self {
+    pub const fn new(x: f64, y: f64) -> Self {
         Self { x, y }
     }
     #[inline(always)]
