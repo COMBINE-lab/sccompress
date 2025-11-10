@@ -619,7 +619,7 @@ fn tree_from_10x<T: AsRef<Path>>(
 }
 
 /// Read cluster assignments from a file where each line contains cell IDs separated by semicolons
-fn read_cluster_file<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<String>>> {
+fn read_cluster_file_semicolon<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<String>>> {
     let file = File::open(cluster_path)?;
     let reader = BufReader::new(file);
     
@@ -642,12 +642,77 @@ fn read_cluster_file<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<
     Ok(clusters)
 }
 
+/// Read cluster assignments from a two-column file (cell_id, cluster_id)
+fn read_cluster_file_two_column<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<String>>> {
+    let file = File::open(cluster_path)?;
+    let reader = BufReader::new(file);
+    
+    // Use a HashMap to group cells by cluster ID
+    let mut cluster_map: HashMap<String, Vec<String>> = HashMap::new();
+    let mut first_line = true;
+    
+    for (line_num, line) in reader.lines().enumerate() {
+        let line = line?;
+        let line = line.trim();
+        
+        // Skip empty lines
+        if line.is_empty() {
+            continue;
+        }
+        
+        // Skip header line if it looks like a header
+        if first_line {
+            first_line = false;
+            // Check if this looks like a header (contains "Barcode" or "Cluster" etc.)
+            let lower = line.to_lowercase();
+            if lower.contains("barcode") || lower.contains("cell") || 
+               (lower.contains("cluster") && !line.chars().next().unwrap_or('0').is_numeric()) {
+                info!("Skipping header line: {}", line);
+                continue;
+            }
+        }
+        
+        // Try splitting by comma first (CSV format), then fall back to whitespace
+        let parts: Vec<&str> = if line.contains(',') {
+            line.split(',').collect()
+        } else {
+            line.split_whitespace().collect()
+        };
+        
+        if parts.len() < 2 {
+            warn!("Line {}: Expected 2 columns, found {}. Skipping.", line_num + 1, parts.len());
+            continue;
+        }
+        
+        // First column: cell ID, second column: cluster ID
+        let cell_id = parts[0].trim().trim_matches('"').to_string();
+        let cluster_id = parts[1].trim().trim_matches('"').to_string();
+        
+        cluster_map.entry(cluster_id).or_insert_with(Vec::new).push(cell_id);
+    }
+    
+    // Convert HashMap to Vec<Vec<String>> sorted by cluster ID
+    let mut cluster_ids: Vec<String> = cluster_map.keys().cloned().collect();
+    cluster_ids.sort();
+    
+    let mut clusters = Vec::new();
+    for cluster_id in cluster_ids {
+        let cell_ids = cluster_map.remove(&cluster_id).unwrap();
+        info!("Cluster '{}': {} cells", cluster_id, cell_ids.len());
+        clusters.push(cell_ids);
+    }
+    
+    info!("Total clusters loaded: {}", clusters.len());
+    Ok(clusters)
+}
+
 /// Encode clusters from HDF5 data
 fn encode_clusters_from_h5<T: AsRef<Path>>(
     h5_path: T,
     pos_path: T,
     cluster_path: T,
     pos_type: InputPosType,
+    cluster_format: ClusterFormat,
     pos_x_col: usize,
     pos_y_col: usize,
 ) -> anyhow::Result<Vec<(EncodedDiffs, Vec<DatalessPoint>)>> {
@@ -687,6 +752,19 @@ fn encode_clusters_from_h5<T: AsRef<Path>>(
         data_slice.to_vec(),
     );
     
+    // Read barcodes and create barcode -> row index map (needed for two-column format)
+    let barcodes_arr = barcodes_dataset.read_1d::<FixedAscii<23>>()?;
+    let barcodes: Vec<String> = barcodes_arr
+        .iter()
+        .map(|b| b.as_str().trim_end_matches('\0').to_string())
+        .collect();
+    
+    let barcode_to_idx: HashMap<String, usize> = barcodes
+        .iter()
+        .enumerate()
+        .map(|(idx, bc)| (bc.clone(), idx))
+        .collect();
+    
     // Read position data into a map indexed by row number
     let pos_file = File::open(pos_path.as_ref())?;
     let mut pos_map: HashMap<usize, (f64, f64)> = HashMap::with_capacity(num_cells);
@@ -718,26 +796,46 @@ fn encode_clusters_from_h5<T: AsRef<Path>>(
         }
     }
     
-    // Read cluster assignments
-    let clusters = read_cluster_file(cluster_path)?;
+    // Read cluster assignments based on format
+    let clusters = match cluster_format {
+        ClusterFormat::Semicolon => read_cluster_file_semicolon(cluster_path)?,
+        ClusterFormat::TwoColumn => read_cluster_file_two_column(cluster_path)?,
+    };
     
     // Encode each cluster
     let mut encoded_clusters = Vec::new();
     
     for (cluster_idx, cell_ids) in clusters.iter().enumerate() {
         info!("Encoding cluster {} with {} cells", cluster_idx, cell_ids.len());
+        if cell_ids.len() == 1 {
+            info!("this cellid {} is a single cell cluster", cell_ids[0]);
+        }
         
         // Build Point vector for this cluster
         let mut points = Vec::new();
         let mut positions = Vec::new();
         
         for cell_id_str in cell_ids {
-            // Parse cell ID as row index
-            match cell_id_str.parse::<usize>() {
-                Ok(row_idx) => {
+            // For two-column format, try barcode lookup first, then fall back to row index
+            // For semicolon format, always parse as row index
+            let row_idx_opt = if matches!(cluster_format, ClusterFormat::TwoColumn) {
+                // Try as barcode first
+                barcode_to_idx.get(cell_id_str).copied()
+                    .or_else(|| {
+                        // Fall back to parsing as row index
+                        cell_id_str.parse::<usize>().ok()
+                    })
+            } else {
+                // Semicolon format: always parse as row index
+                cell_id_str.parse::<usize>().ok()
+            };
+            
+            match row_idx_opt {
+                Some(row_idx) => {
                     // Check if row index is valid
                     if row_idx >= num_cells {
-                        warn!("Cell row index {} out of bounds (max: {})", row_idx, num_cells - 1);
+                        warn!("Cell '{}' maps to row index {} which is out of bounds (max: {})", 
+                              cell_id_str, row_idx, num_cells - 1);
                         continue;
                     }
                     
@@ -746,11 +844,11 @@ fn encode_clusters_from_h5<T: AsRef<Path>>(
                         points.push(Point::new(x, y, row_idx));
                         positions.push(DatalessPoint::new(x, y));
                     } else {
-                        warn!("Cell row {} not found in position data", row_idx);
+                        warn!("Cell '{}' (row {}) not found in position data", cell_id_str, row_idx);
                     }
                 }
-                Err(_) => {
-                    warn!("Cell ID '{}' is not a valid row index (must be integer)", cell_id_str);
+                None => {
+                    warn!("Cell ID '{}' not found as barcode and cannot be parsed as row index", cell_id_str);
                 }
             }
         }
@@ -808,6 +906,14 @@ enum Platform {
     Xenium,
 }
 
+#[derive(Debug, Clone, ValueEnum)]
+enum ClusterFormat {
+    /// Semicolon-separated format: each line is a cluster with cells separated by semicolons
+    Semicolon,
+    /// Two-column format: cell_id cluster_id (whitespace or tab separated)
+    TwoColumn,
+}
+
 /// Build a quadtree representation of spatial transcriptomics data
 #[derive(Debug, Args)]
 #[command(version, about, long_about = None)]
@@ -830,7 +936,7 @@ struct EncodeClustersCommand {
     /// Position file (CSV or Parquet)
     #[arg(short = 'p', long)]
     input_pos: PathBuf,
-    /// Cluster assignment file (each line = cluster, cell IDs separated by semicolons)
+    /// Cluster assignment file
     #[arg(short = 'c', long)]
     clusters: PathBuf,
     /// Output file (default "clusters_encoded.bin.gz")
@@ -842,6 +948,9 @@ struct EncodeClustersCommand {
     /// Platform (visium or xenium)
     #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
+    /// Cluster file format
+    #[arg(short = 'f', long = "cluster-format", value_enum, default_value_t = ClusterFormat::Semicolon)]
+    cluster_format: ClusterFormat,
 }
 
 /// Build a quadtree representation of spatial transcriptomics data
@@ -1081,6 +1190,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &args.input_pos,
                 &args.clusters,
                 args.pos_format,
+                args.cluster_format,
                 pos_x_col,
                 pos_y_col,
             )?;
