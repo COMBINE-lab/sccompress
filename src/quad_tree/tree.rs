@@ -176,8 +176,12 @@ impl EncodedDiffs {
 
                     // the first value in our sparse list that is >= first_idx
                     let start_cur = indices.0.geq_cursor(first_idx as u64);
+                    let stop_cur =if last_stored_index <= last_idx as u64 {
+                        last_stored_cursor
                     // the first value in our sparse list that is >= last_idx
-                    let stop_cur = indices.0.geq_cursor(last_idx as u64);
+                    }else{indices.0.geq_cursor(
+                        last_idx as u64
+                    )};
 
                     // if the first value is >= last_idx, then there are no
                     // non-zeros stored for this gene
