@@ -238,6 +238,86 @@ fn read_strings_as_bytes(
     Ok(strings)
 }
 
+fn tree_from_csv<T: AsRef<Path>>(
+    file_path: T,
+    idx_x: usize,
+    idx_y: usize,
+    idx_gene_start: usize,
+    idx_gene_end: Option<usize>,
+    _method: ErrorMetric,
+    _lossless: bool,
+) -> anyhow::Result<(QuadTree, CsMat<u16>)> {
+    let mut coords = Vec::new();
+    let mut xs = Vec::new();
+    let mut ys = Vec::new();
+
+    let mut rdr = ReaderBuilder::new()
+        .has_headers(true)
+        .flexible(true)
+        .from_path(file_path)
+        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
+
+    let records: Vec<_> = rdr
+        .records()
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?;
+
+    println!("Total records read: {}", records.len());
+
+    let num_columns = records[0].len();
+    let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
+    println!("num_columns: {}", num_columns);
+    let num_genes = idx_gene_end - idx_gene_start;
+    
+    use ndarray::Array2;
+    let mut dense_data = Vec::new();
+    
+    for record in &records {
+        for j in idx_gene_start..idx_gene_end {
+            let value: i16 = match record[j].parse::<f64>() {
+                Ok(v) => v as i16,
+                Err(_) => 0,
+            };
+            dense_data.push(value);
+        }
+    }
+    
+    let dense = Array2::from_shape_vec((records.len(), num_genes), dense_data)?;
+    let csr_i16 = CsMat::csr_from_dense(dense.view(), 0i16);
+    
+    let (rows, cols) = csr_i16.shape();
+    let (indptr, indices, data_i16) = csr_i16.into_raw_storage();
+    let data_u16: Vec<u16> = data_i16.into_iter().map(|x| x as u16).collect();
+    let csr = CsMat::new((rows, cols), indptr, indices, data_u16);
+
+    for row_idx in 0..records.len() {
+        let record = &records[row_idx];
+        let x: f64 = record[idx_x].parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse x coordinate at column {}: {}", idx_x, e)
+        })?;
+        let y: f64 = record[idx_y].parse().map_err(|e| {
+            anyhow::anyhow!("Failed to parse y coordinate at column {}: {}", idx_y, e)
+        })?;
+        xs.push(x);
+        ys.push(y);
+        coords.push(Point::new(x, y, row_idx));
+    }
+
+    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
+    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
+    let w = maxx - minx;
+    let h = maxy - miny;
+
+    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
+    let mut qtree = QuadTree::new(domain, coords, 0);
+
+    qtree.divide(&csr);
+    
+    Ok((qtree, csr))
+}
+
 fn tree_from_10x<T: AsRef<Path>>(
     h5_path: T,
     pos_path: T,
@@ -484,7 +564,7 @@ enum InputPosType {
 #[derive(Debug, Clone, ValueEnum)]
 enum InputDataType {
     Csr,
-//    Csv,
+    Csv,
     H5ad,
    // Mtx,
    // v2,
@@ -618,6 +698,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => (args.idx_x, args.idx_y),
             };
             let (qtree, csr) = match args.format {
+                InputDataType::Csv => {
+                    tree_from_csv(
+                        &args.input,
+                        args.idx_x,
+                        args.idx_y,
+                        args.idx_gene_start,
+                        args.idx_gene_end,
+                        ErrorMetric::Mean,
+                        true,
+                    )?
+                }
                 InputDataType::Csr
                 | InputDataType::H5ad => {
                     let file_path_pos = args
@@ -632,10 +723,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         },
                         match args.format {
                             InputDataType::Csr => InputDataType::Csr,
-                            //InputDataType::Csv => InputDataType::Csv,
+                            InputDataType::Csv => InputDataType::Csv,
                             InputDataType::H5ad => InputDataType::H5ad,
-                            //InputDataType::Mtx => InputDataType::Mtx,
-                            //InputDataType::v2 => InputDataType::v2,
                         },
                         pos_x_col,
                         pos_y_col,
