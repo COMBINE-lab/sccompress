@@ -119,7 +119,7 @@ impl EncodedDiffs {
 
                 let first_idx = self.num_genes() * cell_ind;
                 // the first index to start iterating from
-                info!("num_ones: {}", *num_ones);
+                //info!("num_ones: {}", *num_ones);
                 
                 //let mut diff_iter = self.diffs.iter().skip(*num_ones);
                 let mut diff_pos = *num_ones;
@@ -682,10 +682,13 @@ impl Rect {
 
     #[inline(always)]
     pub(crate) const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64) -> Self {
-        let w = west - east;
-        let h = north - south;
-        let cx = west + (w / 2_f64);
-        let cy = south + (h / 2_f64);
+        //let w = west - east;
+        //let h = north - south;
+        //let cx = west + (w / 2_f64); // should be east + (w / 2_f64)
+        //let cy = south + (h / 2_f64);
+        let cx = (west + east) / 2_f64;
+        let cy = (south + north) / 2_f64;
+
         Self {
             cx,
             cy,
