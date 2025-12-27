@@ -672,10 +672,12 @@ impl Rect {
 
     #[inline(always)]
     pub(crate) const fn new_from_bounds(west: f64, east: f64, north: f64, south: f64) -> Self {
-        let w = west - east;
-        let h = north - south;
-        let cx = west + (w / 2_f64);
-        let cy = south + (h / 2_f64);
+        //let w = west - east;
+        //let h = north - south;
+        //let cx = west + (w / 2_f64);
+        //let cy = south + (h / 2_f64);
+        let cx = (west + east) / 2_f64;
+        let cy = (south + north) / 2_f64;
         Self {
             cx,
             cy,
