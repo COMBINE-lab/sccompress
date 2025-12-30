@@ -995,10 +995,6 @@ impl EncodedDiffsMST {
     
     /// Get the delta list for cell at order_idx (0-based among non-root cells)
     fn get_cell_deltas(&self, order_idx: usize) -> Vec<(u32, i32)> {
-        // Use select to find boundaries
-        // boundary has pattern: 1 0 0 0 1 0 0 1 0 ...
-        //                       ^       ^     ^
-        //                       cell0   cell1 cell2
         
         // Find position of (order_idx + 1)-th 1-bit
         let bit_start = if order_idx == 0 {
