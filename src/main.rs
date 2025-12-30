@@ -343,10 +343,11 @@ fn tree_from_csv<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let qtree = QuadTree::new(domain, coords, 0);
+    let mut qtree = QuadTree::new(domain, coords, 0);
 
      // Divide the quadtree and get cost log
-    /*let division_cost_log = qtree.divide_recursive(&csr);
+     let division_cost_log = qtree.divide_recursive(&csr);
+    /*
     //info!("Division cost log contains {} steps", division_cost_log.steps.len());
     //info!("Total nodes processed: {}", division_cost_log.total_nodes);
     //info!("Total cost: {}", division_cost_log.total_cost);
