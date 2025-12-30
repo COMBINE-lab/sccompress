@@ -176,12 +176,11 @@ impl EncodedDiffs {
 
                     // the first value in our sparse list that is >= first_idx
                     let start_cur = indices.0.geq_cursor(first_idx as u64);
-                    let stop_cur =if last_stored_index <= last_idx as u64 {
+                    let last_in_this_cell = last_stored_index <= last_idx as u64;
+                    let stop_cur =if last_in_this_cell {
                         last_stored_cursor
                     // the first value in our sparse list that is >= last_idx
-                    }else{indices.0.geq_cursor(
-                        last_idx as u64
-                    )};
+                    }else{indices.0.geq_cursor(last_idx as u64)};
 
                     // if the first value is >= last_idx, then there are no
                     // non-zeros stored for this gene
@@ -195,7 +194,7 @@ impl EncodedDiffs {
 
                     let start = start_cur.index();
 
-                    let stop = if !stop_cur.is_valid() || cell_ind == self.num_cells() - 1 {
+                    let stop = if !stop_cur.is_valid() || cell_ind == self.num_cells() - 1 || last_in_this_cell {
                         self.diffs.len()
                     } else {
                         stop_cur.index()
@@ -522,6 +521,7 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
             // Optionally still panic if you want to stop on first error
             // assert_eq!(recon_vec, orig_data.to_vec());
 
+            // Save only the error cell
             use std::io::Write;
             let f = std::fs::File::create("bad_cells.coo").expect("Should be able to create file");
             let mut f = std::io::BufWriter::new(f);
