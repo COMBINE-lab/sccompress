@@ -1,4 +1,4 @@
-use crate::bits::HybridSparseVec;
+use crate::bits::{HybridSparseVec, EFVector, InnerEFVector};
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
 use rayon::join;
@@ -43,20 +43,148 @@ pub(crate) struct EncodedDiffs {
 }
 
 /// MST-based delta encoding for a block of cells
-/// Stores deltas along MST edges instead of per-cell residuals
+/// Stores root expression + deltas along MST edges (no median needed)
+/// Root is always cell 0, cells are stored in DFS order
 #[derive(Clone)]
-pub(crate) struct EncodedDiffsMST {
-    pub(crate) ncells: u32,
-    pub(crate) num_genes: u32,
-    pub(crate) medians: BitFieldVec,           // per-gene medians
-    pub(crate) root: u32,                       // root cell index
-    pub(crate) parent: Vec<u32>,                // parent[c] = parent of cell c in MST (root has self)
-    pub(crate) root_residual_genes: DacsOpt,    // sparse gene indices for root
-    pub(crate) root_residual_vals: DacsOpt,     // sparse values for root (zigzag encoded)
+pub struct EncodedDiffsMST {
+    pub(crate) num_genes: u32,                  // needed for output vector size
+    pub(crate) ncells: u32,                     // number of cells (needed to reconstruct)
+    pub(crate) dfs_order: DacsOpt,              // DFS traversal order: dfs_order[i] = original cell index at position i
+    pub(crate) parent_offset: DacsOpt,          // parent_offset[i] = i - parent_position (small positive numbers!)
+    pub(crate) root_indices: HybridSparseVec,   // bitvector or EF for root's non-zero gene indices
+    pub(crate) root_vals: DacsOpt,              // expression values for root (parallel to root_indices 1-bits)
     pub(crate) delta_genes: DacsOpt,            // concatenated gene indices for all deltas
-    pub(crate) delta_vals: DacsOpt,             // concatenated delta values (zigzag encoded)
+    pub(crate) delta_vals: DacsOpt,             // delta values (zigzag encoded)
     pub(crate) boundary: Rank9Sel,              // bitvector: 1 marks start of each cell's deltas
-    pub(crate) order: Vec<u32>,                 // traversal order (non-root cells)
+}
+
+impl EncodedDiffsMST {
+    pub(crate) fn empty() -> Self {
+        EncodedDiffsMST {
+            num_genes: 0,
+            ncells: 0,
+            dfs_order: DacsOpt::default(),
+            parent_offset: DacsOpt::default(),
+            root_indices: HybridSparseVec::empty(),
+            root_vals: DacsOpt::default(),
+            delta_genes: DacsOpt::default(),
+            delta_vals: DacsOpt::default(),
+            boundary: Rank9Sel::from_bits(vec![]),
+        }
+    }
+    
+    #[allow(dead_code)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.ncells == 0
+    }
+    
+    #[allow(dead_code)]
+    pub(crate) fn len(&self) -> usize {
+        self.ncells as usize
+    }
+}
+
+impl Encode for EncodedDiffsMST {
+    fn encode<E: bincode::enc::Encoder>(
+        &self,
+        encoder: &mut E,
+    ) -> core::result::Result<(), bincode::error::EncodeError> {
+        Encode::encode(&self.num_genes, encoder)?;
+        Encode::encode(&self.ncells, encoder)?;
+        
+        // Serialize DacsOpt fields
+        let mut dfs_order_bytes = Vec::new();
+        self.dfs_order.serialize_into(&mut dfs_order_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
+        Encode::encode(&dfs_order_bytes, encoder)?;
+        
+        let mut parent_offset_bytes = Vec::new();
+        self.parent_offset.serialize_into(&mut parent_offset_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
+        Encode::encode(&parent_offset_bytes, encoder)?;
+        
+        // HybridSparseVec has built-in Encode
+        Encode::encode(&self.root_indices, encoder)?;
+        
+        let mut root_vals_bytes = Vec::new();
+        self.root_vals.serialize_into(&mut root_vals_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
+        Encode::encode(&root_vals_bytes, encoder)?;
+        
+        let mut delta_genes_bytes = Vec::new();
+        self.delta_genes.serialize_into(&mut delta_genes_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
+        Encode::encode(&delta_genes_bytes, encoder)?;
+        
+        let mut delta_vals_bytes = Vec::new();
+        self.delta_vals.serialize_into(&mut delta_vals_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
+        Encode::encode(&delta_vals_bytes, encoder)?;
+        
+        // Serialize Rank9Sel
+        let mut boundary_bytes = Vec::new();
+        self.boundary.serialize_into(&mut boundary_bytes)
+            .map_err(|_| bincode::error::EncodeError::OtherString("Rank9Sel serialize failed".into()))?;
+        Encode::encode(&boundary_bytes, encoder)?;
+        
+        Ok(())
+    }
+}
+
+impl<Context> Decode<Context> for EncodedDiffsMST {
+    fn decode<D: bincode::de::Decoder<Context = Context>>(
+        decoder: &mut D,
+    ) -> core::result::Result<Self, bincode::error::DecodeError> {
+        let num_genes: u32 = Decode::decode(decoder)?;
+        let ncells: u32 = Decode::decode(decoder)?;
+        
+        let dfs_order_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let dfs_order = DacsOpt::deserialize_from(&dfs_order_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+        
+        let parent_offset_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let parent_offset = DacsOpt::deserialize_from(&parent_offset_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+        
+        let root_indices: HybridSparseVec = Decode::decode(decoder)?;
+        
+        let root_vals_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let root_vals = DacsOpt::deserialize_from(&root_vals_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+        
+        let delta_genes_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let delta_genes = DacsOpt::deserialize_from(&delta_genes_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+        
+        let delta_vals_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let delta_vals = DacsOpt::deserialize_from(&delta_vals_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+        
+        let boundary_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let boundary = Rank9Sel::deserialize_from(&boundary_bytes[..])
+            .map_err(|_| bincode::error::DecodeError::OtherString("Rank9Sel deserialize failed".into()))?;
+        
+        Ok(Self {
+            num_genes,
+            ncells,
+            dfs_order,
+            parent_offset,
+            root_indices,
+            root_vals,
+            delta_genes,
+            delta_vals,
+            boundary,
+        })
+    }
+}
+
+impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffsMST {
+    fn borrow_decode<D: bincode::de::BorrowDecoder<'de, Context = Context>>(
+        decoder: &mut D,
+    ) -> Result<Self, bincode::error::DecodeError> {
+        // Reuse the Decode implementation
+        <Self as Decode<Context>>::decode(decoder)
+    }
 }
 
 fn decode_v(diff: i32) -> i32 {
@@ -577,69 +705,66 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
 // MST-based encoding functions
 // ============================================================================
 
-/// Sparse residual: (gene_index, zigzag-encoded value)
-type SparseResidual = Vec<(u32, i32)>;
+/// Sparse expression: (gene_index, value)
+type SparseExpression = Vec<(u32, u16)>;
 
-/// Compute sparse residual for a single cell: R[c][g] = X[c][g] - median[g]
-/// Only stores non-zero residuals where both val != 0 and median != 0
-fn compute_sparse_residual(
+/// Extract sparse expression for a single cell (no median subtraction)
+/// Only stores non-zero values
+fn compute_sparse_expression(
     point: &Point,
     data: &CsMat<u16>,
-    median_vec: &[u16],
-) -> SparseResidual {
-    let mut residual = Vec::new();
+) -> SparseExpression {
+    let mut expression = Vec::new();
     if let Some(row) = point.get_data(data) {
         for (gene_idx, &val) in row.iter() {
-            let median = median_vec[gene_idx];
-            // Skip if either is zero (same logic as original encode_subarray)
-            if median == 0 || val == 0 {
-                continue;
+            if val != 0 {
+                expression.push((gene_idx as u32, val));
             }
-            let diff = val as i32 - median as i32;
-            // Zigzag encode
-            let encoded = if diff < 0 {
-                (-2 * diff) + 1
-            } else {
-                2 * diff
-            };
-            residual.push((gene_idx as u32, encoded));
         }
     }
-    residual
+    expression
 }
 
-/// L0 diff: count genes where values differ between two sparse residuals
-fn l0_diff(a: &SparseResidual, b: &SparseResidual) -> u32 {
-    let mut count = 0u32;
+/// L1 diff: sum of absolute differences between expression values
+/// Better for compression than L0 because it measures actual delta sizes
+fn l1_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
+    let mut sum = 0u32;
     let mut i = 0;
     let mut j = 0;
     
     while i < a.len() && j < b.len() {
         match a[i].0.cmp(&b[j].0) {
             std::cmp::Ordering::Less => {
-                count += 1; // gene in a but not b
+                sum += a[i].1 as u32; // Gene only in a: |a - 0| = a
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                count += 1; // gene in b but not a
+                sum += b[j].1 as u32; // Gene only in b: |0 - b| = b
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                if a[i].1 != b[j].1 {
-                    count += 1; // same gene, different value
-                }
+                sum += (a[i].1 as i32 - b[j].1 as i32).unsigned_abs();
                 i += 1;
                 j += 1;
             }
         }
     }
-    count += (a.len() - i) as u32 + (b.len() - j) as u32;
-    count
+    // Remaining in a
+    while i < a.len() {
+        sum += a[i].1 as u32;
+        i += 1;
+    }
+    // Remaining in b
+    while j < b.len() {
+        sum += b[j].1 as u32;
+        j += 1;
+    }
+    sum
 }
 
-/// Sparse subtract: compute diff_list = R[child] - R[parent]
-/// Returns list of (gene, delta) where delta != 0
-fn sparse_subtract(child: &SparseResidual, parent: &SparseResidual) -> Vec<(u32, i32)> {
+/// Sparse subtract: compute delta = child_expr - parent_expr
+/// Returns list of (gene, zigzag_encoded_delta) where delta != 0
+fn sparse_subtract(child: &SparseExpression, parent: &SparseExpression) -> Vec<(u32, i32)> {
     let mut result = Vec::new();
     let mut i = 0;
     let mut j = 0;
@@ -647,87 +772,151 @@ fn sparse_subtract(child: &SparseResidual, parent: &SparseResidual) -> Vec<(u32,
     while i < child.len() && j < parent.len() {
         match child[i].0.cmp(&parent[j].0) {
             std::cmp::Ordering::Less => {
-                // Gene only in child
-                result.push((child[i].0, child[i].1));
+                // Gene only in child: delta = child_val - 0 = child_val
+                let delta = child[i].1 as i32;
+                result.push((child[i].0, zigzag_encode(delta)));
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
                 // Gene only in parent: delta = 0 - parent_val = -parent_val
-                // But we need to negate the zigzag value properly
-                // For simplicity, store the negated zigzag (will decode correctly)
-                result.push((parent[j].0, negate_zigzag(parent[j].1)));
+                let delta = -(parent[j].1 as i32);
+                result.push((parent[j].0, zigzag_encode(delta)));
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                let delta = child[i].1 - parent[j].1;
+                let delta = child[i].1 as i32 - parent[j].1 as i32;
                 if delta != 0 {
-                    result.push((child[i].0, delta));
+                    result.push((child[i].0, zigzag_encode(delta)));
                 }
                 i += 1;
                 j += 1;
             }
         }
     }
-    // Remaining in child
+    // Remaining in child (parent has 0)
     while i < child.len() {
-        result.push((child[i].0, child[i].1));
+        let delta = child[i].1 as i32;
+        result.push((child[i].0, zigzag_encode(delta)));
         i += 1;
     }
-    // Remaining in parent (negated)
+    // Remaining in parent (child has 0)
     while j < parent.len() {
-        result.push((parent[j].0, negate_zigzag(parent[j].1)));
+        let delta = -(parent[j].1 as i32);
+        result.push((parent[j].0, zigzag_encode(delta)));
         j += 1;
     }
     result
 }
 
-/// Negate a zigzag-encoded value
-fn negate_zigzag(v: i32) -> i32 {
-    // Decode, negate, re-encode
-    let decoded = decode_v(v);
-    let negated = -decoded;
-    if negated < 0 {
-        (-2 * negated) + 1
+/// Zigzag encode: maps signed to unsigned for efficient storage
+/// 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, 2 -> 4, ...
+fn zigzag_encode(v: i32) -> i32 {
+    if v < 0 {
+        (-2 * v) - 1
     } else {
-        2 * negated
+        2 * v
     }
 }
 
-/// Find k nearest spatial neighbors of point i (excluding self)
-fn k_nearest_neighbors<P: PointLike>(points: &[P], i: usize, k: usize) -> Vec<usize> {
-    if points.len() <= 1 {
-        return Vec::new();
+/// Build symmetric kNN graph for all points using grid-based spatial index
+/// Returns adjacency list where neighbors[i] contains all neighbors of cell i
+/// Graph is undirected: if A is neighbor of B, then B is neighbor of A
+fn build_symmetric_knn<P: PointLike>(points: &[P], k: usize) -> Vec<Vec<usize>> {
+    use std::collections::{HashMap, HashSet};
+    
+    let n = points.len();
+    if n <= 1 {
+        return vec![Vec::new(); n];
     }
     
-    let mut distances: Vec<(usize, f64)> = points
-        .iter()
-        .enumerate()
-        .filter(|(j, _)| *j != i)
-        .map(|(j, p)| {
-            let dx = p.xpos() - points[i].xpos();
-            let dy = p.ypos() - points[i].ypos();
-            (j, dx * dx + dy * dy)
-        })
-        .collect();
-    
-    let k_actual = k.min(distances.len());
-    if k_actual == 0 {
-        return Vec::new();
+    // Find bounding box
+    let (mut min_x, mut max_x) = (f64::MAX, f64::MIN);
+    let (mut min_y, mut max_y) = (f64::MAX, f64::MIN);
+    for p in points {
+        min_x = min_x.min(p.xpos());
+        max_x = max_x.max(p.xpos());
+        min_y = min_y.min(p.ypos());
+        max_y = max_y.max(p.ypos());
     }
     
-    // Partial sort to get k smallest
-    distances.select_nth_unstable_by(k_actual - 1, |a, b| {
-        a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // Grid cell size: aim for ~k points per cell on average
+    let area = (max_x - min_x + 1.0) * (max_y - min_y + 1.0);
+    let cell_size = (area / (n as f64 / k as f64)).sqrt().max(1.0);
     
-    distances[..k_actual].iter().map(|(j, _)| *j).collect()
+    // Build grid index
+    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
+    for (i, p) in points.iter().enumerate() {
+        let gx = ((p.xpos() - min_x) / cell_size) as i32;
+        let gy = ((p.ypos() - min_y) / cell_size) as i32;
+        grid.entry((gx, gy)).or_default().push(i);
+    }
+    
+    // For each point, find k nearest from neighboring grid cells
+    let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); n];
+    
+    for (i, p) in points.iter().enumerate() {
+        let gx = ((p.xpos() - min_x) / cell_size) as i32;
+        let gy = ((p.ypos() - min_y) / cell_size) as i32;
+        
+        // Collect candidates from neighborhood (expand if needed)
+        let mut candidates: Vec<(usize, f64)> = Vec::new();
+        let mut radius = 2;
+        
+        // Expand search radius until we find at least k candidates or hit max
+        while candidates.len() < k && radius <= 10 {
+            candidates.clear();
+            for dx in -radius..=radius {
+                for dy in -radius..=radius {
+                    if let Some(cell_points) = grid.get(&(gx + dx, gy + dy)) {
+                        for &j in cell_points {
+                            if j != i {
+                                let dist_sq = (p.xpos() - points[j].xpos()).powi(2) 
+                                            + (p.ypos() - points[j].ypos()).powi(2);
+                                candidates.push((j, dist_sq));
+                            }
+                        }
+                    }
+                }
+            }
+            radius += 2;
+        }
+        
+        // Fallback: if still not enough, do brute force for this point
+        if candidates.len() < k && candidates.len() < n - 1 {
+            candidates.clear();
+            for (j, other) in points.iter().enumerate() {
+                if j != i {
+                    let dist_sq = (p.xpos() - other.xpos()).powi(2) 
+                                + (p.ypos() - other.ypos()).powi(2);
+                    candidates.push((j, dist_sq));
+                }
+            }
+        }
+        
+        // Get k nearest
+        let k_actual = k.min(candidates.len());
+        if k_actual > 0 {
+            candidates.select_nth_unstable_by(k_actual - 1, |a, b| {
+                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
+            });
+            
+            // Add symmetric edges
+            for &(j, _) in &candidates[..k_actual] {
+                neighbors[i].insert(j);
+                neighbors[j].insert(i);  // Symmetric!
+            }
+        }
+    }
+    
+    // Convert to Vec<Vec<usize>>
+    neighbors.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
-/// Build MST using Prim's algorithm over kNN neighbor graph
-/// This only considers edges to k-nearest spatial neighbors, matching the pseudocode
+/// Build MST using Prim's algorithm over symmetric kNN neighbor graph
+/// Uses grid-based spatial index for O(N) kNN construction instead of O(N²)
 fn build_mst_prim<P: PointLike>(
     points: &[P],
-    residuals: &[SparseResidual],
+    expressions: &[SparseExpression],
     k: usize,
 ) -> (usize, Vec<u32>) {
     use std::collections::BinaryHeap;
@@ -741,13 +930,11 @@ fn build_mst_prim<P: PointLike>(
         return (0, vec![0]);
     }
     
-    // Precompute kNN neighbors for each cell
-    let neighbors: Vec<Vec<usize>> = (0..n)
-        .map(|i| k_nearest_neighbors(points, i, k))
-        .collect();
+    // Build symmetric kNN graph using grid-based spatial index - O(N) instead of O(N²)!
+    let neighbors = build_symmetric_knn(points, k);
     
-    // Prim's algorithm
-    let root = 0; // Could choose cell with smallest total residual
+    // Root is always cell 0 for simplicity
+    let root = 0;
     let mut parent = vec![u32::MAX; n];
     let mut key = vec![u32::MAX; n];  // Minimum edge weight to reach this node
     let mut in_mst = vec![false; n];
@@ -766,10 +953,10 @@ fn build_mst_prim<P: PointLike>(
         
         in_mst[u] = true;
         
-        // Check all kNN neighbors of u
+        // Check all neighbors of u (graph is symmetric, no reverse check needed!)
         for &v in &neighbors[u] {
             if !in_mst[v] {
-                let weight = l0_diff(&residuals[u], &residuals[v]);
+                let weight = l1_diff(&expressions[u], &expressions[v]);
                 if weight < key[v] {
                     key[v] = weight;
                     parent[v] = u as u32;
@@ -777,22 +964,10 @@ fn build_mst_prim<P: PointLike>(
                 }
             }
         }
-        
-        // Also check neighbors where u is in their kNN (reverse edges)
-        // This ensures the graph is effectively undirected
-        for i in 0..n {
-            if !in_mst[i] && neighbors[i].contains(&u) {
-                let weight = l0_diff(&residuals[u], &residuals[i]);
-                if weight < key[i] {
-                    key[i] = weight;
-                    parent[i] = u as u32;
-                    heap.push(Reverse((weight, i)));
-                }
-            }
-        }
+        // No reverse edge check needed - graph is symmetric!
     }
     
-    // Handle any disconnected nodes (shouldn't happen with proper kNN, but be safe)
+    // Handle any disconnected nodes (shouldn't happen with symmetric kNN, but be safe)
     for i in 0..n {
         if parent[i] == u32::MAX {
             warn!("Node {} was disconnected, connecting to root", i);
@@ -803,7 +978,55 @@ fn build_mst_prim<P: PointLike>(
     (root, parent)
 }
 
+/// Compute DFS traversal order of MST starting from root
+/// Returns (dfs_order, parent_in_dfs_order)
+/// dfs_order[i] = original cell index at DFS position i
+/// parent_in_dfs_order[i] = DFS position of parent of cell at position i
+fn compute_dfs_order(root: usize, parent: &[u32], n: usize) -> (Vec<u32>, Vec<u32>) {
+    // Build adjacency list (children of each node)
+    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
+    for i in 0..n {
+        if i != root {
+            let p = parent[i] as usize;
+            children[p].push(i);
+        }
+    }
+    
+    // DFS traversal
+    let mut dfs_order = Vec::with_capacity(n);
+    let mut pos_in_dfs = vec![0u32; n]; // pos_in_dfs[orig_cell] = position in DFS order
+    let mut stack = vec![root];
+    
+    while let Some(node) = stack.pop() {
+        pos_in_dfs[node] = dfs_order.len() as u32;
+        dfs_order.push(node as u32);
+        // Push children in reverse order so they're processed in order
+        for &child in children[node].iter().rev() {
+            stack.push(child);
+        }
+    }
+    
+    // Compute parent offset in DFS order
+    // parent_offset[i] = i - (DFS position of parent)
+    // For root, offset = 0
+    let mut parent_offset = Vec::with_capacity(n);
+    for (dfs_pos, &orig_cell) in dfs_order.iter().enumerate() {
+        if orig_cell as usize == root {
+            parent_offset.push(0);
+        } else {
+            let parent_orig = parent[orig_cell as usize] as usize;
+            let parent_dfs_pos = pos_in_dfs[parent_orig];
+            // Offset is always positive since parent comes before child in DFS
+            parent_offset.push((dfs_pos as u32) - parent_dfs_pos);
+        }
+    }
+    
+    (dfs_order, parent_offset)
+}
+
 /// MST-based encoding of a subarray (block of cells)
+/// Uses raw expression values with deltas along MST edges (no median)
+/// Cells are stored in DFS order with parent offsets for efficient compression
 pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffsMST> {
     if points.is_empty() {
         return None;
@@ -812,59 +1035,33 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
     let num_genes = data.cols() as u32;
     let ncells = points.len() as u32;
     
-    // Step 1: Compute per-gene medians (same as original)
-    let mut gene_values: Vec<Vec<u16>> = vec![Vec::new(); data.cols()];
-    for p in points.iter() {
-        if let Some(row) = p.get_data(data) {
-            for (gene_idx, &val) in row.iter() {
-                gene_values[gene_idx].push(val);
-            }
-        }
-    }
-    
-    let mut median_vec = Vec::with_capacity(data.cols());
-    for j in 0..data.cols() {
-        let nz_values = &mut gene_values[j];
-        let median = if !nz_values.is_empty() {
-            let mid = nz_values.len() / 2;
-            *nz_values.select_nth_unstable(mid).1
-        } else {
-            0
-        };
-        median_vec.push(median);
-    }
-    
-    // Step 2: Compute sparse residuals for ALL cells
-    let residuals: Vec<SparseResidual> = points
+    // Step 1: Compute sparse expression for ALL cells (no median)
+    let expressions: Vec<SparseExpression> = points
         .iter()
-        .map(|p| compute_sparse_residual(p, data, &median_vec))
+        .map(|p| compute_sparse_expression(p, data))
         .collect();
     
-    // Step 3 & 4: Build kNN graph + MST using petgraph
+    // Step 2: Build kNN graph + MST using Prim's algorithm
     let k = 8; // Number of neighbors
-    let (root, parent) = build_mst_prim(points, &residuals, k);
+    let (root, parent) = build_mst_prim(points, &expressions, k);
     
-    // Step 5: Encode deltas along MST edges
-    let root_residual = &residuals[root];
+    // Step 3: Compute DFS order and parent offsets
+    let (dfs_order_vec, parent_offset_vec) = compute_dfs_order(root, &parent, points.len());
     
-    // Separate root residual into genes and values
-    let root_genes: Vec<u32> = root_residual.iter().map(|(g, _)| *g).collect();
-    let root_vals: Vec<u32> = root_residual.iter().map(|(_, v)| *v as u32).collect();
+    // Step 4: Encode root cell's expression directly (root is first in DFS order)
+    let root_expr = &expressions[root];
+    let root_genes_vec: Vec<u32> = root_expr.iter().map(|(g, _)| *g).collect();
+    let root_vals_vec: Vec<u32> = root_expr.iter().map(|(_, v)| *v as u32).collect();
     
-    // Build order (BFS order excluding root)
-    let order: Vec<u32> = (0..points.len())
-        .filter(|&c| c != root)
-        .map(|c| c as u32)
-        .collect();
-    
-    // Encode deltas for each non-root cell
+    // Step 5: Encode deltas for each non-root cell IN DFS ORDER
     let mut delta_genes_raw = Vec::new();
     let mut delta_vals_raw = Vec::new();
     let mut boundary_bits = Vec::new();
     
-    for &c in &order {
-        let p = parent[c as usize] as usize;
-        let diff_list = sparse_subtract(&residuals[c as usize], &residuals[p]);
+    // Skip first cell (root), process rest in DFS order
+    for (dfs_pos, &orig_cell) in dfs_order_vec.iter().enumerate().skip(1) {
+        let parent_orig = parent[orig_cell as usize] as usize;
+        let diff_list = sparse_subtract(&expressions[orig_cell as usize], &expressions[parent_orig]);
         
         // Mark start of this cell's deltas
         boundary_bits.push(true);
@@ -873,25 +1070,36 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
         for (g, d) in &diff_list {
             delta_genes_raw.push(*g);
             delta_vals_raw.push(*d as u32);
-            boundary_bits.push(false); // zeros after the 1
+            boundary_bits.push(false);
         }
     }
     
     // Convert to compressed structures
-    let medians = BitFieldVec::<usize>::from_slice(&median_vec).expect("should fit");
-    
-    let root_residual_genes = if root_genes.is_empty() {
+    // DFS order: cell indices (bounded by ncells, compresses well)
+    let dfs_order = if dfs_order_vec.is_empty() {
         DacsOpt::default()
     } else {
-        DacsOpt::from_slice(&root_genes, Some(3)).expect("should fit")
+        DacsOpt::from_slice(&dfs_order_vec, Some(3)).expect("should fit")
     };
     
-    let root_residual_vals = if root_vals.is_empty() {
+    // Parent offsets: small positive numbers (usually 1-10), compress very well!
+    let parent_offset = if parent_offset_vec.is_empty() {
         DacsOpt::default()
     } else {
-        DacsOpt::from_slice(&root_vals, Some(3)).expect("should fit")
+        DacsOpt::from_slice(&parent_offset_vec, Some(3)).expect("should fit")
     };
     
+    // Use HybridSparseVec for root indices (auto-selects bitvector vs EF based on density)
+    let root_genes_u64: Vec<u64> = root_genes_vec.iter().map(|&g| g as u64).collect();
+    let root_indices = HybridSparseVec::from_indices(&root_genes_u64, 0.5, num_genes as usize);
+    
+    let root_vals = if root_vals_vec.is_empty() {
+        DacsOpt::default()
+    } else {
+        DacsOpt::from_slice(&root_vals_vec, Some(3)).expect("should fit")
+    };
+    
+    // Keep delta_genes as DacsOpt (gene indices are sequential, not bitvector)
     let delta_genes = if delta_genes_raw.is_empty() {
         DacsOpt::default()
     } else {
@@ -908,89 +1116,114 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
     let boundary = Rank9Sel::from_bits(boundary_bits);
     
     info!(
-        "MST encoding: {} cells, root residual {} entries, {} total delta entries",
-        ncells,
-        root_genes.len(),
-        delta_genes_raw.len()
+        "MST encoding: {} cells, root {} entries ({} type), {} total delta entries, parent_offset avg: {:.1}",
+        points.len(),
+        root_genes_vec.len(),
+        root_indices.tyname(),
+        delta_genes_raw.len(),
+        if parent_offset_vec.len() > 1 {
+            parent_offset_vec.iter().skip(1).map(|&x| x as f64).sum::<f64>() / (parent_offset_vec.len() - 1) as f64
+        } else { 0.0 }
     );
     
     Some(EncodedDiffsMST {
-        ncells,
         num_genes,
-        medians,
-        root: root as u32,
-        parent,
-        root_residual_genes,
-        root_residual_vals,
+        ncells,
+        dfs_order,
+        parent_offset,
+        root_indices,
+        root_vals,
         delta_genes,
         delta_vals,
         boundary,
-        order,
     })
 }
 
 impl EncodedDiffsMST {
-    /// Decode the expression vector for a single cell
-    pub fn decode_cell(&self, cell_idx: usize) -> Vec<u16> {
+    /// Number of cells
+    #[inline]
+    fn num_cells_internal(&self) -> usize {
+        self.ncells as usize
+    }
+    
+    /// Get original cell index at DFS position
+    fn orig_cell_at_dfs_pos(&self, dfs_pos: usize) -> usize {
+        self.dfs_order.access(dfs_pos).unwrap_or(0) as usize
+    }
+    
+    /// Find DFS position of an original cell index
+    fn dfs_pos_of_cell(&self, orig_cell: usize) -> Option<usize> {
+        for i in 0..self.num_cells_internal() {
+            if self.orig_cell_at_dfs_pos(i) == orig_cell {
+                return Some(i);
+            }
+        }
+        None
+    }
+    
+    /// Get parent's DFS position from a cell's DFS position using offset
+    fn parent_dfs_pos(&self, dfs_pos: usize) -> usize {
+        if dfs_pos == 0 {
+            return 0; // Root's parent is itself
+        }
+        let offset = self.parent_offset.access(dfs_pos).unwrap_or(0) as usize;
+        dfs_pos.saturating_sub(offset)
+    }
+    
+    /// Decode the expression vector for a single cell (by original cell index)
+    /// No median - uses raw expression from root + deltas along MST path
+    pub fn decode_cell(&self, orig_cell_idx: usize) -> Vec<u16> {
         let mut expression = vec![0u16; self.num_genes as usize];
         
-        // Start with root residual
+        // Find DFS position of this cell
+        let dfs_pos = match self.dfs_pos_of_cell(orig_cell_idx) {
+            Some(pos) => pos,
+            None => return expression, // Cell not found
+        };
+        
+        // Start with root's raw expression values using HybridSparseVec
         let mut acc: Vec<(u32, i32)> = Vec::new();
-        for i in 0..self.root_residual_genes.len() {
-            let g = self.root_residual_genes.access(i).unwrap() as u32;
-            let v = self.root_residual_vals.access(i).unwrap() as i32;
-            acc.push((g, v));
+        let root_indices = self.root_indices.indices_vec();
+        for (i, &g) in root_indices.iter().enumerate() {
+            let v = self.root_vals.access(i).unwrap_or(0) as i32;
+            acc.push((g as u32, v));
         }
         
-        if cell_idx == self.root as usize {
-            // Root cell: just apply root residual
+        if dfs_pos == 0 {
+            // This is the root cell: just return root expression
             for (g, v) in &acc {
-                let median = self.medians.get(*g as usize) as i32;
-                let decoded = decode_v(*v);
-                expression[*g as usize] = (decoded + median).max(0) as u16;
+                expression[*g as usize] = (*v).max(0) as u16;
             }
             return expression;
         }
         
-        // Find path from cell to root
-        let path = self.path_to_root(cell_idx);
+        // Build path from root to this cell (in DFS positions)
+        // Path is stored as [root_pos, ..., parent_pos, this_pos]
+        let mut path_dfs = Vec::new();
+        let mut current_dfs = dfs_pos;
+        while current_dfs != 0 {
+            path_dfs.push(current_dfs);
+            current_dfs = self.parent_dfs_pos(current_dfs);
+        }
+        path_dfs.push(0); // Add root
+        path_dfs.reverse(); // Now it's [0, ..., parent_dfs, this_dfs]
         
         // Walk from root to cell, accumulating deltas
-        // Path is [cell, parent, grandparent, ..., root], so we reverse it
-        for i in (1..path.len()).rev() {
-            let child = path[i - 1];
-            // Find child's position in order
-            if let Some(order_idx) = self.order.iter().position(|&c| c == child as u32) {
-                let deltas = self.get_cell_deltas(order_idx);
-                acc = self.apply_deltas(&acc, &deltas);
-            }
+        // path_dfs[0] is root (no delta needed), path_dfs[1..] need deltas
+        for i in 1..path_dfs.len() {
+            // Delta for cell at path_dfs[i] is stored at order_idx = path_dfs[i] - 1
+            // (since root is at position 0, non-root cells start at position 1)
+            let order_idx = path_dfs[i] - 1; // Convert DFS position to delta index
+            let deltas = self.get_cell_deltas(order_idx);
+            acc = self.apply_deltas(&acc, &deltas);
         }
         
-        // Convert accumulated residual to expression
+        // Convert accumulated expression to output vector
         for (g, v) in &acc {
-            let median = self.medians.get(*g as usize) as i32;
-            let decoded = decode_v(*v);
-            expression[*g as usize] = (decoded + median).max(0) as u16;
+            expression[*g as usize] = (*v).max(0) as u16;
         }
         
         expression
-    }
-    
-    /// Get path from cell to root: [cell, parent, grandparent, ..., root]
-    fn path_to_root(&self, cell_idx: usize) -> Vec<usize> {
-        let mut path = Vec::new();
-        let mut current = cell_idx;
-        
-        while current != self.root as usize {
-            path.push(current);
-            current = self.parent[current] as usize;
-            // Safety: prevent infinite loop
-            if path.len() > self.ncells as usize {
-                break;
-            }
-        }
-        path.push(self.root as usize);
-        path
     }
     
     /// Get the delta list for cell at order_idx (0-based among non-root cells)
@@ -1037,6 +1270,8 @@ impl EncodedDiffsMST {
     }
     
     /// Apply deltas to accumulated residual: acc = acc + deltas
+    /// Apply zigzag-encoded deltas to accumulated expression
+    /// acc contains raw expression values, deltas are zigzag-encoded
     fn apply_deltas(&self, acc: &[(u32, i32)], deltas: &[(u32, i32)]) -> Vec<(u32, i32)> {
         let mut result = Vec::new();
         let mut i = 0;
@@ -1045,15 +1280,22 @@ impl EncodedDiffsMST {
         while i < acc.len() && j < deltas.len() {
             match acc[i].0.cmp(&deltas[j].0) {
                 std::cmp::Ordering::Less => {
+                    // Gene only in acc (no delta)
                     result.push(acc[i]);
                     i += 1;
                 }
                 std::cmp::Ordering::Greater => {
-                    result.push(deltas[j]);
+                    // Gene only in delta: new value = 0 + decoded_delta
+                    let decoded_delta = decode_v(deltas[j].1);
+                    if decoded_delta != 0 {
+                        result.push((deltas[j].0, decoded_delta));
+                    }
                     j += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    let sum = acc[i].1 + deltas[j].1;
+                    // Both have this gene: new value = acc + decoded_delta
+                    let decoded_delta = decode_v(deltas[j].1);
+                    let sum = acc[i].1 + decoded_delta;
                     if sum != 0 {
                         result.push((acc[i].0, sum));
                     }
@@ -1062,12 +1304,17 @@ impl EncodedDiffsMST {
                 }
             }
         }
+        // Remaining in acc (no deltas)
         while i < acc.len() {
             result.push(acc[i]);
             i += 1;
         }
+        // Remaining deltas (acc had 0)
         while j < deltas.len() {
-            result.push(deltas[j]);
+            let decoded_delta = decode_v(deltas[j].1);
+            if decoded_delta != 0 {
+                result.push((deltas[j].0, decoded_delta));
+            }
             j += 1;
         }
         
@@ -1076,16 +1323,62 @@ impl EncodedDiffsMST {
     
     /// Estimate bytes used by this encoding
     pub fn bytes(&self) -> usize {
-        self.medians.len() * 2  // roughly
-            + self.parent.len() * 4
-            + self.root_residual_genes.size_in_bytes()
-            + self.root_residual_vals.size_in_bytes()
+        4 + 4  // num_genes + ncells
+            + self.dfs_order.size_in_bytes()
+            + self.parent_offset.size_in_bytes()  // Small numbers, compress well!
+            + self.root_indices.num_bits() / 8  // HybridSparseVec
+            + self.root_vals.size_in_bytes()
             + self.delta_genes.size_in_bytes()
             + self.delta_vals.size_in_bytes()
             + self.boundary.size_in_bytes()
-            + self.order.len() * 4
+    }
+    
+    /// Number of cells accessor for external use
+    pub(crate) fn num_cells(&self) -> usize {
+        self.num_cells_internal()
+    }
+    
+    /// Number of genes accessor
+    pub(crate) fn num_genes(&self) -> usize {
+        self.num_genes as usize
+    }
+    
+    /// Iterator over expression vectors for all cells
+    pub(crate) fn expression_vec_iter(&self) -> ExpressionVecIterMST<'_> {
+        ExpressionVecIterMST {
+            ediff: self,
+            cell_ind: 0,
+        }
     }
 }
+
+/// Iterator over expression vectors for MST-encoded data
+pub(crate) struct ExpressionVecIterMST<'a> {
+    ediff: &'a EncodedDiffsMST,
+    cell_ind: usize,
+}
+
+impl Iterator for ExpressionVecIterMST<'_> {
+    type Item = Vec<u16>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.cell_ind < self.ediff.num_cells_internal() {
+            // Get original cell index at this DFS position
+            let orig_cell = self.ediff.orig_cell_at_dfs_pos(self.cell_ind);
+            self.cell_ind += 1;
+            Some(self.ediff.decode_cell(orig_cell))
+        } else {
+            None
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.ediff.num_cells_internal() - self.cell_ind;
+        (remaining, Some(remaining))
+    }
+}
+
+impl ExactSizeIterator for ExpressionVecIterMST<'_> {}
 
 #[derive(Debug, Copy, Clone)]
 pub(crate) enum ErrorMetric {
@@ -1350,7 +1643,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for BitField {
 #[derive(Encode, Decode, Clone)]
 pub(crate) struct BitFieldQuadTree {
     pub(crate) boundary: Rect,
-    pub(crate) encoded_diffs: EncodedDiffs,
+    pub(crate) encoded_diffs: EncodedDiffsMST,
     divided: bool,
     nw: Option<Box<BitFieldQuadTree>>,
     ne: Option<Box<BitFieldQuadTree>>,
@@ -1364,7 +1657,7 @@ impl BitFieldQuadTree {
     pub(crate) fn new(boundary: Rect) -> Self {
         Self {
             boundary,
-            encoded_diffs: EncodedDiffs::empty(),
+            encoded_diffs: EncodedDiffsMST::empty(),
             divided: false,
             nw: None,
             ne: None,
@@ -1656,7 +1949,7 @@ impl QuadTree {
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
         // Compute the expense of encoding the current block
-        //info!("encoding current block");
+        // Use fast median-based encoding for divide decisions (O(N×genes) vs O(N²) for MST)
         let current_expense = encode_subarray(&self.points, data).map_or(0, |x| x.bytes());
         info!(
             "expense of current block consisting of {} points is {}",
@@ -1685,6 +1978,7 @@ impl QuadTree {
         );
 
         // Convert children to BitFieldQuadTree to calculate their expenses
+        // Use fast median-based encoding for divide decisions
         let nw_expense = encode_subarray(&nw.points, data).map_or(0, |x| x.bytes());
         let ne_expense = encode_subarray(&ne.points, data).map_or(0, |x| x.bytes());
         let se_expense = encode_subarray(&se.points, data).map_or(0, |x| x.bytes());
@@ -1910,6 +2204,7 @@ impl QuadTree {
     ) -> (usize, usize, bool) {
         if !self.divided {
             // Leaf node - calculate parent expense only
+            // Use fast median-based encoding for divide decisions
             let parent_expense = if !self.points.is_empty() {
                 encode_subarray(&self.points, data).map_or(0, |x| x.bytes())
             } else {
@@ -1940,6 +2235,7 @@ impl QuadTree {
         }
 
         // Calculate parent expense for this node
+        // Use fast median-based encoding for divide decisions
         let parent_expense = if !self.points.is_empty() {
             encode_subarray(&self.points, data).map_or(0, |x| x.bytes())
         } else {
@@ -2122,7 +2418,7 @@ impl QuadTree {
         */
         let mut node = BitFieldQuadTree {
             boundary: self.boundary.clone(),
-            encoded_diffs: EncodedDiffs::empty(),
+            encoded_diffs: EncodedDiffsMST::empty(),
             //medians,
             //data: diffs,
             divided: self.divided,
@@ -2164,7 +2460,7 @@ impl QuadTree {
             node.se = se_res.map(|x| Box::new(x));
             node.sw = sw_res.map(|x| Box::new(x));
         } else {
-            node.encoded_diffs = encode_subarray(&self.points, data).expect("expect nonempty");
+            node.encoded_diffs = encode_subarray_mst(&self.points, data).expect("expect nonempty");
             node.positions = self.positions.clone();
         }
         node
@@ -2205,6 +2501,8 @@ mod tests {
         for i in 0..csr.rows() {
             points.push(Point::new(0., 0., i));
         }
+        // Test both encodings
         encode_subarray(&points, &csr);
+        encode_subarray_mst(&points, &csr);
     }
 }
