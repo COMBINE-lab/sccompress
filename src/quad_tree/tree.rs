@@ -743,7 +743,7 @@ fn l0_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
 
 /// Sparse subtract: compute delta = child_expr - parent_expr
 /// Returns list of (gene, zigzag_encoded_delta) where delta != 0
-/// LOSSLESS: stores all deltas for genes that are in either child or parent
+/// LOSSLESS: stores all deltas for genes that differ between child and parent
 fn sparse_subtract(child: &SparseExpression, parent: &SparseExpression) -> Vec<(u32, i32)> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -752,15 +752,13 @@ fn sparse_subtract(child: &SparseExpression, parent: &SparseExpression) -> Vec<(
     while i < child.len() && j < parent.len() {
         match child[i].0.cmp(&parent[j].0) {
             std::cmp::Ordering::Less => {
-                // Gene only in child: delta = child_val - 0 = child_val
-                let delta = child[i].1 as i32;
-                result.push((child[i].0, zigzag_encode(delta)));
+                // Gene only in child: delta = child_val - 0
+                result.push((child[i].0, zigzag_encode(child[i].1 as i32)));
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                // Gene only in parent: delta = 0 - parent_val = -parent_val
-                let delta = -(parent[j].1 as i32);
-                result.push((parent[j].0, zigzag_encode(delta)));
+                // Gene only in parent: delta = 0 - parent_val (need this to zero it out!)
+                result.push((parent[j].0, zigzag_encode(-(parent[j].1 as i32))));
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
@@ -773,16 +771,12 @@ fn sparse_subtract(child: &SparseExpression, parent: &SparseExpression) -> Vec<(
             }
         }
     }
-    // Remaining in child (parent has 0)
     while i < child.len() {
-        let delta = child[i].1 as i32;
-        result.push((child[i].0, zigzag_encode(delta)));
+        result.push((child[i].0, zigzag_encode(child[i].1 as i32)));
         i += 1;
     }
-    // Remaining in parent (child has 0)
     while j < parent.len() {
-        let delta = -(parent[j].1 as i32);
-        result.push((parent[j].0, zigzag_encode(delta)));
+        result.push((parent[j].0, zigzag_encode(-(parent[j].1 as i32))));
         j += 1;
     }
     result
@@ -1157,6 +1151,20 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
     let mut combined_indices = Vec::new();
     let mut delta_vals_raw = Vec::new();
     
+    // Also compute what old encoding would store for comparison
+    let mut old_entry_count = 0usize;
+    let mut old_delta_sum = 0u64;
+    for expr in expressions.iter() {
+        for (gene, val) in expr.iter() {
+            let median = medians[*gene as usize];
+            if *val > 0 && median > 0 {
+                old_entry_count += 1;
+                let diff = (*val as i32 - median as i32).abs() as u64;
+                old_delta_sum += diff;
+            }
+        }
+    }
+    
     // Skip first cell (root), process rest in DFS order
     for (dfs_pos, &orig_cell) in dfs_order_vec.iter().enumerate().skip(1) {
         let parent_orig = parent[orig_cell as usize] as usize;
@@ -1170,6 +1178,18 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
             delta_vals_raw.push(*d as u32);
         }
     }
+    
+    // Calculate MST delta stats for comparison
+    let mst_entry_count = combined_indices.len() + root_genes_vec.len();
+    let mst_delta_sum: u64 = delta_vals_raw.iter().map(|&d| d as u64).sum();
+    
+    info!(
+        "  Entry count: MST={} vs Old={} (diff={:+}), Avg delta: MST={:.1} vs Old={:.1}",
+        mst_entry_count, old_entry_count, 
+        mst_entry_count as i64 - old_entry_count as i64,
+        if !delta_vals_raw.is_empty() { mst_delta_sum as f64 / delta_vals_raw.len() as f64 } else { 0.0 },
+        if old_entry_count > 0 { old_delta_sum as f64 / old_entry_count as f64 } else { 0.0 }
+    );
     
     // Parent offsets: small positive numbers (usually 1-10), compress very well!
     let parent_offset = if parent_offset_vec.is_empty() {
