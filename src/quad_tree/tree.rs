@@ -821,6 +821,7 @@ fn zigzag_encode(v: i32) -> i32 {
 /// Build symmetric kNN graph for all points using grid-based spatial index
 /// Returns adjacency list where neighbors[i] contains all neighbors of cell i
 /// Graph is undirected: if A is neighbor of B, then B is neighbor of A
+/// Also ensures graph is connected by bridging disconnected components
 fn build_symmetric_knn<P: PointLike>(points: &[P], k: usize) -> Vec<Vec<usize>> {
     use std::collections::{HashMap, HashSet};
     
@@ -908,18 +909,20 @@ fn build_symmetric_knn<P: PointLike>(points: &[P], k: usize) -> Vec<Vec<usize>> 
         }
     }
     
-    // Convert to Vec<Vec<usize>>
+    // Convert to Vec<Vec<usize>> - connectivity bridging done in build_mst_prim
+    // where we have access to expression data for L1-based bridging
     neighbors.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
 /// Build MST using Prim's algorithm over symmetric kNN neighbor graph
 /// Uses grid-based spatial index for O(N) kNN construction instead of O(N²)
+/// Bridges disconnected components using EXPRESSION similarity (L1) for better compression
 fn build_mst_prim<P: PointLike>(
     points: &[P],
     expressions: &[SparseExpression],
     k: usize,
 ) -> (usize, Vec<u32>) {
-    use std::collections::BinaryHeap;
+    use std::collections::{BinaryHeap, HashMap, HashSet};
     use std::cmp::Reverse;
     
     let n = points.len();
@@ -931,7 +934,97 @@ fn build_mst_prim<P: PointLike>(
     }
     
     // Build symmetric kNN graph using grid-based spatial index - O(N) instead of O(N²)!
-    let neighbors = build_symmetric_knn(points, k);
+    let mut neighbors: Vec<HashSet<usize>> = build_symmetric_knn(points, k)
+        .into_iter()
+        .map(|v| v.into_iter().collect())
+        .collect();
+    
+    // === BRIDGE DISCONNECTED COMPONENTS USING EXPRESSION SIMILARITY ===
+    // Use Union-Find to identify components
+    let mut uf_parent: Vec<usize> = (0..n).collect();
+    let mut uf_rank: Vec<usize> = vec![0; n];
+    
+    fn uf_find(uf_parent: &mut [usize], x: usize) -> usize {
+        if uf_parent[x] != x {
+            uf_parent[x] = uf_find(uf_parent, uf_parent[x]); // Path compression
+        }
+        uf_parent[x]
+    }
+    
+    fn uf_union(uf_parent: &mut [usize], uf_rank: &mut [usize], x: usize, y: usize) {
+        let rx = uf_find(uf_parent, x);
+        let ry = uf_find(uf_parent, y);
+        if rx != ry {
+            if uf_rank[rx] < uf_rank[ry] {
+                uf_parent[rx] = ry;
+            } else if uf_rank[rx] > uf_rank[ry] {
+                uf_parent[ry] = rx;
+            } else {
+                uf_parent[ry] = rx;
+                uf_rank[rx] += 1;
+            }
+        }
+    }
+    
+    // Build initial union-find from kNN edges
+    for (i, neighs) in neighbors.iter().enumerate() {
+        for &j in neighs {
+            uf_union(&mut uf_parent, &mut uf_rank, i, j);
+        }
+    }
+    
+    // Find all unique components
+    let mut components: HashMap<usize, Vec<usize>> = HashMap::new();
+    for i in 0..n {
+        let root = uf_find(&mut uf_parent, i);
+        components.entry(root).or_default().push(i);
+    }
+    
+    let num_components = components.len();
+    if num_components > 1 {
+        info!("kNN graph has {} disconnected components, bridging by expression similarity", num_components);
+        
+        // Get component list
+        let comp_list: Vec<Vec<usize>> = components.into_values().collect();
+        
+        // Connect components in a chain using EXPRESSION SIMILARITY (L1)
+        for w in comp_list.windows(2) {
+            let comp_a = &w[0];
+            let comp_b = &w[1];
+            
+            // Sample if too large
+            let sample_size = 50;  // Smaller sample since L1 is more expensive
+            let sample_a: Vec<usize> = if comp_a.len() <= sample_size {
+                comp_a.clone()
+            } else {
+                comp_a.iter().step_by(comp_a.len() / sample_size).copied().collect()
+            };
+            let sample_b: Vec<usize> = if comp_b.len() <= sample_size {
+                comp_b.clone()
+            } else {
+                comp_b.iter().step_by(comp_b.len() / sample_size).copied().collect()
+            };
+            
+            // Find pair with MINIMUM L1 expression distance (most similar expressions)
+            let mut best_l1 = u32::MAX;
+            let mut best_pair = (sample_a[0], sample_b[0]);
+            
+            for &i in &sample_a {
+                for &j in &sample_b {
+                    let l1 = l1_diff(&expressions[i], &expressions[j]);
+                    if l1 < best_l1 {
+                        best_l1 = l1;
+                        best_pair = (i, j);
+                    }
+                }
+            }
+            
+            // Add bridge edge (smallest delta = best compression)
+            neighbors[best_pair.0].insert(best_pair.1);
+            neighbors[best_pair.1].insert(best_pair.0);
+        }
+    }
+    // === END BRIDGING ===
     
     // Root is always cell 0 for simplicity
     let root = 0;
@@ -953,7 +1046,7 @@ fn build_mst_prim<P: PointLike>(
         
         in_mst[u] = true;
         
-        // Check all neighbors of u (graph is symmetric, no reverse check needed!)
+        // Check all neighbors of u (graph is symmetric)
         for &v in &neighbors[u] {
             if !in_mst[v] {
                 let weight = l1_diff(&expressions[u], &expressions[v]);
@@ -964,15 +1057,18 @@ fn build_mst_prim<P: PointLike>(
                 }
             }
         }
-        // No reverse edge check needed - graph is symmetric!
     }
     
-    // Handle any disconnected nodes (shouldn't happen with symmetric kNN, but be safe)
+    // Handle any disconnected nodes (shouldn't happen after bridging)
+    let mut disconnected_count = 0;
     for i in 0..n {
         if parent[i] == u32::MAX {
-            warn!("Node {} was disconnected, connecting to root", i);
+            disconnected_count += 1;
             parent[i] = root as u32;
         }
+    }
+    if disconnected_count > 0 {
+        warn!("Unexpected: {} nodes still disconnected out of {} after bridging", disconnected_count, n);
     }
     
     (root, parent)
@@ -1116,14 +1212,27 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
     let boundary = Rank9Sel::from_bits(boundary_bits);
     
     info!(
-        "MST encoding: {} cells, root {} entries ({} type), {} total delta entries, parent_offset avg: {:.1}",
+        "MST encoding: {} cells, num_genes={}, root_genes={} ({} type), delta_genes={}, parent_offset avg: {:.1}",
         points.len(),
+        num_genes,
         root_genes_vec.len(),
         root_indices.tyname(),
         delta_genes_raw.len(),
         if parent_offset_vec.len() > 1 {
             parent_offset_vec.iter().skip(1).map(|&x| x as f64).sum::<f64>() / (parent_offset_vec.len() - 1) as f64
         } else { 0.0 }
+    );
+    
+    // Additional size breakdown
+    info!(
+        "  Size breakdown: dfs_order={} bytes, parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes, delta_genes={} bytes, delta_vals={} bytes, boundary={} bytes",
+        dfs_order.size_in_bytes(),
+        parent_offset.size_in_bytes(),
+        root_indices.num_bits() / 8,
+        root_vals.size_in_bytes(),
+        delta_genes.size_in_bytes(),
+        delta_vals.size_in_bytes(),
+        boundary.size_in_bytes()
     );
     
     Some(EncodedDiffsMST {
