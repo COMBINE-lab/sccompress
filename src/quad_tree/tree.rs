@@ -702,23 +702,27 @@ fn compute_sparse_expression(
 
 /// L1 diff: sum of absolute differences between expression values
 /// Better for compression than L0 because it measures actual delta sizes
-fn l1_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
-    let mut sum = 0u32;
+/// L0 diff: Count of genes that differ between two cells
+/// This minimizes NUMBER of delta entries (better for compression)
+fn l0_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
+    let mut count = 0u32;
     let mut i = 0;
     let mut j = 0;
     
     while i < a.len() && j < b.len() {
         match a[i].0.cmp(&b[j].0) {
             std::cmp::Ordering::Less => {
-                sum += a[i].1 as u32; // Gene only in a: |a - 0| = a
+                count += 1; // Gene only in a: counts as 1 difference
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                sum += b[j].1 as u32; // Gene only in b: |0 - b| = b
+                count += 1; // Gene only in b: counts as 1 difference
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                sum += (a[i].1 as i32 - b[j].1 as i32).unsigned_abs();
+                if a[i].1 != b[j].1 {
+                    count += 1; // Same gene, different value
+                }
                 i += 1;
                 j += 1;
             }
@@ -726,15 +730,15 @@ fn l1_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
     }
     // Remaining in a
     while i < a.len() {
-        sum += a[i].1 as u32;
+        count += 1;
         i += 1;
     }
     // Remaining in b
     while j < b.len() {
-        sum += b[j].1 as u32;
+        count += 1;
         j += 1;
     }
-    sum
+    count
 }
 
 /// Sparse subtract: compute delta = child_expr - parent_expr
@@ -987,7 +991,7 @@ fn build_mst_prim<P: PointLike>(
             
             for &i in &sample_a {
                 for &j in &sample_b {
-                    let l1 = l1_diff(&expressions[i], &expressions[j]);
+                    let l1 = l0_diff(&expressions[i], &expressions[j]);
                     if l1 < best_l1 {
                         best_l1 = l1;
                         best_pair = (i, j);
@@ -1025,7 +1029,7 @@ fn build_mst_prim<P: PointLike>(
         // Check all neighbors of u (graph is symmetric)
         for &v in &neighbors[u] {
             if !in_mst[v] {
-                let weight = l1_diff(&expressions[u], &expressions[v]);
+                let weight = l0_diff(&expressions[u], &expressions[v]);
                 if weight < key[v] {
                     key[v] = weight;
                     parent[v] = u as u32;
