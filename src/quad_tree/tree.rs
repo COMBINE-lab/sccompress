@@ -38,8 +38,8 @@ impl CostLog {
 pub(crate) struct EncodedDiffs {
     pub(crate) indices: HybridSparseVec,
     pub(crate) ncells: u32,
-    pub(crate) diffs: DacsOpt,               // Delta values (zigzag encoded: val - median)
-    pub(crate) medians: BitFieldVec<usize>,  // Median values per gene
+    pub(crate) values: DacsOpt,              // Raw expression values (no median subtraction)
+    pub(crate) num_genes: u32,               // Total number of genes
 }
 
 /// MST-based delta encoding for a block of cells
@@ -205,8 +205,8 @@ impl EncodedDiffs {
         EncodedDiffs {
             indices: HybridSparseVec::empty(),
             ncells: 0,
-            diffs: DacsOpt::default(),
-            medians: BitFieldVec::with_capacity(0, 0),
+            values: DacsOpt::default(),
+            num_genes: 0,
         }
     }
 
@@ -215,16 +215,12 @@ impl EncodedDiffs {
         self.len() == 0
     }
 
-    pub(crate) fn num_medians(&self) -> usize {
-        self.medians.len()
-    }
-
     pub(crate) fn len(&self) -> usize {
-        self.diffs.len()
+        self.values.len()
     }
 
     pub(crate) fn num_genes(&self) -> usize {
-        self.medians.len()
+        self.num_genes as usize
     }
     
 
@@ -240,8 +236,11 @@ impl EncodedDiffs {
                 }
 
                 let first_idx = self.num_genes() * cell_ind;
-                let mut diff_pos = *num_ones;
-                let mut next_diff = self.diffs.access(diff_pos).unwrap_or(0);
+                // the first index to start iterating from
+                //info!("num_ones: {}", *num_ones);
+                
+                let mut value_pos = *num_ones;
+                let mut next_value = self.values.access(value_pos).expect("valid");
 
                 let mut expression = Vec::with_capacity(self.num_genes());
                 let mut num_ones_in_cell = 0_usize;
@@ -250,11 +249,10 @@ impl EncodedDiffs {
                         expression.push(0);
                     } else {
                         num_ones_in_cell += 1;
-                        let ddiff = decode_v(next_diff as i32);
-                        let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                        let decoded_val = next_value as u16;
                         expression.push(decoded_val);
-                        diff_pos += 1;
-                        next_diff = self.diffs.access(diff_pos).unwrap_or(0);
+                        value_pos += 1;
+                        next_value = self.values.access(value_pos).unwrap_or(0);
                     }
                 }
                 *num_ones += num_ones_in_cell;
@@ -267,7 +265,7 @@ impl EncodedDiffs {
     fn expression_vec_ef(&self, cell_ind: usize, _num_ones: &mut usize) -> Vec<u16> {
         match &self.indices {
             HybridSparseVec::EF(indices) => {
-                if !self.precheck_cells(cell_ind) || self.diffs.is_empty() {
+                if !self.precheck_cells(cell_ind) || self.values.is_empty() {
                     return vec![0_u16; self.num_genes()];
                 }
 
@@ -278,10 +276,10 @@ impl EncodedDiffs {
                 // should end
                 let last_idx = first_idx + self.num_genes();
 
-                // we checked that self.diffs is not empty above, so the len must be
+                // we checked that self.values is not empty above, so the len must be
                 // at least 1. Get a cursor to the last element
                 if let Some(last_stored_cursor) =
-                    unsafe { indices.0.cursor_at(self.diffs.len() - 1) }
+                    unsafe { indices.0.cursor_at(self.values.len() - 1) }
                 {
                     // the index stored at the last position
                     let last_stored_index = last_stored_cursor.value().unwrap();
@@ -310,7 +308,7 @@ impl EncodedDiffs {
                     let start = start_cur.index();
 
                     let stop = if !stop_cur.is_valid() || cell_ind == self.num_cells() - 1 || last_in_this_cell {
-                        self.diffs.len()
+                        self.values.len()
                     } else {
                         stop_cur.index()
                     };
@@ -319,8 +317,8 @@ impl EncodedDiffs {
                     }
                     if start >= stop {
                         error!(
-                            "start = {start}, but stop = {stop}, diffs len = {}",
-                            self.diffs.len()
+                            "start = {start}, but stop = {stop}, values len = {}",
+                            self.values.len()
                         );
                     }
 
@@ -330,8 +328,8 @@ impl EncodedDiffs {
                         return vec![0_u16; self.num_genes()];
                     }
 
-                    let mut diff_pos = start;
-                    let mut next_diff = self.diffs.access(diff_pos).unwrap_or(0);
+                    let mut value_pos = start;
+                    let mut next_value = self.values.access(value_pos).unwrap_or(0);
 
                     let mut nz_ind_iter = start_cur.clone();
 
@@ -342,14 +340,13 @@ impl EncodedDiffs {
                         if gidx < next_nz_ind as usize {
                             expression.push(0);
                         } else {
-                            let ddiff = decode_v(next_diff as i32);
-                            let decoded_val = (ddiff + self.medians.get(gidx) as i32) as u16;
+                            let decoded_val = next_value as u16;
                             expression.push(decoded_val);
                             if nz_ind_iter.advance() {
                                 next_nz_ind =
                                     nz_ind_iter.value().unwrap_or(u64::MAX) - first_idx as u64;
-                                diff_pos += 1;
-                                next_diff = self.diffs.access(diff_pos).unwrap_or(0);
+                                value_pos += 1;
+                                next_value = self.values.access(value_pos).unwrap_or(0);
                             } else {
                                 next_nz_ind = self.num_genes() as u64 + 1;
                             }
@@ -387,12 +384,12 @@ impl EncodedDiffs {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        let diff_bytes = self.diffs.size_in_bytes();
-        let ibits = self.indices.num_bits();
-        // BitFieldVec size: len * bit_width / 8
-        let median_bits = self.medians.len() * self.medians.bit_width();
+        let value_bits = self.values.size_in_bytes();
+        let ibits = self.indices.num_bits(); //0.write_bytes() * 8;
+
         let ncbits = 32;
-        diff_bytes + (ibits + median_bits + ncbits) / 8
+        let num_genes_bits = 32;
+        (4 * 24) + (value_bits + ibits + ncbits + num_genes_bits) / 8
     }
 }
 
@@ -406,16 +403,13 @@ impl Encode for EncodedDiffs {
         Encode::encode(&self.indices, encoder)?;
         Encode::encode(&self.ncells, encoder)?;
 
-        let mut diffs_bytes = Vec::new();
-        self.diffs.serialize_into(&mut diffs_bytes)
+        let mut values_bytes = Vec::new();
+        self.values.serialize_into(&mut values_bytes)
             .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-        Encode::encode(&diffs_bytes, encoder)?;
+        Encode::encode(&values_bytes, encoder)?;
 
-        // Encode medians (BitFieldVec)
-        let (data, width, len) = self.medians.clone().into_raw_parts();
-        Encode::encode(&data, encoder)?;
-        Encode::encode(&width, encoder)?;
-        Encode::encode(&len, encoder)?;
+        // Encode num_genes
+        Encode::encode(&self.num_genes, encoder)?;
         
         Ok(())
     }
@@ -428,21 +422,18 @@ impl<Context> Decode<Context> for EncodedDiffs {
         let indices = Decode::decode(decoder)?;
         let ncells = Decode::decode(decoder)?;
 
-        let diffs_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let diffs = DacsOpt::deserialize_from(&diffs_bytes[..])
+        let values_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let values = DacsOpt::deserialize_from(&values_bytes[..])
             .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
 
-        // Decode medians (BitFieldVec)
-        let data = Decode::decode(decoder)?;
-        let w = Decode::decode(decoder)?;
-        let l = Decode::decode(decoder)?;
-        let medians = unsafe { BitFieldVec::from_raw_parts(data, w, l) };
+        // Decode num_genes
+        let num_genes: u32 = Decode::decode(decoder)?;
         
         Ok(Self {
             indices,
             ncells,
-            diffs,
-            medians,
+            values,
+            num_genes,
         })
     }
 }
@@ -454,31 +445,24 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
         let indices = BorrowDecode::borrow_decode(decoder)?;
         let ncells = BorrowDecode::borrow_decode(decoder)?;
 
-        let diffs_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let diffs = DacsOpt::deserialize_from(&diffs_bytes[..])
+        let values_bytes: Vec<u8> = Decode::decode(decoder)?;
+        let values = DacsOpt::deserialize_from(&values_bytes[..])
             .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
 
-        // Decode medians (BitFieldVec)
-        let data = BorrowDecode::borrow_decode(decoder)?;
-        let width = BorrowDecode::borrow_decode(decoder)?;
-        let len = BorrowDecode::borrow_decode(decoder)?;
-        let medians = unsafe { BitFieldVec::from_raw_parts(data, width, len) };
+        // Decode num_genes
+        let num_genes: u32 = Decode::decode(decoder)?;
         
         Ok(Self {
             indices,
             ncells,
-            diffs,
-            medians,
+            values,
+            num_genes,
         })
     }
 }
 
-/// Takes a slice of points and applies delta encoding from the median value
-/// along the "gene" axis.  That is, each coordinate of the point is encoded
-/// with respect to the difference from the median of points amongst all points
-/// along that axis/coordinate.
-/// Returns a `Some(EncodedDiff)` struct representing the encoded differences or `None`
-/// if the slice is empty.
+/// Takes a slice of points and encodes raw expression values (no median subtraction)
+/// Returns a `Some(EncodedDiffs)` struct representing the encoded values or `None` if empty.
 ///
 pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffs> {
     if points.is_empty() {
@@ -487,98 +471,50 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     }
 
     let mut indices = Vec::<u64>::new();
-    let mut median_vec = Vec::<u16>::new();
-    let mut raw_diffs = Vec::<u32>::new();
-    let mut max_diff = 0_i32;
+    let mut raw_values = Vec::<u32>::new();
     let num_genes = data.cols() as u32;
     debug!("Processing {} points in encode_subarray()", points.len());
     debug!("Number of genes: {}", num_genes);
 
     let mut nnz = 0_usize;
-
-    // Collect non-zero values per gene in a single pass through sparse rows
-    // This is more efficient than iterating gene-by-gene for CSR matrices
-    let mut gene_values: Vec<Vec<u16>> = vec![Vec::new(); data.cols()];
-
-    // Single pass: collect all non-zero values per gene from sparse rows
-    for p in points.iter() {
+    
+    // Store raw expression values (no median computation)
+    for (cell_ind, p) in points.iter().enumerate() {
+        let index_offset = cell_ind * num_genes as usize;
         if let Some(row) = p.get_data(data) {
-            // Iterate only over non-zero entries in this sparse row
             for (gene_idx, &val) in row.iter() {
-                nnz += 1;
-                gene_values[gene_idx].push(val);
+                if val > 0 {
+                    nnz += 1;
+                    raw_values.push(val as u32);
+                    let index = index_offset + gene_idx;
+                    indices.push(index as u64);
+                }
             }
         }
     }
-
-    // Calculate median for each gene from collected values
-    for j in 0..data.cols() {
-        let nz_values = &mut gene_values[j];
-
-        // Calculate median using select_nth_unstable (O(n) average)
-        let median = if !nz_values.is_empty() {
-            let mid = nz_values.len() / 2;
-            *nz_values.select_nth_unstable(mid).1
-        } else {
-            0
-        };
-
-        if j == 20000 {
-            debug!("j: {}, median: {}", j, median);
-        }
-        median_vec.push(median);
-    }
-
+    
     let tot = num_genes as usize * points.len();
     let sparsity = (nnz as f64) / (tot as f64);
     if sparsity > 0.75 {
         println!("sparsity: {}", sparsity);
     }
 
-    // for each cell
-    for (cell_ind, p) in points.iter().enumerate() {
-        let index_offset = cell_ind * num_genes as usize;
-        if let Some(row) = p.get_data(data) {
-            let mut recorded_values_for_cell = 0;
-            for (gene_idx, &val) in row.iter() {
-                let median_val = median_vec[gene_idx];
-
-                // no observation for this gene
-                if median_val == 0 || val == 0 {
-                    continue;
-                } else {
-                    let diff = val as i32 - median_val as i32;
-                    let diff = if diff < 0 {
-                        (-2_i32 * diff) + 1
-                    } else {
-                        2_i32 * diff
-                    };
-
-                    assert_eq!(
-                        val as u16,
-                        (decode_v(diff) + median_val as i32) as u16
-                    );
-                    raw_diffs.push(diff as u32);
-                    let index = index_offset + gene_idx;
-                    indices.push(index as u64);
-                    max_diff = max_diff.max(diff);
-                    recorded_values_for_cell += 1;
-                }
-            }
-        }
-    }
-
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot);
-    let medians = BitFieldVec::<usize>::from_slice(&median_vec).expect("should fit");
-    // changed to DacsOpts Directly Addressable Codes variable length encoding to save space that is affected by large outliers
-    let diffs = DacsOpt::from_slice(&raw_diffs, Some(3)).expect("should fit");
-    assert_eq!(indices.len(), diffs.len());
+    
+    // Store raw values (no zigzag encoding needed since values are unsigned)
+    let values = if raw_values.is_empty() {
+        DacsOpt::default()
+    } else {
+        DacsOpt::from_slice(&raw_values, Some(3)).expect("should fit")
+    };
+    
+    assert_eq!(indices.len(), values.len());
 
     let enc_diffs = EncodedDiffs {
         indices,
         ncells: points.len() as u32,
-        diffs,
-        medians,
+        values,
+        num_genes: num_genes,
     };
 
     // validate!
@@ -589,17 +525,21 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
     {
         let orig_data = orig_vec.get_data(data).unwrap().to_dense().to_vec();
         // Find differences instead of asserting equality
-        let differences: Vec<(usize, u16, u16, u16)> = recon_vec
+        let differences: Vec<(usize, u16, u16)> = recon_vec
             .iter()
             .zip(orig_data.iter())
             .enumerate()
             .filter(|(_, (&r, &o))| r != o)
-            .map(|(gene_idx, (&r, &o))| (gene_idx, r, o, median_vec[gene_idx]))
+            .map(|(gene_idx, (&r, &o))| (gene_idx, r, o))
             .collect();
 
         if !differences.is_empty() {
+            //info!("orig_data: {:?}", orig_data);
+            //info!("recon_vec: {:?}", recon_vec);
             info!("differences: {:?}", differences);
             info!("type: {:?}", enc_diffs.indices.tyname());
+            // Optionally still panic if you want to stop on first error
+            // assert_eq!(recon_vec, orig_data.to_vec());
 
             // Save only the error cell
             use std::io::Write;
@@ -617,6 +557,8 @@ pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDif
 
             panic!("Failed to reconstruct!");
         }
+        //dump this problematic cell to a file
+        //unit test for encode/decode
     }
     /*
     info!(
