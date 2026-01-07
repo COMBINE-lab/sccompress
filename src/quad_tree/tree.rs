@@ -389,7 +389,9 @@ impl EncodedDiffs {
 
         let ncbits = 32;
         let num_genes_bits = 32;
-        (4 * 24) + (value_bits + ibits + ncbits + num_genes_bits) / 8
+        //what this is 
+        //(4 * 24) + 
+        (value_bits + ibits + ncbits + num_genes_bits) / 8
     }
 }
 
@@ -1055,18 +1057,27 @@ pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<Encode
     };
     
     // Use HybridSparseVec for combined indices (same as old encoding!)
+    // CRITICAL: Sort indices and delta_vals together to maintain parallel relationship
+    // HybridSparseVec may sort indices internally, so we need to sort them together first
+    let mut indexed_deltas: Vec<(u64, u32)> = combined_indices.iter().zip(delta_vals_raw.iter())
+        .map(|(&idx, &val)| (idx, val))
+        .collect();
+    indexed_deltas.sort_by_key(|&(idx, _)| idx);
+    
+    let (sorted_indices, sorted_delta_vals): (Vec<u64>, Vec<u32>) = indexed_deltas.into_iter().unzip();
+    
     let total_possible = (points.len() - 1) * (num_genes as usize); // (ncells-1) * num_genes
     let sparsity = if total_possible > 0 {
-        combined_indices.len() as f64 / total_possible as f64
+        sorted_indices.len() as f64 / total_possible as f64
     } else {
         0.0
     };
-    let indices = HybridSparseVec::from_indices(&combined_indices, sparsity, total_possible);
+    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, total_possible);
     
-    let delta_vals = if delta_vals_raw.is_empty() {
+    let delta_vals = if sorted_delta_vals.is_empty() {
         DacsOpt::default()
     } else {
-        DacsOpt::from_slice(&delta_vals_raw, Some(3)).expect("should fit")
+        DacsOpt::from_slice(&sorted_delta_vals, Some(3)).expect("should fit")
     };
     
     info!(
@@ -1217,23 +1228,33 @@ impl EncodedDiffsMST {
         let cell_end = cell_offset + num_genes;
         
         let mut deltas = Vec::new();
+        
+        // CRITICAL: Iterate through indices and delta_vals in parallel
+        // Both are stored in the same sorted order from encoding
         let all_indices = self.indices.indices_vec();
         
         // Find indices in range [cell_offset, cell_end)
-        // indices are sorted, so we can binary search
+        // Since indices are sorted, we can binary search
         let start_pos = all_indices.partition_point(|&x| (x as usize) < cell_offset);
         
-        for (pos, &idx) in all_indices.iter().enumerate().skip(start_pos) {
+        // Iterate through indices in the range
+        // The enumeration position after skip is still the original position in all_indices
+        // which matches the position in delta_vals (both were sorted together during encoding)
+        for (pos_in_all, &idx) in all_indices.iter().enumerate().skip(start_pos) {
             let idx_usize = idx as usize;
             if idx_usize >= cell_end {
                 break;
             }
             let gene = (idx_usize - cell_offset) as u32;
-            if let Some(v) = self.delta_vals.access(pos) {
+            // pos_in_all is the position in the sorted all_indices Vec
+            // which corresponds to the position in delta_vals (both sorted together)
+            if let Some(v) = self.delta_vals.access(pos_in_all) {
                 deltas.push((gene, v as i32));
             }
         }
         
+        // Ensure deltas are sorted by gene_idx for apply_deltas
+        deltas.sort_by_key(|(g, _)| *g);
         deltas
     }
     
@@ -1913,7 +1934,6 @@ impl QuadTree {
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
         // Compute the expense of encoding the current block
-        // Use fast median-based encoding for divide decisions (O(N×genes) vs O(N²) for MST)
         let current_expense = encode_subarray(&self.points, data).map_or(0, |x| x.bytes());
         info!(
             "expense of current block consisting of {} points is {}",
@@ -1942,7 +1962,6 @@ impl QuadTree {
         );
 
         // Convert children to BitFieldQuadTree to calculate their expenses
-        // Use fast median-based encoding for divide decisions
         let nw_expense = encode_subarray(&nw.points, data).map_or(0, |x| x.bytes());
         let ne_expense = encode_subarray(&ne.points, data).map_or(0, |x| x.bytes());
         let se_expense = encode_subarray(&se.points, data).map_or(0, |x| x.bytes());
