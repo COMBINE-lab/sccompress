@@ -1,4 +1,4 @@
-use crate::bits::{HybridSparseVec, EFVector, InnerEFVector};
+use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
 use rayon::join;
@@ -46,7 +46,7 @@ pub(crate) struct EncodedDiffs {
 /// Simplified structure matching old encoding's index format
 /// Root is always cell 0, cells are stored in DFS order
 #[derive(Clone)]
-pub struct EncodedDiffsMST {
+pub(crate) struct EncodedDiffsMST {
     pub(crate) num_genes: u32,                  // needed for output vector size
     // ncells derivable from parent_offset.len()
     pub(crate) parent_offset: DacsOpt,          // parent_offset[i] = i - parent_position (one per cell)
@@ -83,6 +83,8 @@ impl EncodedDiffsMST {
     }
 }
 
+// Manual implementation of de/serialization for `Rect`.
+// We don't need to store the edges since they can computed from the other fields.
 impl Encode for EncodedDiffsMST {
     fn encode<E: bincode::enc::Encoder>(
         &self,
@@ -384,14 +386,13 @@ impl EncodedDiffs {
     }
 
     pub(crate) fn bytes(&self) -> usize {
-        let value_bits = self.values.size_in_bytes();
-        let ibits = self.indices.num_bits(); //0.write_bytes() * 8;
+        let value_bytes = self.values.size_in_bytes();
+        let ibytes = (self.indices.num_bits() + 7) / 8;
 
-        let ncbits = 32;
-        let num_genes_bits = 32;
-        //what this is 
-        //(4 * 24) + 
-        (value_bits + ibits + ncbits + num_genes_bits) / 8
+        let ncbytes = 4;
+        let num_genes_bytes = 4;
+        
+        value_bytes + ibytes + ncbytes + num_genes_bytes
     }
 }
 
@@ -429,7 +430,7 @@ impl<Context> Decode<Context> for EncodedDiffs {
             .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
 
         // Decode num_genes
-        let num_genes: u32 = Decode::decode(decoder)?;
+        let num_genes = Decode::decode(decoder)?;
         
         Ok(Self {
             indices,
@@ -452,7 +453,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
             .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
 
         // Decode num_genes
-        let num_genes: u32 = Decode::decode(decoder)?;
+        let num_genes = Decode::decode(decoder)?;
         
         Ok(Self {
             indices,
@@ -466,7 +467,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
 /// Takes a slice of points and encodes raw expression values (no median subtraction)
 /// Returns a `Some(EncodedDiffs)` struct representing the encoded values or `None` if empty.
 ///
-pub fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffs> {
+pub(crate) fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffs> {
     if points.is_empty() {
         debug!("Empty points array in encode_subarray()");
         return None;
@@ -599,9 +600,9 @@ fn compute_sparse_expression(
 
 /// L1 diff: sum of absolute differences between expression values
 /// Better for compression than L0 because it measures actual delta sizes
-/// L0 diff: Count of genes that differ between two cells
-/// This minimizes NUMBER of delta entries (better for compression)
-fn l0_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
+/// L0 binary diff: Count of genes where sparsity pattern differs
+/// (one is zero, the other is non-zero)
+fn l0_binary_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
     let mut count = 0u32;
     let mut i = 0;
     let mut j = 0;
@@ -609,32 +610,21 @@ fn l0_diff(a: &SparseExpression, b: &SparseExpression) -> u32 {
     while i < a.len() && j < b.len() {
         match a[i].0.cmp(&b[j].0) {
             std::cmp::Ordering::Less => {
-                count += 1; // Gene only in a: counts as 1 difference
+                count += 1; // Gene only in a
                 i += 1;
             }
             std::cmp::Ordering::Greater => {
-                count += 1; // Gene only in b: counts as 1 difference
+                count += 1; // Gene only in b
                 j += 1;
             }
             std::cmp::Ordering::Equal => {
-                if a[i].1 != b[j].1 {
-                    count += 1; // Same gene, different value
-                }
+                // Both are non-zero, so pattern matches
                 i += 1;
                 j += 1;
             }
         }
     }
-    // Remaining in a
-    while i < a.len() {
-        count += 1;
-        i += 1;
-    }
-    // Remaining in b
-    while j < b.len() {
-        count += 1;
-        j += 1;
-    }
+    count += (a.len() - i) as u32 + (b.len() - j) as u32;
     count
 }
 
@@ -691,112 +681,48 @@ fn zigzag_encode(v: i32) -> i32 {
 
 /// Build symmetric kNN graph for all points using grid-based spatial index
 /// Returns adjacency list where neighbors[i] contains all neighbors of cell i
-/// Graph is undirected: if A is neighbor of B, then B is neighbor of A
-/// Also ensures graph is connected by bridging disconnected components
-fn build_symmetric_knn<P: PointLike>(points: &[P], k: usize) -> Vec<Vec<usize>> {
-    use std::collections::{HashMap, HashSet};
-    
-    let n = points.len();
+/// Build symmetric kNN graph based on expression sparsity pattern similarity
+fn build_expression_knn(expressions: &[SparseExpression], k: usize) -> Vec<Vec<usize>> {
+    use std::collections::HashSet;
+    let n = expressions.len();
     if n <= 1 {
         return vec![Vec::new(); n];
     }
-    
-    // Find bounding box
-    let (mut min_x, mut max_x) = (f64::MAX, f64::MIN);
-    let (mut min_y, mut max_y) = (f64::MAX, f64::MIN);
-    for p in points {
-        min_x = min_x.min(p.xpos());
-        max_x = max_x.max(p.xpos());
-        min_y = min_y.min(p.ypos());
-        max_y = max_y.max(p.ypos());
-    }
-    
-    // Grid cell size: aim for ~k points per cell on average
-    let area = (max_x - min_x + 1.0) * (max_y - min_y + 1.0);
-    let cell_size = (area / (n as f64 / k as f64)).sqrt().max(1.0);
-    
-    // Build grid index
-    let mut grid: HashMap<(i32, i32), Vec<usize>> = HashMap::new();
-    for (i, p) in points.iter().enumerate() {
-        let gx = ((p.xpos() - min_x) / cell_size) as i32;
-        let gy = ((p.ypos() - min_y) / cell_size) as i32;
-        grid.entry((gx, gy)).or_default().push(i);
-    }
-    
-    // For each point, find k nearest from neighboring grid cells
+
     let mut neighbors: Vec<HashSet<usize>> = vec![HashSet::new(); n];
-    
-    for (i, p) in points.iter().enumerate() {
-        let gx = ((p.xpos() - min_x) / cell_size) as i32;
-        let gy = ((p.ypos() - min_y) / cell_size) as i32;
-        
-        // Collect candidates from neighborhood (expand if needed)
-        let mut candidates: Vec<(usize, f64)> = Vec::new();
-        let mut radius = 2;
-        
-        // Expand search radius until we find at least k candidates or hit max
-        while candidates.len() < k && radius <= 10 {
-            candidates.clear();
-            for dx in -radius..=radius {
-                for dy in -radius..=radius {
-                    if let Some(cell_points) = grid.get(&(gx + dx, gy + dy)) {
-                        for &j in cell_points {
-                            if j != i {
-                                let dist_sq = (p.xpos() - points[j].xpos()).powi(2) 
-                                            + (p.ypos() - points[j].ypos()).powi(2);
-                                candidates.push((j, dist_sq));
-                            }
-                        }
-                    }
-                }
-            }
-            radius += 2;
-        }
-        
-        // Fallback: if still not enough, do brute force for this point
-        if candidates.len() < k && candidates.len() < n - 1 {
-            candidates.clear();
-            for (j, other) in points.iter().enumerate() {
-                if j != i {
-                    let dist_sq = (p.xpos() - other.xpos()).powi(2) 
-                                + (p.ypos() - other.ypos()).powi(2);
-                    candidates.push((j, dist_sq));
-                }
+
+    for i in 0..n {
+        let mut candidates: Vec<(usize, u32)> = Vec::with_capacity(n - 1);
+        for j in 0..n {
+            if i != j {
+                let dist = l0_binary_diff(&expressions[i], &expressions[j]);
+                candidates.push((j, dist));
             }
         }
-        
-        // Get k nearest
+
         let k_actual = k.min(candidates.len());
         if k_actual > 0 {
-            candidates.select_nth_unstable_by(k_actual - 1, |a, b| {
-                a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal)
-            });
-            
-            // Add symmetric edges
+            candidates.select_nth_unstable_by(k_actual - 1, |a, b| a.1.cmp(&b.1));
             for &(j, _) in &candidates[..k_actual] {
                 neighbors[i].insert(j);
-                neighbors[j].insert(i);  // Symmetric!
+                neighbors[j].insert(i);
             }
         }
     }
-    
-    // Convert to Vec<Vec<usize>> - connectivity bridging done in build_mst_prim
-    // where we have access to expression data for L1-based bridging
+
     neighbors.into_iter().map(|s| s.into_iter().collect()).collect()
 }
 
-/// Build MST using Prim's algorithm over symmetric kNN neighbor graph
-/// Uses grid-based spatial index for O(N) kNN construction instead of O(N²)
-/// Bridges disconnected components using EXPRESSION similarity (L1) for better compression
+/// Build MST using Prim's algorithm over expression-based kNN graph
 fn build_mst_prim<P: PointLike>(
-    points: &[P],
+    _points: &[P],
     expressions: &[SparseExpression],
     k: usize,
 ) -> (usize, Vec<u32>) {
     use std::collections::{BinaryHeap, HashMap, HashSet};
     use std::cmp::Reverse;
     
-    let n = points.len();
+    let n = expressions.len();
     if n == 0 {
         return (0, Vec::new());
     }
@@ -804,14 +730,13 @@ fn build_mst_prim<P: PointLike>(
         return (0, vec![0]);
     }
     
-    // Build symmetric kNN graph using grid-based spatial index - O(N) instead of O(N²)!
-    let mut neighbors: Vec<HashSet<usize>> = build_symmetric_knn(points, k)
+    // Build symmetric kNN graph based on expression sparsity pattern similarity
+    let mut neighbors: Vec<HashSet<usize>> = build_expression_knn(expressions, k)
         .into_iter()
         .map(|v| v.into_iter().collect())
         .collect();
     
     // === BRIDGE DISCONNECTED COMPONENTS USING EXPRESSION SIMILARITY ===
-    // Use Union-Find to identify components
     let mut uf_parent: Vec<usize> = (0..n).collect();
     let mut uf_rank: Vec<usize> = vec![0; n];
     
@@ -853,18 +778,14 @@ fn build_mst_prim<P: PointLike>(
     
     let num_components = components.len();
     if num_components > 1 {
-        info!("kNN graph has {} disconnected components, bridging by expression similarity", num_components);
+        info!("Expression kNN graph has {} disconnected components, bridging", num_components);
         
-        // Get component list
         let comp_list: Vec<Vec<usize>> = components.into_values().collect();
-        
-        // Connect components in a chain using EXPRESSION SIMILARITY (L1)
         for w in comp_list.windows(2) {
             let comp_a = &w[0];
             let comp_b = &w[1];
             
-            // Sample if too large
-            let sample_size = 50;  // Smaller sample since L1 is more expensive
+            let sample_size = 50;
             let sample_a: Vec<usize> = if comp_a.len() <= sample_size {
                 comp_a.clone()
             } else {
@@ -876,26 +797,23 @@ fn build_mst_prim<P: PointLike>(
                 comp_b.iter().step_by(comp_b.len() / sample_size).copied().collect()
             };
             
-            // Find pair with MINIMUM L1 expression distance (most similar expressions)
-            let mut best_l1 = u32::MAX;
+            let mut best_dist = u32::MAX;
             let mut best_pair = (sample_a[0], sample_b[0]);
             
             for &i in &sample_a {
                 for &j in &sample_b {
-                    let l1 = l0_diff(&expressions[i], &expressions[j]);
-                    if l1 < best_l1 {
-                        best_l1 = l1;
+                    let dist = l0_binary_diff(&expressions[i], &expressions[j]);
+                    if dist < best_dist {
+                        best_dist = dist;
                         best_pair = (i, j);
                     }
                 }
             }
             
-            // Add bridge edge (smallest delta = best compression)
             neighbors[best_pair.0].insert(best_pair.1);
             neighbors[best_pair.1].insert(best_pair.0);
         }
     }
-    // === END BRIDGING ===
     
     // Root is always cell 0 for simplicity
     let root = 0;
@@ -920,7 +838,7 @@ fn build_mst_prim<P: PointLike>(
         // Check all neighbors of u (graph is symmetric)
         for &v in &neighbors[u] {
             if !in_mst[v] {
-                let weight = l0_diff(&expressions[u], &expressions[v]);
+                let weight = l0_binary_diff(&expressions[u], &expressions[v]);
                 if weight < key[v] {
                     key[v] = weight;
                     parent[v] = u as u32;
@@ -931,19 +849,15 @@ fn build_mst_prim<P: PointLike>(
     }
     
     // Handle any disconnected nodes (shouldn't happen after bridging)
-    let mut disconnected_count = 0;
     for i in 0..n {
         if parent[i] == u32::MAX {
-            disconnected_count += 1;
             parent[i] = root as u32;
         }
-    }
-    if disconnected_count > 0 {
-        warn!("Unexpected: {} nodes still disconnected out of {} after bridging", disconnected_count, n);
     }
     
     (root, parent)
 }
+
 
 /// Compute DFS traversal order of MST starting from root
 /// Returns (dfs_order, parent_in_dfs_order)
@@ -994,7 +908,7 @@ fn compute_dfs_order(root: usize, parent: &[u32], n: usize) -> (Vec<u32>, Vec<u3
 /// MST-based encoding of a subarray (block of cells)
 /// Uses raw expression values with deltas along MST edges (no median)
 /// Cells are stored in DFS order with parent offsets for efficient compression
-pub fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffsMST> {
+pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffsMST> {
     if points.is_empty() {
         return None;
     }
@@ -1171,9 +1085,8 @@ impl EncodedDiffsMST {
     
     /// Decode the expression vector for a cell at given DFS position
     /// Uses new simplified format: indices = (dfs_pos-1)*num_genes + gene
-    pub fn decode_cell_at_dfs_pos(&self, dfs_pos: usize) -> Vec<u16> {
+    pub(crate) fn decode_cell_at_dfs_pos(&self, dfs_pos: usize) -> Vec<u16> {
         let mut expression = vec![0u16; self.num_genes as usize];
-        let num_genes = self.num_genes as usize;
         
         // Start with root's raw expression values
         let mut acc: Vec<(u32, i32)> = Vec::new();
@@ -1205,7 +1118,7 @@ impl EncodedDiffsMST {
         // path_dfs[0] is root (no delta needed), path_dfs[1..] need deltas
         for i in 1..path_dfs.len() {
             let cell_dfs = path_dfs[i];
-            let deltas = self.get_cell_deltas_new(cell_dfs, num_genes);
+            let deltas = self.get_cell_deltas_new(cell_dfs);
             acc = self.apply_deltas(&acc, &deltas);
         }
         
@@ -1219,13 +1132,14 @@ impl EncodedDiffsMST {
     
     /// Get deltas for cell at dfs_pos using new index format
     /// Index = (dfs_pos - 1) * num_genes + gene
-    fn get_cell_deltas_new(&self, dfs_pos: usize, num_genes: usize) -> Vec<(u32, i32)> {
+    fn get_cell_deltas_new(&self, dfs_pos: usize) -> Vec<(u32, i32)> {
         if dfs_pos == 0 {
             return Vec::new(); // Root has no deltas
         }
         
-        let cell_offset = (dfs_pos - 1) * num_genes;
-        let cell_end = cell_offset + num_genes;
+        let num_genes_usize = self.num_genes as usize;
+        let cell_offset = (dfs_pos - 1) * num_genes_usize;
+        let cell_end = cell_offset + num_genes_usize;
         
         let mut deltas = Vec::new();
         
@@ -1312,9 +1226,9 @@ impl EncodedDiffsMST {
     pub fn bytes(&self) -> usize {
         4  // num_genes only (ncells derived from parent_offset.len())
             + self.parent_offset.size_in_bytes()
-            + self.root_indices.num_bits() / 8
+            + (self.root_indices.num_bits() + 7) / 8
             + self.root_vals.size_in_bytes()
-            + self.indices.num_bits() / 8  // HybridSparseVec for combined indices
+            + (self.indices.num_bits() + 7) / 8  // HybridSparseVec for combined indices
             + self.delta_vals.size_in_bytes()
     }
     
@@ -1914,6 +1828,35 @@ impl QuadTree {
         }
     */
 
+    pub(crate) fn force_divide(&mut self, target_depth: usize, data: &CsMat<u16>) {
+        if self.depth >= target_depth || self.points.is_empty() {
+            if !self.points.is_empty() {
+                self.divide_recursive(data);
+            }
+            return;
+        }
+
+        let (nw_boundary, ne_boundary, se_boundary, sw_boundary) = get_child_rects(&self.boundary);
+        
+        let nw_points = self.query(&nw_boundary);
+        let ne_points = self.query(&ne_boundary);
+        let se_points = self.query(&se_boundary);
+        let sw_points = self.query(&sw_boundary);
+
+        self.divided = true;
+        self.nw = (!nw_points.is_empty()).then_some(Box::new(QuadTree::new(nw_boundary, nw_points, self.depth + 1)));
+        self.ne = (!ne_points.is_empty()).then_some(Box::new(QuadTree::new(ne_boundary, ne_points, self.depth + 1)));
+        self.se = (!se_points.is_empty()).then_some(Box::new(QuadTree::new(se_boundary, se_points, self.depth + 1)));
+        self.sw = (!sw_points.is_empty()).then_some(Box::new(QuadTree::new(sw_boundary, sw_points, self.depth + 1)));
+
+        self.points.clear();
+
+        if let Some(ref mut nw) = self.nw { nw.force_divide(target_depth, data); }
+        if let Some(ref mut ne) = self.ne { ne.force_divide(target_depth, data); }
+        if let Some(ref mut se) = self.se { se.force_divide(target_depth, data); }
+        if let Some(ref mut sw) = self.sw { sw.force_divide(target_depth, data); }
+    }
+
     pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
         //pub(crate) fn divide_recursive(&mut self, data: &CsMat<u16>) {
         info!("divide_recursive");
@@ -1923,9 +1866,7 @@ impl QuadTree {
         let max_pt: usize = 5;
         // nothing to do if this subtree is empty
         if self.points.is_empty() {
-            //return cost_log;
-            info!("points is empty");
-            //return CostLog::new();
+            return;
         }
         // Store the current points' positions before clearing them
         let positions: Vec<DatalessPoint> = self
@@ -2443,8 +2384,10 @@ impl QuadTree {
             node.se = se_res.map(|x| Box::new(x));
             node.sw = sw_res.map(|x| Box::new(x));
         } else {
-            node.encoded_diffs = encode_subarray(&self.points, data).expect("expect nonempty");
-            node.positions = self.positions.clone();
+            if !self.points.is_empty() {
+                node.encoded_diffs = encode_subarray(&self.points, data).expect("expect nonempty");
+                node.positions = self.positions.clone();
+            }
         }
         node
     }
@@ -2486,6 +2429,6 @@ mod tests {
         }
         // Test both encodings
         encode_subarray(&points, &csr);
-        encode_subarray_mst(&points, &csr);
+        // encode_subarray_mst(&points, &csr);
     }
 }

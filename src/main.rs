@@ -24,7 +24,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
 use sprs::CsMat;
-// removed unused bincode::{Encode, Decode} import
+use bincode::{Decode, Encode};
 
 use mimalloc::MiMalloc;
 use std::collections::HashMap;
@@ -345,8 +345,9 @@ fn tree_from_csv<T: AsRef<Path>>(
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
 
-     // Divide the quadtree and get cost log
-     let division_cost_log = qtree.divide_recursive(&csr);
+    // Force divide into 16x16 grid (depth 4) first, then recursively divide
+    //qtree.force_divide(4, &csr);
+    let division_cost_log = qtree.divide_recursive(&csr);
     /*
     //info!("Division cost log contains {} steps", division_cost_log.steps.len());
     //info!("Total nodes processed: {}", division_cost_log.total_nodes);
@@ -593,17 +594,20 @@ fn tree_from_10x<T: AsRef<Path>>(
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
     let mut qtree = QuadTree::new(domain, coords, 0);
 
-    // Divide the quadtree and get cost log
-    let division_cost_log = qtree.divide_recursive(&csr);
+    // Force divide into 16x16 grid (depth 4) first, then recursively divide
+    //qtree.force_divide(4, &csr);
+    //let division_cost_log = qtree.divide_recursive(&csr);
 
     // Serialize division cost log to file
+    /*
     let division_cost_log_filename = PathBuf::from("division_costs.bin");
     let cost_config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
     let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
+    // bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
     info!("Division cost log serialized to: {}", division_cost_log_filename.display());
+    */
 /* 
     // Optimize the quadtree and get cost log
    // let optimization_cost_log = qtree.optimize_quadtree();
@@ -996,6 +1000,7 @@ struct BuildCommand {
     platform: Option<Platform>,
 }
 
+#[derive(Clone, Encode, Decode)]
 struct Data {
     pub data: Vec<EncodedDiffs>,
     pub pos: Vec<DatalessPoint>,
