@@ -2384,10 +2384,8 @@ impl QuadTree {
             node.se = se_res.map(|x| Box::new(x));
             node.sw = sw_res.map(|x| Box::new(x));
         } else {
-            if !self.points.is_empty() {
-                node.encoded_diffs = encode_subarray(&self.points, data).expect("expect nonempty");
-                node.positions = self.positions.clone();
-            }
+            node.encoded_diffs = encode_subarray(&self.points, data).expect("expect nonempty");
+            node.positions = self.positions.clone();
         }
         node
     }
