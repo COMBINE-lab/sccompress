@@ -596,7 +596,7 @@ fn tree_from_10x<T: AsRef<Path>>(
 
     // Force divide into 16x16 grid (depth 4) first, then recursively divide
     //qtree.force_divide(4, &csr);
-    //let division_cost_log = qtree.divide_recursive(&csr);
+    let division_cost_log = qtree.divide_recursive(&csr);
 
     // Serialize division cost log to file
     /*
