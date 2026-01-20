@@ -1,6 +1,8 @@
 pub mod bits;
 pub mod quad_tree;
+//pub mod lossy_compression;
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
+//use crate::lossy_compression::LloydMaxQuantizer;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;
@@ -8,7 +10,7 @@ use hdf5::File as Hdf5File;
 use ndarray::ArrayD;
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
-use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffs, PointLike};
+use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffsMST, PointLike};
 //use std::error::Error;
 use std::fmt::Write as FmtWrite;
 use std::fs::File;
@@ -24,7 +26,7 @@ use flate2::Compression;
 use flate2::write::GzEncoder;
 use flate2::read::GzDecoder;
 use sprs::CsMat;
-use bincode::{Decode, Encode};
+// removed unused bincode::{Encode, Decode} import
 
 use mimalloc::MiMalloc;
 use std::collections::HashMap;
@@ -343,36 +345,11 @@ fn tree_from_csv<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0);
+    let qtree = QuadTree::new(domain, coords, 0);
 
-    // Force divide into 16x16 grid (depth 4) first, then recursively divide
-    //qtree.force_divide(4, &csr);
-    let division_cost_log = qtree.divide_recursive(&csr);
-    /*
-    //info!("Division cost log contains {} steps", division_cost_log.steps.len());
-    //info!("Total nodes processed: {}", division_cost_log.total_nodes);
-    //info!("Total cost: {}", division_cost_log.total_cost);
-
-    //Serialize division cost log to file
-        let division_cost_log_filename = PathBuf::from("division_costs.bin");
-        let cost_config = bincode::config::standard()
-            .with_little_endian()
-            .with_fixed_int_encoding();
-        let mut division_cost_file = File::create(&division_cost_log_filename)?;
-        bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-        info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-
-      // Optimize the quadtree and get cost log
-    let optimization_cost_log = qtree.optimize_quadtree();
-    info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
-    info!("Optimization total cost: {}", optimization_cost_log.total_cost);
-
-    // Serialize optimization cost log to file
-    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
-    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
-    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
-    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    */
+     // Divide the quadtree and get cost log
+    //let division_cost_log = qtree.divide_recursive(&csr);
+    
     Ok((qtree, csr))
 }
 
@@ -592,34 +569,11 @@ fn tree_from_10x<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0);
+    let qtree = QuadTree::new(domain, coords, 0);
 
-    // Force divide into 16x16 grid (depth 4) first, then recursively divide
-    //qtree.force_divide(4, &csr);
-    let division_cost_log = qtree.divide_recursive(&csr);
-
-    // Serialize division cost log to file
-    /*
-    let division_cost_log_filename = PathBuf::from("division_costs.bin");
-    let cost_config = bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding();
-    let mut division_cost_file = File::create(&division_cost_log_filename)?;
-    // bincode::encode_into_std_write(&division_cost_log, &mut division_cost_file, cost_config)?;
-    info!("Division cost log serialized to: {}", division_cost_log_filename.display());
-    */
-/* 
-    // Optimize the quadtree and get cost log
-   // let optimization_cost_log = qtree.optimize_quadtree();
-    //info!("Optimization cost log contains {} steps", optimization_cost_log.steps.len());
-    //info!("Optimization total cost: {}", optimization_cost_log.total_cost);
-
-    // Serialize optimization cost log to file
-    let optimization_cost_log_filename = PathBuf::from("optimization_costs.bin");
-    let mut optimization_cost_file = File::create(&optimization_cost_log_filename)?;
-    bincode::encode_into_std_write(&optimization_cost_log, &mut optimization_cost_file, cost_config)?;
-    info!("Optimization cost log serialized to: {}", optimization_cost_log_filename.display());
-    */
+    // Divide the quadtree and get cost log
+    //let division_cost_log = qtree.divide_recursive(&csr);
+    
     Ok((qtree, csr))
 }
 
@@ -720,7 +674,7 @@ fn encode_clusters_from_h5<T: AsRef<Path>>(
     cluster_format: ClusterFormat,
     pos_x_col: usize,
     pos_y_col: usize,
-) -> anyhow::Result<Vec<(EncodedDiffs, Vec<DatalessPoint>)>> {
+) -> anyhow::Result<Vec<(EncodedDiffsMST, Vec<DatalessPoint>)>> {
     info!("Loading HDF5 data from: {}", h5_path.as_ref().display());
     
     // Read features from HDF5
@@ -858,12 +812,14 @@ fn encode_clusters_from_h5<T: AsRef<Path>>(
             }
         }
         
-        info!("Cluster {} has {} valid cells with positions", cluster_idx, points.len());
-        
         // Encode this cluster
-        if let Some(encoded) = quad_tree::tree::encode_subarray(&points, &csr) {
+        if let Some((encoded, dfs_order)) = quad_tree::tree::encode_subarray_mst(&points, &csr) {
             info!("Cluster {} encoded: {} bytes", cluster_idx, encoded.bytes());
-            encoded_clusters.push((encoded, positions));
+            // Reorder positions to match DFS order
+            let reordered_positions: Vec<DatalessPoint> = dfs_order.iter()
+                .map(|&idx| positions[idx as usize].clone())
+                .collect();
+            encoded_clusters.push((encoded, reordered_positions));
         } else {
             warn!("Failed to encode cluster {}", cluster_idx);
         }
@@ -1000,9 +956,8 @@ struct BuildCommand {
     platform: Option<Platform>,
 }
 
-#[derive(Clone, Encode, Decode)]
 struct Data {
-    pub data: Vec<EncodedDiffs>,
+    pub data: Vec<EncodedDiffsMST>,
     pub pos: Vec<DatalessPoint>,
     // pub sep: Vec<usize>,
 }
@@ -1135,14 +1090,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 qtree.non_zero_blocks(&csr)
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
+            //bincode::encode_into_std_write(&d.data, &mut writer, config).unwrap();
+            //bincode::encode_into_std_write(&d.pos, &mut writer, config).unwrap();
             bincode::encode_into_std_write(&d.data, &mut encoder, config).unwrap();
             bincode::encode_into_std_write(&d.pos, &mut encoder, config).unwrap();
+
         }
         Commands::Dump(args) => {
             info!("start dump");
             let ifile = std::fs::File::open(args.input)?;
-            let ifile = std::io::BufReader::new(ifile);
-            let gz = GzDecoder::new(ifile);
+            let mut rdr = std::io::BufReader::new(ifile);
+            let gz = GzDecoder::new(&mut rdr);
             let mut rdr = BufReader::new(gz);
 
             let config = bincode::config::standard()
