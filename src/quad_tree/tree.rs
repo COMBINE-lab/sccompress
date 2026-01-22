@@ -601,6 +601,8 @@ fn compute_sparse_expression(
 
 /// L0 binary diff: Count of genes where sparsity pattern differs
 
+/// L0 binary diff: Count of genes where sparsity pattern differs
+/// (one is zero, the other is non-zero)
 fn l0_binary_diff(a: &[(u32, u16)], b: &[(u32, u16)]) -> u32 {
     let mut count = 0u32;
     let mut i = 0;
@@ -779,10 +781,10 @@ fn build_mst_prim<P: PointLike>(
         for i in 0..n {
             let mut candidates: Vec<(usize, u32)> = Vec::with_capacity(n - 1);
             for j in 0..n {
-                if i != j {
-                    let dist = l0_binary_diff(&expressions[i], &expressions[j]);
-                    candidates.push((j, dist));
-                }
+            if i != j {
+                let dist = l0_binary_diff(&expressions[i], &expressions[j]);
+                candidates.push((j, dist));
+            }
             }
 
             let k_actual = k.min(candidates.len());
@@ -900,7 +902,7 @@ fn compute_dfs_order(root: usize, parent: &[u32], n: usize) -> (Vec<u32>, Vec<u3
 /// MST-based encoding of a subarray (block of cells)
 /// Uses raw expression values with deltas along MST edges (no median)
 /// Cells are stored in DFS order with parent offsets for efficient compression
-pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option<(EncodedDiffsMST, Vec<u32>)> {
+pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>, depth: usize) -> Option<(EncodedDiffsMST, Vec<u32>)> {
     if points.is_empty() {
         return None;
     }
@@ -978,6 +980,9 @@ pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option
     } else {
         0.0
     };
+    
+    let delta_change_pct = sparsity * 100.0;
+    
     let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, total_possible);
     
     let delta_vals = if sorted_delta_vals.is_empty() {
@@ -987,11 +992,11 @@ pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>) -> Option
     };
     
     info!(
-        "MST encoding: {} cells, num_genes={}, root_genes={}, delta_entries={}, parent_offset avg: {:.1}",
+        "[Level {}] MST encoding: {} cells, delta_entries={}, change_pct={:.3}%, parent_offset avg: {:.1}",
+        depth,
         points.len(),
-        num_genes,
-        root_genes_vec.len(),
         combined_indices.len(),
+        delta_change_pct,
         if parent_offset_vec.len() > 1 {
             parent_offset_vec.iter().skip(1).map(|&x| x as f64).sum::<f64>() / (parent_offset_vec.len() - 1) as f64
         } else { 0.0 }
@@ -1159,7 +1164,7 @@ impl EncodedDiffsMST {
 
     /// Get deltas for cell at dfs_pos using new index format
     /// Index = (dfs_pos - 1) * num_genes + gene
-    fn get_cell_deltas_new(&self, dfs_pos: usize) -> Vec<(u32, i32)> {
+    pub(crate) fn get_cell_deltas_new(&self, dfs_pos: usize) -> Vec<(u32, i32)> {
         let all_indices = self.indices.indices_vec();
         self.get_cell_deltas_with_indices(dfs_pos, &all_indices)
     }
@@ -1578,7 +1583,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for BitField {
 pub(crate) struct BitFieldQuadTree {
     pub(crate) boundary: Rect,
     pub(crate) encoded_diffs: EncodedDiffsMST,
-    divided: bool,
+    pub(crate) divided: bool,
     nw: Option<Box<BitFieldQuadTree>>,
     ne: Option<Box<BitFieldQuadTree>>,
     se: Option<Box<BitFieldQuadTree>>,
@@ -1909,10 +1914,10 @@ impl QuadTree {
             .iter()
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
-        // Compute the expense of encoding the current block
-        let current_expense = encode_subarray(&self.points, data).map_or(0, |x| x.bytes());
+        // Compute the expense of encoding the current block using MST
+        let current_expense = encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes());
         info!(
-            "expense of current block consisting of {} points is {}",
+            "expense of current block (MST) consisting of {} points is {}",
             self.points.len(),
             current_expense
         );
@@ -1937,11 +1942,11 @@ impl QuadTree {
             self.points.len()
         );
 
-        // Convert children to BitFieldQuadTree to calculate their expenses
-        let nw_expense = encode_subarray(&nw.points, data).map_or(0, |x| x.bytes());
-        let ne_expense = encode_subarray(&ne.points, data).map_or(0, |x| x.bytes());
-        let se_expense = encode_subarray(&se.points, data).map_or(0, |x| x.bytes());
-        let sw_expense = encode_subarray(&sw.points, data).map_or(0, |x| x.bytes());
+        // Convert children to calculate their MST expenses
+        let nw_expense = encode_subarray_mst(&nw.points, data).map_or(0, |(x, _)| x.bytes());
+        let ne_expense = encode_subarray_mst(&ne.points, data).map_or(0, |(x, _)| x.bytes());
+        let se_expense = encode_subarray_mst(&se.points, data).map_or(0, |(x, _)| x.bytes());
+        let sw_expense = encode_subarray_mst(&sw.points, data).map_or(0, |(x, _)| x.bytes());
 
         info!("NW expense: {}", nw_expense);
         info!("NE expense: {}", ne_expense);
@@ -1951,8 +1956,10 @@ impl QuadTree {
         let total_expense = nw_expense + ne_expense + se_expense + sw_expense;
         info!("total_expense: {}", total_expense);
 
-        //if self.points.len() > 1 {
-        if total_expense < current_expense {
+        // Force divide if too many points, or if it saves space
+        let force_divide = self.points.len() > 5000;
+        
+        if force_divide || total_expense < current_expense {
             self.divided = true;
             // Convert BitFieldQuadTree back to QuadTree and assign children
             self.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
@@ -2163,9 +2170,8 @@ impl QuadTree {
     ) -> (usize, usize, bool) {
         if !self.divided {
             // Leaf node - calculate parent expense only
-            // Use fast median-based encoding for divide decisions
             let parent_expense = if !self.points.is_empty() {
-                encode_subarray(&self.points, data).map_or(0, |x| x.bytes())
+                encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
             } else {
                 0
             };
@@ -2194,9 +2200,8 @@ impl QuadTree {
         }
 
         // Calculate parent expense for this node
-        // Use fast median-based encoding for divide decisions
         let parent_expense = if !self.points.is_empty() {
-            encode_subarray(&self.points, data).map_or(0, |x| x.bytes())
+            encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
         } else {
             0
         };
@@ -2216,7 +2221,7 @@ impl QuadTree {
             if !self.divided {
                 // Leaf node - return its own expense
                 let leaf_expense = if !self.points.is_empty() {
-                    encode_subarray(&self.points).map_or(0, |x| x.bytes())
+                    encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
                 } else {
                     0
                 };
@@ -2254,7 +2259,7 @@ impl QuadTree {
 
             // Calculate parent expense
             let parent_expense = if !self.points.is_empty() {
-                encode_subarray(&self.points).map_or(0, |x| x.bytes())
+                encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
             } else {
                 0
             };
