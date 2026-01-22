@@ -466,6 +466,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
 /// Takes a slice of points and encodes raw expression values (no median subtraction)
 /// Returns a `Some(EncodedDiffs)` struct representing the encoded values or `None` if empty.
 ///
+/* 
 pub(crate) fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<EncodedDiffs> {
     if points.is_empty() {
         debug!("Empty points array in encode_subarray()");
@@ -573,6 +574,7 @@ pub(crate) fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<Enc
     */
     Some(enc_diffs)
 }
+    */
 
 // ============================================================================
 // MST-based encoding functions
@@ -899,10 +901,54 @@ fn compute_dfs_order(root: usize, parent: &[u32], n: usize) -> (Vec<u32>, Vec<u3
     (dfs_order, parent_offset)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct MSTStats {
+    pub level: usize,
+    pub points: usize,
+    pub total_entries: usize,
+    pub non_zeros: usize,
+    pub zeros: usize,
+    pub pattern_changes: usize,
+    pub change_pct: f64,
+}
+
+impl MSTStats {
+    pub fn save_to_csv(&self, filename: &str) -> std::io::Result<()> {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        
+        let file_exists = std::path::Path::new(filename).exists();
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(filename)?;
+            
+        if !file_exists {
+            writeln!(file, "level,points,total_entries,non_zeros,zeros,pattern_changes,change_pct")?;
+        }
+        
+        writeln!(
+            file,
+            "{},{},{},{},{},{},{:.6}",
+            self.level,
+            self.points,
+            self.total_entries,
+            self.non_zeros,
+            self.zeros,
+            self.pattern_changes,
+            self.change_pct
+        )
+    }
+}
+
 /// MST-based encoding of a subarray (block of cells)
 /// Uses raw expression values with deltas along MST edges (no median)
 /// Cells are stored in DFS order with parent offsets for efficient compression
-pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>, depth: usize) -> Option<(EncodedDiffsMST, Vec<u32>)> {
+pub(crate) fn encode_subarray_mst(
+    points: &[Point], 
+    data: &CsMat<u16>, 
+    depth: usize
+) -> Option<(EncodedDiffsMST, Vec<u32>, MSTStats)> {
     if points.is_empty() {
         return None;
     }
@@ -932,11 +978,19 @@ pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>, depth: us
     // Index = (dfs_pos - 1) * num_genes + gene (combined cell+gene in one index)
     let mut combined_indices = Vec::new();
     let mut delta_vals_raw = Vec::new();
+    let mut total_pattern_changes = 0usize;
+    let mut total_non_zeros = root_expr.len();
     
     // Skip first cell (root), process rest in DFS order
     for (dfs_pos, &orig_cell) in dfs_order_vec.iter().enumerate().skip(1) {
         let parent_orig = parent[orig_cell as usize] as usize;
-        let diff_list = sparse_subtract(&expressions[orig_cell as usize], &expressions[parent_orig]);
+        let child_expr = &expressions[orig_cell as usize];
+        let parent_expr = &expressions[parent_orig];
+        
+        total_non_zeros += child_expr.len();
+        total_pattern_changes += l0_binary_diff(child_expr, parent_expr) as usize;
+        
+        let diff_list = sparse_subtract(child_expr, parent_expr);
         
         // Use (dfs_pos - 1) since root is stored separately
         let cell_offset = ((dfs_pos - 1) as u64) * (num_genes as u64);
@@ -974,16 +1028,20 @@ pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>, depth: us
     
     let (sorted_indices, sorted_delta_vals): (Vec<u64>, Vec<u32>) = indexed_deltas.into_iter().unzip();
     
-    let total_possible = (points.len() - 1) * (num_genes as usize); // (ncells-1) * num_genes
-    let sparsity = if total_possible > 0 {
-        sorted_indices.len() as f64 / total_possible as f64
+    let edges_possible = (points.len() - 1) * (num_genes as usize);
+    let change_pct = if edges_possible > 0 {
+        total_pattern_changes as f64 / edges_possible as f64 * 100.0
     } else {
         0.0
     };
     
-    let delta_change_pct = sparsity * 100.0;
+    let sparsity = if edges_possible > 0 {
+        sorted_indices.len() as f64 / edges_possible as f64
+    } else {
+        0.0
+    };
     
-    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, total_possible);
+    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
     
     let delta_vals = if sorted_delta_vals.is_empty() {
         DacsOpt::default()
@@ -991,12 +1049,22 @@ pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>, depth: us
         DacsOpt::from_slice(&sorted_delta_vals, Some(3)).expect("should fit")
     };
     
+    let stats = MSTStats {
+        level: depth,
+        points: points.len(),
+        total_entries: points.len() * num_genes as usize,
+        non_zeros: total_non_zeros,
+        zeros: (points.len() * num_genes as usize).saturating_sub(total_non_zeros),
+        pattern_changes: total_pattern_changes,
+        change_pct,
+    };
+
     info!(
-        "[Level {}] MST encoding: {} cells, delta_entries={}, change_pct={:.3}%, parent_offset avg: {:.1}",
+        "[Level {}] MST encoding: {} cells, pattern_changes={}, change_pct={:.3}%, parent_offset avg: {:.1}",
         depth,
         points.len(),
-        combined_indices.len(),
-        delta_change_pct,
+        total_pattern_changes,
+        change_pct,
         if parent_offset_vec.len() > 1 {
             parent_offset_vec.iter().skip(1).map(|&x| x as f64).sum::<f64>() / (parent_offset_vec.len() - 1) as f64
         } else { 0.0 }
@@ -1023,54 +1091,10 @@ pub(crate) fn encode_subarray_mst(points: &[Point], data: &CsMat<u16>, depth: us
 
     /* 
     // validate! - Ensure lossless reconstruction
-    for (dfs_pos, (recon_vec, &orig_cell_idx)) in enc_diffs_mst
-        .expression_vec_iter()
-        .zip(dfs_order_vec.iter())
-        .enumerate()
-    {
-        let orig_vec = &points[orig_cell_idx as usize];
-        let orig_data = orig_vec.get_data(data).unwrap().to_dense().to_vec();
-        // Find differences instead of asserting equality
-        let differences: Vec<(usize, u16, u16)> = recon_vec
-            .iter()
-            .zip(orig_data.iter())
-            .enumerate()
-            .filter(|(_, (&r, &o))| r != o)
-            .map(|(gene_idx, (&r, &o))| (gene_idx, r, o))
-            .collect();
-
-        if !differences.is_empty() {
-            info!("MST encoding differences for cell (dfs_pos={}, orig_idx={}): {:?}", dfs_pos, orig_cell_idx, differences);
-            info!("type: {:?}", enc_diffs_mst.indices.tyname());
-            
-            // Save error cell to file
-            use std::io::Write;
-            let fname = format!("bad_cell_mst_dfs{}_orig{}.txt", dfs_pos, orig_cell_idx);
-            let f = std::fs::File::create(&fname).expect("Should be able to create file");
-            let mut f = std::io::BufWriter::new(f);
-            
-            writeln!(f, "# Error cell DFS pos: {}, Original index: {}", dfs_pos, orig_cell_idx).ok();
-            writeln!(f, "# Differences (gene_idx, reconstructed, original):").ok();
-            for diff in &differences {
-                writeln!(f, "{}\t{}\t{}", diff.0, diff.1, diff.2).ok();
-            }
-            writeln!(f, "# Original sparse row:").ok();
-            if let Some(row) = orig_vec.get_data(data) {
-                for (gene_idx, &val) in row.iter() {
-                    writeln!(f, "{}\t{}\t{}", orig_cell_idx + 1, gene_idx + 1, val).unwrap();
-                }
-            }
-            writeln!(f, "# Reconstructed non-zero values:").ok();
-            for (gene_idx, &val) in recon_vec.iter().enumerate().filter(|(_, &v)| v != 0) {
-                writeln!(f, "{}\t{}\t{}", orig_cell_idx + 1, gene_idx + 1, val).unwrap();
-            }
-            
-            panic!("MST encoding failed to reconstruct cell (dfs_pos={}, orig_idx={})!", dfs_pos, orig_cell_idx);
-        }
-    }
+    // ...
     */
     
-    Some((enc_diffs_mst, dfs_order_vec))
+    Some((enc_diffs_mst, dfs_order_vec, stats))
 }
 
 impl EncodedDiffsMST {
@@ -1915,7 +1939,9 @@ impl QuadTree {
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
         // Compute the expense of encoding the current block using MST
-        let current_expense = encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes());
+        let (current_enc, _, current_stats) = encode_subarray_mst(&self.points, data, self.depth).expect("expect nonempty");
+        let current_expense = current_enc.bytes();
+        
         info!(
             "expense of current block (MST) consisting of {} points is {}",
             self.points.len(),
@@ -1943,10 +1969,10 @@ impl QuadTree {
         );
 
         // Convert children to calculate their MST expenses
-        let nw_expense = encode_subarray_mst(&nw.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
-        let ne_expense = encode_subarray_mst(&ne.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
-        let se_expense = encode_subarray_mst(&se.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
-        let sw_expense = encode_subarray_mst(&sw.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
+        let nw_expense = encode_subarray_mst(&nw.points, data, self.depth + 1).map_or(0, |(x, _, _)| x.bytes());
+        let ne_expense = encode_subarray_mst(&ne.points, data, self.depth + 1).map_or(0, |(x, _, _)| x.bytes());
+        let se_expense = encode_subarray_mst(&se.points, data, self.depth + 1).map_or(0, |(x, _, _)| x.bytes());
+        let sw_expense = encode_subarray_mst(&sw.points, data, self.depth + 1).map_or(0, |(x, _, _)| x.bytes());
 
         info!("NW expense: {}", nw_expense);
         info!("NE expense: {}", ne_expense);
@@ -1961,6 +1987,10 @@ impl QuadTree {
         
         if force_divide || total_expense < current_expense {
             self.divided = true;
+            
+            // Save stats to CSV for nodes that actually divided
+            current_stats.save_to_csv("quadtree_mst_stats.csv").ok();
+            
             // Convert BitFieldQuadTree back to QuadTree and assign children
             self.nw = (!nw.points.is_empty()).then_some(Box::new(nw));
             self.ne = (!ne.points.is_empty()).then_some(Box::new(ne));
@@ -2171,7 +2201,7 @@ impl QuadTree {
         if !self.divided {
             // Leaf node - calculate parent expense only
             let parent_expense = if !self.points.is_empty() {
-                encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
+                encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _, _)| x.bytes())
             } else {
                 0
             };
@@ -2201,7 +2231,7 @@ impl QuadTree {
 
         // Calculate parent expense for this node
         let parent_expense = if !self.points.is_empty() {
-            encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
+            encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _, _)| x.bytes())
         } else {
             0
         };
@@ -2221,7 +2251,7 @@ impl QuadTree {
             if !self.divided {
                 // Leaf node - return its own expense
                 let leaf_expense = if !self.points.is_empty() {
-                    encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
+                    encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _, _)| x.bytes())
                 } else {
                     0
                 };
@@ -2259,7 +2289,7 @@ impl QuadTree {
 
             // Calculate parent expense
             let parent_expense = if !self.points.is_empty() {
-                encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
+                encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _, _)| x.bytes())
             } else {
                 0
             };
@@ -2424,7 +2454,7 @@ impl QuadTree {
             node.se = se_res.map(|x| Box::new(x));
             node.sw = sw_res.map(|x| Box::new(x));
         } else {
-            let (enc_diffs, dfs_order) = encode_subarray_mst(&self.points, data, self.depth).expect("expect nonempty");
+            let (enc_diffs, dfs_order, _) = encode_subarray_mst(&self.points, data, self.depth).expect("expect nonempty");
             node.encoded_diffs = enc_diffs;
             // Reorder positions to match MST DFS order
             // Deriving from self.points because self.positions might be empty
