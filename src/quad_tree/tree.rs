@@ -1915,7 +1915,7 @@ impl QuadTree {
             .map(|p| DatalessPoint::new(p.x, p.y))
             .collect();
         // Compute the expense of encoding the current block using MST
-        let current_expense = encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes());
+        let current_expense = encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes());
         info!(
             "expense of current block (MST) consisting of {} points is {}",
             self.points.len(),
@@ -1943,10 +1943,10 @@ impl QuadTree {
         );
 
         // Convert children to calculate their MST expenses
-        let nw_expense = encode_subarray_mst(&nw.points, data).map_or(0, |(x, _)| x.bytes());
-        let ne_expense = encode_subarray_mst(&ne.points, data).map_or(0, |(x, _)| x.bytes());
-        let se_expense = encode_subarray_mst(&se.points, data).map_or(0, |(x, _)| x.bytes());
-        let sw_expense = encode_subarray_mst(&sw.points, data).map_or(0, |(x, _)| x.bytes());
+        let nw_expense = encode_subarray_mst(&nw.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
+        let ne_expense = encode_subarray_mst(&ne.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
+        let se_expense = encode_subarray_mst(&se.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
+        let sw_expense = encode_subarray_mst(&sw.points, data, self.depth + 1).map_or(0, |(x, _)| x.bytes());
 
         info!("NW expense: {}", nw_expense);
         info!("NE expense: {}", ne_expense);
@@ -2171,7 +2171,7 @@ impl QuadTree {
         if !self.divided {
             // Leaf node - calculate parent expense only
             let parent_expense = if !self.points.is_empty() {
-                encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
+                encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
             } else {
                 0
             };
@@ -2201,7 +2201,7 @@ impl QuadTree {
 
         // Calculate parent expense for this node
         let parent_expense = if !self.points.is_empty() {
-            encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
+            encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
         } else {
             0
         };
@@ -2221,7 +2221,7 @@ impl QuadTree {
             if !self.divided {
                 // Leaf node - return its own expense
                 let leaf_expense = if !self.points.is_empty() {
-                    encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
+                    encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
                 } else {
                     0
                 };
@@ -2259,7 +2259,7 @@ impl QuadTree {
 
             // Calculate parent expense
             let parent_expense = if !self.points.is_empty() {
-                encode_subarray_mst(&self.points, data).map_or(0, |(x, _)| x.bytes())
+                encode_subarray_mst(&self.points, data, self.depth).map_or(0, |(x, _)| x.bytes())
             } else {
                 0
             };
@@ -2424,7 +2424,7 @@ impl QuadTree {
             node.se = se_res.map(|x| Box::new(x));
             node.sw = sw_res.map(|x| Box::new(x));
         } else {
-            let (enc_diffs, dfs_order) = encode_subarray_mst(&self.points, data).expect("expect nonempty");
+            let (enc_diffs, dfs_order) = encode_subarray_mst(&self.points, data, self.depth).expect("expect nonempty");
             node.encoded_diffs = enc_diffs;
             // Reorder positions to match MST DFS order
             // Deriving from self.points because self.positions might be empty
