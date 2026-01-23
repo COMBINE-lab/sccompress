@@ -345,10 +345,10 @@ fn tree_from_csv<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let qtree = QuadTree::new(domain, coords, 0);
+    let mut qtree = QuadTree::new(domain, coords, 0);
 
-     // Divide the quadtree and get cost log
-    //let division_cost_log = qtree.divide_recursive(&csr);
+     // Divide the quadtree
+    qtree.divide_recursive(&csr);
     
     Ok((qtree, csr))
 }
@@ -569,10 +569,10 @@ fn tree_from_10x<T: AsRef<Path>>(
     let h = maxy - miny;
 
     let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let qtree = QuadTree::new(domain, coords, 0);
+    let mut qtree = QuadTree::new(domain, coords, 0);
 
-    // Divide the quadtree and get cost log
-    //let division_cost_log = qtree.divide_recursive(&csr);
+    // Divide the quadtree
+    qtree.divide_recursive(&csr);
     
     Ok((qtree, csr))
 }
@@ -813,7 +813,7 @@ fn encode_clusters_from_h5<T: AsRef<Path>>(
         }
         
         // Encode this cluster
-        if let Some((encoded, dfs_order)) = quad_tree::tree::encode_subarray_mst(&points, &csr) {
+        if let Some((encoded, dfs_order, _)) = quad_tree::tree::encode_subarray_mst(&points, &csr, 0) {
             info!("Cluster {} encoded: {} bytes", cluster_idx, encoded.bytes());
             // Reorder positions to match DFS order
             let reordered_positions: Vec<DatalessPoint> = dfs_order.iter()
@@ -1023,7 +1023,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Platform::Xenium) => (1, 2),
                 None => (args.idx_x, args.idx_y),
             };
-            let (qtree, csr) = match args.format {
+            let (mut qtree, csr) = match args.format {
                 InputDataType::Csv => {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {
                     //    anyhow::anyhow!("Position file required for CSV format")
@@ -1079,7 +1079,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut d = Data::new();
 
             let mut collect_data = |n: &BitFieldQuadTree| {
-                if n.encoded_diffs.bytes() > 0 {
+                if !n.divided && n.encoded_diffs.ncells() > 0 {
                     d.data.push(n.encoded_diffs.clone());
                     d.pos.extend_from_slice(&n.positions);
                 }
