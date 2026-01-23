@@ -1926,7 +1926,7 @@ impl QuadTree {
         info!("divide_recursive");
         //let mut stack = vec![self];
         // let cost_log = CostLog::new();
-        //let max_depth = 3;
+        let max_depth = 4;
         // let max_pt: usize = 5;
         // nothing to do if this subtree is empty
         if self.points.is_empty() {
@@ -1983,9 +1983,9 @@ impl QuadTree {
         info!("total_expense: {}", total_expense);
 
         // Force divide if too many points, or if it saves space
-        let force_divide = self.points.len() > 5000;
+        //let force_divide = self.points.len() > 5000;
         
-        if force_divide || total_expense < current_expense {
+        if total_expense < current_expense && self.depth < max_depth {
             self.divided = true;
             
             // Save stats to CSV for nodes that actually divided
