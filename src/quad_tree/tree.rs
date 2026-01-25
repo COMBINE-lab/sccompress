@@ -1985,7 +1985,8 @@ impl QuadTree {
         // Force divide if too many points, or if it saves space
         //let force_divide = self.points.len() > 5000;
         
-        if total_expense < current_expense && self.depth < max_depth {
+        //if total_expense < current_expense && self.depth < max_depth {
+        if total_expense < current_expense {
             self.divided = true;
             
             // Save stats to CSV for nodes that actually divided
