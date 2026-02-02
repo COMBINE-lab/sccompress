@@ -184,6 +184,7 @@ test_data/
 *.tar.gz
 test_output.*
 H5_spatial_subset2.bin.gz
+!test_data/HD16_spatial_data.tar.gz
 
 # IDE files
 .vscode/
