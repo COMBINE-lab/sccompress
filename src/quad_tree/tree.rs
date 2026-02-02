@@ -828,6 +828,40 @@ fn zigzag_encode(v: i32) -> i32 {
     }
 }
 
+/// Find optimal k parameter for DacsOpt encoding based on value distribution
+///
+/// DacsOpt uses a parameter k that controls the encoding efficiency.
+/// This function tests different k values and returns the one that gives the smallest size.
+///
+/// # Arguments
+///
+/// * `values` - The values to encode
+///
+/// # Returns
+///
+/// Optimal k value (typically 2-5 for gene expression deltas)
+fn find_optimal_dacs_k(values: &[u32]) -> Option<usize> {
+    if values.is_empty() {
+        return Some(3); // Default
+    }
+    
+    let test_k_values = [2, 3, 4, 5, 6];
+    let mut best_k = 3;
+    let mut best_size = usize::MAX;
+    
+    for &k in &test_k_values {
+        if let Ok(encoded) = DacsOpt::from_slice(values, Some(k)) {
+            let size = encoded.size_in_bytes();
+            if size < best_size {
+                best_size = size;
+                best_k = k;
+            }
+        }
+    }
+    
+    Some(best_k)
+}
+
 /// Build symmetric kNN graph for all points using grid-based spatial index
 /// Returns adjacency list where neighbors[i] contains all neighbors of cell i
 /// Build symmetric kNN graph based on expression sparsity pattern similarity
@@ -1181,10 +1215,12 @@ pub(crate) fn encode_subarray_mst(
     let root_genes_u64: Vec<u64> = root_genes_vec.iter().map(|&g| g as u64).collect();
     let root_indices = HybridSparseVec::from_indices(&root_genes_u64, 0.5, num_genes as usize);
     
+    // OPTIMIZATION: Find optimal k for root values
+    let root_k = find_optimal_dacs_k(&root_vals_vec).unwrap_or(3);
     let root_vals = if root_vals_vec.is_empty() {
         DacsOpt::default()
     } else {
-        DacsOpt::from_slice(&root_vals_vec, Some(3)).expect("should fit")
+        DacsOpt::from_slice(&root_vals_vec, Some(root_k)).expect("should fit")
     };
     
     // Use HybridSparseVec for combined indices (same as old encoding!)
@@ -1212,10 +1248,12 @@ pub(crate) fn encode_subarray_mst(
     
     let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
     
+    // OPTIMIZATION: Find optimal k for delta values based on their distribution
+    let delta_k = find_optimal_dacs_k(&sorted_delta_vals).unwrap_or(3);
     let delta_vals = if sorted_delta_vals.is_empty() {
         DacsOpt::default()
     } else {
-        DacsOpt::from_slice(&sorted_delta_vals, Some(3)).expect("should fit")
+        DacsOpt::from_slice(&sorted_delta_vals, Some(delta_k)).expect("should fit")
     };
     
     let stats = MSTStats {
@@ -1241,12 +1279,14 @@ pub(crate) fn encode_subarray_mst(
     
     // Size breakdown
     info!(
-        "  Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes, indices={} bytes, delta_vals={} bytes",
+        "  Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes (k={}), indices={} bytes, delta_vals={} bytes (k={})",
         parent_offset.size_in_bytes(),
         root_indices.num_bytes(),
         root_vals.size_in_bytes(),
+        root_k,
         indices.num_bytes(),
-        delta_vals.size_in_bytes()
+        delta_vals.size_in_bytes(),
+        delta_k
     );
     
     let enc_diffs_mst = EncodedDiffsMST {
