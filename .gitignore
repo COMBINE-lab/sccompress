@@ -169,3 +169,29 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# Rust build artifacts
+target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# Test data files
+test_data/
+*.h5
+*.parquet
+*.bin.gz
+*.tar.gz
+test_output.*
+H5_spatial_subset2.bin.gz
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
