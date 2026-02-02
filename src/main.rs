@@ -1,5 +1,6 @@
 pub mod bits;
 pub mod quad_tree;
+pub mod h5_utils;
 //pub mod lossy_compression;
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 //use crate::lossy_compression::LloydMaxQuantizer;
@@ -104,143 +105,54 @@ fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
 
 //use af_anndata::H5 as H52;
 
-fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
-    println!(
-        "Reading features from 10x HDF5 file: {}",
-        h5_path.as_ref().display()
-    );
-
-    let file = Hdf5File::open(h5_path.as_ref())?;
-    println!("Successfully opened HDF5 file");
-
-    let matrix_group = file.group("matrix")?;
-    println!("Found matrix group");
-
-    let features_group = matrix_group.group("features")?;
-    println!("Found features group");
-
-    // Try to read feature names
-    match features_group.dataset("name") {
-        Ok(name_dataset) => {
-            println!("Found name dataset, attempting to read...");
-            match name_dataset.read_1d::<u8>() {
-                Ok(names_bytes) => {
-                    println!(
-                        "Successfully read {} bytes from name dataset",
-                        names_bytes.len()
-                    );
-
-                    // Convert to Vec<u8> to avoid version conflicts
-                    let names_vec: Vec<u8> = names_bytes.to_vec();
-
-                    // Convert bytes to strings - each string is 23 bytes
-                    let mut names = Vec::new();
-                    for i in 0..541 {
-                        let start = i * 23;
-                        let end = start + 23;
-                        if end <= names_vec.len() {
-                            let string_bytes = &names_vec[start..end];
-                            // Convert bytes to string, removing null padding
-                            let name = String::from_utf8_lossy(string_bytes)
-                                .trim_matches('\0')
-                                .to_string();
-                            names.push(name);
-                        }
-                    }
-
-                    println!("Successfully read {} feature names from HDF5", names.len());
-                    if names.len() > 0 {
-                        println!("First 5 features: {:?}", &names[..names.len().min(5)]);
-                    }
-
-                    Ok(names)
-                }
-                Err(e) => {
-                    println!("Failed to read name dataset: {:?}", e);
-                    // Fallback to placeholder features
-                    let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
-                    println!("Using {} placeholder features", names.len());
-                    Ok(names)
-                }
-            }
-        }
-        Err(e) => {
-            println!("Failed to find name dataset: {:?}", e);
-            // Fallback to placeholder features
-            let names: Vec<String> = (0..541).map(|i| format!("Gene_{}", i)).collect();
-            println!("Using {} placeholder features", names.len());
-            Ok(names)
-        }
-    }
-}
-
-// Helper functions to read fixed-length strings from HDF5
-fn read_strings_7(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
-    let dataset = file.dataset(dataset_path)?;
-    match dataset.read_1d::<FixedAscii<7>>() {
-        Ok(strings_array) => {
-            let strings: Vec<String> = strings_array
-                .iter()
-                .map(|s| s.as_str().trim_end_matches('\0').to_string())
-                .collect();
-            Ok(strings)
-        }
-        Err(_) => read_strings_as_bytes(file, dataset_path, 7, 541),
-    }
-}
-
-fn read_strings_23(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
-    let dataset = file.dataset(dataset_path)?;
-    match dataset.read_1d::<FixedAscii<23>>() {
-        Ok(strings_array) => {
-            let strings: Vec<String> = strings_array
-                .iter()
-                .map(|s| s.as_str().trim_end_matches('\0').to_string())
-                .collect();
-            Ok(strings)
-        }
-        Err(_) => read_strings_as_bytes(file, dataset_path, 23, 541),
-    }
-}
-
-fn read_strings_25(file: &Hdf5File, dataset_path: &str) -> anyhow::Result<Vec<String>> {
-    let dataset = file.dataset(dataset_path)?;
-    match dataset.read_1d::<FixedAscii<25>>() {
-        Ok(strings_array) => {
-            let strings: Vec<String> = strings_array
-                .iter()
-                .map(|s| s.as_str().trim_end_matches('\0').to_string())
-                .collect();
-            Ok(strings)
-        }
-        Err(_) => read_strings_as_bytes(file, dataset_path, 25, 541),
-    }
-}
-
-fn read_strings_as_bytes(
-    file: &Hdf5File,
-    dataset_path: &str,
-    string_length: usize,
-    num_strings: usize,
-) -> anyhow::Result<Vec<String>> {
-    let dataset = file.dataset(dataset_path)?;
-    let bytes = dataset.read_1d::<u8>()?;
-    let bytes_vec: Vec<u8> = bytes.to_vec();
+fn read_strings_dynamic(file: &Hdf5File, path: &str) -> anyhow::Result<Vec<String>> {
+    let dataset = file.dataset(path)?;
+    let dtype = dataset.dtype()?;
+    let dsize = dtype.size();
     
-    let mut strings = Vec::new();
-    for i in 0..num_strings {
-        let start = i * string_length;
-        let end = start + string_length;
-        if end <= bytes_vec.len() {
-            let string_bytes = &bytes_vec[start..end];
-            let string = String::from_utf8_lossy(string_bytes)
-                .trim_matches('\0')
-                .to_string();
-            strings.push(string);
-        }
+    // Try Variable Length Unicode
+    if let Ok(v) = dataset.read_1d::<hdf5::types::VarLenUnicode>() {
+        return Ok(v.iter().map(|s| s.to_string()).collect());
     }
+    
+    // Use the exact size match for FixedAscii to prevent truncation
+    match dsize {
+        6  => if let Ok(v) = dataset.read_1d::<FixedAscii<6>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        7  => if let Ok(v) = dataset.read_1d::<FixedAscii<7>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        11 => if let Ok(v) = dataset.read_1d::<FixedAscii<11>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        15 => if let Ok(v) = dataset.read_1d::<FixedAscii<15>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        16 => if let Ok(v) = dataset.read_1d::<FixedAscii<16>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        18 => if let Ok(v) = dataset.read_1d::<FixedAscii<18>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        21 => if let Ok(v) = dataset.read_1d::<FixedAscii<21>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        23 => if let Ok(v) = dataset.read_1d::<FixedAscii<23>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        25 => if let Ok(v) = dataset.read_1d::<FixedAscii<25>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        32 => if let Ok(v) = dataset.read_1d::<FixedAscii<32>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        64 => if let Ok(v) = dataset.read_1d::<FixedAscii<64>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        _ => {}
+    }
+    
+    // Fallback: Read as raw bytes and try to guess the length
+    let bytes = dataset.read_1d::<u8>()?.to_vec();
+    let shape = dataset.shape();
+    let num_strings = if shape.is_empty() { 0 } else { shape[0] };
+    if num_strings > 0 && bytes.len() % num_strings == 0 {
+        let len = bytes.len() / num_strings;
+        let mut strings = Vec::with_capacity(num_strings);
+        for i in 0..num_strings {
+            let start = i * len;
+            let end = start + len;
+            let s = String::from_utf8_lossy(&bytes[start..end]).trim_matches('\0').to_string();
+            strings.push(s);
+        }
+        return Ok(strings);
+    }
+    
+    anyhow::bail!("Unsupported string format for dataset: {}", path)
+}
 
-    Ok(strings)
+fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
+    let file = Hdf5File::open(h5_path.as_ref())?;
+    read_strings_dynamic(&file, "matrix/features/name")
 }
 
 fn tree_from_csv<T: AsRef<Path>>(
@@ -365,7 +277,7 @@ fn tree_from_10x<T: AsRef<Path>>(
     h5_path: T,
     pos_path: T,
     pos_type: InputPosType,
-    file_type: InputDataType,
+    _file_type: InputDataType,
     pos_x_col: usize,
     pos_y_col: usize,
     _method: ErrorMetric,
@@ -392,27 +304,22 @@ fn tree_from_10x<T: AsRef<Path>>(
         Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
     };
 
-    // Read gene names (23 chars each)
-    let gene_names = read_strings_23(&file, "matrix/features/name")?;
+    // Read gene names (dynamic)
+    let gene_names = read_strings_dynamic(&file, "matrix/features/name")?;
 
-    // Read gene IDs (23 chars each) 
-    let gene_ids = read_strings_23(&file, "matrix/features/id")?;
+    // Read gene IDs (dynamic) - tolerant of missing dataset
+    let gene_ids = read_strings_dynamic(&file, "matrix/features/id").unwrap_or_else(|_| vec!["".to_string(); gene_names.len()]);
 
-    // Read feature types (25 chars each)
-    let feature_types = read_strings_25(&file, "matrix/features/feature_type")?;
+    // Read feature types (dynamic) - tolerant of missing dataset
+    let feature_types = read_strings_dynamic(&file, "matrix/features/feature_type").unwrap_or_else(|_| vec!["".to_string(); gene_names.len()]);
 
-    // Read genome references (7 chars each)
-    let genomes = read_strings_7(&file, "matrix/features/genome")?;
+    // Read genome references (dynamic) - tolerant of missing dataset
+    let genomes = read_strings_dynamic(&file, "matrix/features/genome").unwrap_or_else(|_| vec!["".to_string(); gene_names.len()]);
 
     println!("Gene names: {:?}", &gene_names[..5]);
     println!("Gene IDs: {:?}", &gene_ids[..5]);
     println!("Feature types: {:?}", &feature_types[..5]);
     println!("Genomes: {:?}", &genomes[..5]);
-    // Check if matrix group exists
-    let matrix_group = match file.group("matrix") {
-        Ok(g) => g,
-        Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
-    };
 
     // Read the shape of the matrix
     let shape_dataset = matrix_group.dataset("shape")?;
@@ -431,7 +338,7 @@ fn tree_from_10x<T: AsRef<Path>>(
     let data_dataset = matrix_group.dataset("data")?;
     let indices_dataset = matrix_group.dataset("indices")?;
     let indptr_dataset = matrix_group.dataset("indptr")?;
-    let barcodes_dataset = matrix_group.dataset("barcodes")?;
+    let _barcodes_dataset = matrix_group.dataset("barcodes")?;
 
     let data_array = data_dataset.read_1d::<u16>()?;
     // Use array directly instead of converting to Vec to avoid ownership issues
@@ -459,12 +366,8 @@ fn tree_from_10x<T: AsRef<Path>>(
     xs.reserve(num_cells);
     ys.reserve(num_cells);
 
-    // Read all barcodes from HDF5 once
-    let barcodes_arr = barcodes_dataset.read_1d::<FixedAscii<23>>()?;
-    let barcodes: Vec<String> = barcodes_arr
-        .iter()
-        .map(|b| b.as_str().trim_end_matches('\0').to_string())
-        .collect();
+    // Read all barcodes from HDF5 (dynamic)
+    let barcodes = read_strings_dynamic(&file, "matrix/barcodes")?;
 
     // Build a map from barcode -> (x, y) from the positions file
     use std::collections::HashMap;
@@ -1023,7 +926,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(Platform::Xenium) => (1, 2),
                 None => (args.idx_x, args.idx_y),
             };
-            let (mut qtree, csr) = match args.format {
+            let (qtree, csr) = match args.format {
                 InputDataType::Csv => {
                     // let file_path_pos = args.input_pos.ok_or_else(|| {
                     //    anyhow::anyhow!("Position file required for CSV format")
@@ -1085,11 +988,43 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
             bit_field_tree.visit(&mut collect_data);
+
+            let mut total_p = 0;
+            let mut total_ri = 0;
+            let mut total_rv = 0;
+            let mut total_i = 0;
+            let mut total_dv = 0;
+            let mut total_ng = 0;
+
+            for ediff in &d.data {
+                let (p, ri, rv, i, dv, ng) = ediff.bytes_breakdown();
+                total_p += p;
+                total_ri += ri;
+                total_rv += rv;
+                total_i += i;
+                total_dv += dv;
+                total_ng += ng;
+            }
+
+            let total_mst_bytes = total_p + total_ri + total_rv + total_i + total_dv + total_ng;
+
             info!(
                 "QuadTree Blocks: (non-zero blocks: {})",
                 qtree.non_zero_blocks(&csr)
             );
             info!("Collected Encoded Diffs : {}", d.data.len());
+            
+            if total_mst_bytes > 0 {
+                info!("Final Size Breakdown for MST-encoded data:");
+                info!("  parent_offset: {:>10} bytes ({:>6.2}%)", total_p, (total_p as f64 / total_mst_bytes as f64) * 100.0);
+                info!("  root_indices:  {:>10} bytes ({:>6.2}%)", total_ri, (total_ri as f64 / total_mst_bytes as f64) * 100.0);
+                info!("  root_vals:     {:>10} bytes ({:>6.2}%)", total_rv, (total_rv as f64 / total_mst_bytes as f64) * 100.0);
+                info!("  indices:       {:>10} bytes ({:>6.2}%)", total_i, (total_i as f64 / total_mst_bytes as f64) * 100.0);
+                info!("  delta_vals:    {:>10} bytes ({:>6.2}%)", total_dv, (total_dv as f64 / total_mst_bytes as f64) * 100.0);
+                info!("  num_genes:     {:>10} bytes ({:>6.2}%)", total_ng, (total_ng as f64 / total_mst_bytes as f64) * 100.0);
+                info!("  Total:         {:>10} bytes (uncompressed)", total_mst_bytes);
+            }
+            
             //bincode::encode_into_std_write(&d.data, &mut writer, config).unwrap();
             //bincode::encode_into_std_write(&d.pos, &mut writer, config).unwrap();
             bincode::encode_into_std_write(&d.data, &mut encoder, config).unwrap();

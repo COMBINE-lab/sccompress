@@ -80,6 +80,28 @@ impl EncodedDiffsMST {
     pub(crate) fn ncells(&self) -> usize {
         self.parent_offset.len()
     }
+
+    pub(crate) fn bytes_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
+        let parent_offset_bytes = self.parent_offset.size_in_bytes();
+        let root_indices_bytes = self.root_indices.num_bytes();
+        let root_vals_bytes = self.root_vals.size_in_bytes();
+        let indices_bytes = self.indices.num_bytes();
+        let delta_vals_bytes = self.delta_vals.size_in_bytes();
+        let num_genes_bytes = 4;
+        (
+            parent_offset_bytes,
+            root_indices_bytes,
+            root_vals_bytes,
+            indices_bytes,
+            delta_vals_bytes,
+            num_genes_bytes,
+        )
+    }
+
+    pub(crate) fn total_bytes(&self) -> usize {
+        let (p, ri, rv, i, dv, ng) = self.bytes_breakdown();
+        p + ri + rv + i + dv + ng
+    }
 }
 
 // Manual implementation of de/serialization for `Rect`.
@@ -747,7 +769,7 @@ fn build_mst_prim<P: PointLike>(
     let mut graph = UnGraph::<usize, u32>::new_undirected();
     let nodes: Vec<_> = (0..n).map(|i| graph.add_node(i)).collect();
 
-    if n > 128 {
+    if false {
         // Use HNSW for large N
         let max_nb_connection = 16;
         let ef_construction = 100;
@@ -1926,7 +1948,7 @@ impl QuadTree {
         info!("divide_recursive");
         //let mut stack = vec![self];
         // let cost_log = CostLog::new();
-        let max_depth = 4;
+        let _max_depth = 4;
         // let max_pt: usize = 5;
         // nothing to do if this subtree is empty
         if self.points.is_empty() {
