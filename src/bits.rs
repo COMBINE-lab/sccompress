@@ -75,6 +75,12 @@ impl HybridSparseVec {
         }
     }
 
+    /// Returns the number of bytes used by this hybrid sparse vector
+    ///
+    /// For bitvectors, returns `b.len() * 8` where `b.len()` is the number of u64 words.
+    /// Since each u64 word is 8 bytes, this correctly computes total byte count.
+    ///
+    /// For Elias-Fano encoding, returns the exact bytes written by the underlying structure.
     pub fn num_bytes(&self) -> usize {
         match self {
             Self::Bit(b) => b.len() * 8,  // b.len() is number of u64 words, each is 8 bytes
@@ -89,7 +95,23 @@ impl HybridSparseVec {
         }
     }
 
-    /// Convert to a vector of indices
+    /// Convert to a sorted vector of set bit positions/indices
+    ///
+    /// Returns a vector containing the indices of all set bits in ascending order.
+    ///
+    /// # Performance
+    ///
+    /// - **Elias-Fano**: O(n) where n is the number of set bits
+    /// - **Bitvector**: O(w × 64) where w is the number of u64 words in the underlying storage,
+    ///   worst case when iterating through all bits
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let vec = HybridSparseVec::from_indices(&[0, 5, 100], 0.8, 128);
+    /// let indices = vec.indices_vec();
+    /// assert_eq!(indices, vec![0, 5, 100]);
+    /// ```
     pub fn indices_vec(&self) -> Vec<u64> {
         match self {
             Self::EF(e) => {
