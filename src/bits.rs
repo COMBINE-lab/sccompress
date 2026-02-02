@@ -77,7 +77,7 @@ impl HybridSparseVec {
 
     pub fn num_bytes(&self) -> usize {
         match self {
-            Self::Bit(b) => b.len() * 8,
+            Self::Bit(b) => b.len() * 8,  // b.len() is number of u64 words, each is 8 bytes
             Self::EF(b) => b.0.write_bytes(),
         }
     }
