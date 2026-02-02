@@ -1,3 +1,46 @@
+//! Spatial single-cell RNA-seq compression using Minimum Spanning Trees
+//!
+//! This module implements a lossless compression strategy for spatial single-cell
+//! RNA-sequencing count data that exploits spatial coherence in gene expression.
+//!
+//! # Overview
+//!
+//! The compression approach builds a Minimum Spanning Tree (MST) over cells based
+//! on their expression similarity, then encodes each cell as a delta from its parent
+//! in the tree. This is particularly effective for spatial transcriptomics data where
+//! nearby cells in tissue have similar expression patterns.
+//!
+//! # Key Components
+//!
+//! - [`EncodedDiffsMST`]: Main compressed representation
+//! - [`encode_subarray_mst`]: Compression function
+//! - [`decode_cell_at_dfs_pos`]: Decompression function
+//! - [`HybridSparseVec`]: Adaptive position encoding (Elias-Fano vs bitvector)
+//! - [`DacsOpt`]: Variable-length integer encoding
+//!
+//! # Compression Pipeline
+//!
+//! 1. **Sparse Representation**: Convert dense expression matrix to sparse (gene, value) pairs
+//! 2. **kNN Graph**: Build k-nearest neighbors graph using L0 distance (pattern differences)
+//! 3. **MST Extraction**: Use Prim's algorithm to find minimum spanning tree
+//! 4. **DFS Ordering**: Traverse tree to establish compression/decompression order
+//! 5. **Delta Encoding**: Encode each cell as difference from its parent
+//!
+//! # Adaptive Encoding
+//!
+//! - **Position Encoding**: Automatically selects Elias-Fano (>75% sparse) or bitvector (≤75% sparse)
+//! - **Value Encoding**: Uses DacsOpt for variable-length encoding of zigzag-encoded deltas
+//!
+//! # Example
+//!
+//! ```ignore
+//! // Compress a block of cells
+//! let (encoded, dfs_order, stats) = encode_subarray_mst(&points, &csr_matrix, 0)?;
+//!
+//! // Decompress a specific cell
+//! let cell_expression = encoded.decode_cell_at_dfs_pos(dfs_pos);
+//! ```
+
 use crate::bits::HybridSparseVec;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
@@ -41,18 +84,51 @@ pub(crate) struct EncodedDiffs {
     pub(crate) num_genes: u32,               // Total number of genes
 }
 
-/// MST-based delta encoding for a block of cells
-/// Simplified structure matching old encoding's index format
-/// Root is always cell 0, cells are stored in DFS order
+/// MST-based compression for spatial single-cell RNA-seq data
+///
+/// This structure implements a lossless compression strategy that exploits spatial coherence
+/// in gene expression between nearby cells in tissue. The approach builds a Minimum Spanning
+/// Tree (MST) over cells based on expression similarity, then encodes each cell as a delta
+/// from its parent in the tree.
+///
+/// ## Compression Strategy
+///
+/// 1. **MST Construction**: Build a kNN graph where edge weights represent the L0 distance
+///    (number of differing genes) between cells, then extract the MST using Prim's algorithm.
+///
+/// 2. **Tree Traversal**: Perform DFS traversal from the root to establish a deterministic
+///    ordering of cells for compression/decompression.
+///
+/// 3. **Root Encoding**: The root cell's expression is stored directly (uncompressed) using
+///    sparse representation (gene indices + values).
+///
+/// 4. **Delta Encoding**: Each non-root cell stores only differences from its parent:
+///    - **Position Encoding**: Adaptive selection between Elias-Fano (sparse) and bitvector (dense)
+///    - **Value Encoding**: Variable-length encoding (DacsOpt) with zigzag encoding for signed deltas
+///
+/// ## Decompression
+///
+/// Reconstruction follows the same DFS order:
+/// 1. Read root cell values directly
+/// 2. For each child, reconstruct by applying deltas to parent values
+/// 3. Parent values are always available before children (guaranteed by DFS ordering)
+///
+/// ## Memory Layout
+///
+/// - `parent_offset`: Compact representation of tree structure (parent position relative to child)
+/// - `root_indices`: Sparse indices of non-zero genes in root cell
+/// - `root_vals`: Expression values for root cell
+/// - `indices`: Combined (cell, gene) indices for all deltas (flattened)
+/// - `delta_vals`: Zigzag-encoded delta values, parallel to `indices`
+///
 #[derive(Clone)]
 pub(crate) struct EncodedDiffsMST {
-    pub(crate) num_genes: u32,                  // needed for output vector size
-    // ncells derivable from parent_offset.len()
+    pub(crate) num_genes: u32,                  // Total number of genes (needed for output vector size)
     pub(crate) parent_offset: DacsOpt,          // parent_offset[i] = i - parent_position (one per cell)
-    pub(crate) root_indices: HybridSparseVec,   // root's non-zero gene indices
-    pub(crate) root_vals: DacsOpt,              // root's expression values
+    pub(crate) root_indices: HybridSparseVec,   // Root's non-zero gene indices
+    pub(crate) root_vals: DacsOpt,              // Root's expression values
     pub(crate) indices: HybridSparseVec,        // (dfs_pos-1)*num_genes + gene for non-root cells
-    pub(crate) delta_vals: DacsOpt,             // delta values (zigzag encoded), parallel to indices
+    pub(crate) delta_vals: DacsOpt,             // Delta values (zigzag encoded), parallel to indices
 }
 
 impl EncodedDiffsMST {
@@ -662,9 +738,25 @@ impl Distance<(u32, u16)> for L0Distance {
     }
 }
 
-/// Sparse subtract: compute delta = child_expr - parent_expr
-/// Returns list of (gene, zigzag_encoded_delta) where delta != 0
-/// LOSSLESS: stores all deltas for genes that differ between child and parent
+/// Compute sparse delta between child and parent expression vectors
+///
+/// This function performs a lossless merge-join to identify differences between
+/// two sparse expression vectors. The result is a list of (gene_id, zigzag_delta)
+/// pairs that can be used to reconstruct the child from the parent.
+///
+/// # Algorithm
+///
+/// Uses a two-pointer merge to identify:
+/// - Genes only in child: delta = child_value - 0
+/// - Genes only in parent: delta = 0 - parent_value (must zero out)
+/// - Genes in both: delta = child_value - parent_value (if non-zero)
+///
+/// All deltas are zigzag-encoded for efficient variable-length storage.
+///
+/// # Returns
+///
+/// Vector of (gene_id, zigzag_encoded_delta) sorted by gene_id.
+/// Genes with delta=0 are omitted.
 fn sparse_subtract(child: &SparseExpression, parent: &SparseExpression) -> Vec<(u32, i32)> {
     let mut result = Vec::new();
     let mut i = 0;
@@ -703,8 +795,31 @@ fn sparse_subtract(child: &SparseExpression, parent: &SparseExpression) -> Vec<(
     result
 }
 
-/// Zigzag encode: maps signed to unsigned for efficient storage
-/// 0 -> 0, -1 -> 1, 1 -> 2, -2 -> 3, 2 -> 4, ...
+/// Zigzag encoding for signed integers
+///
+/// Maps signed integers to unsigned for efficient variable-length encoding.
+/// Small absolute values (common case) map to small unsigned values.
+///
+/// # Mapping
+///
+/// ```text
+///  0 -> 0
+/// -1 -> 1
+///  1 -> 2
+/// -2 -> 3
+///  2 -> 4
+/// -3 -> 5
+///  3 -> 6
+/// ...
+/// ```
+///
+/// # Formula
+///
+/// - Positive: `2 * v`
+/// - Negative: `2 * |v| - 1`
+///
+/// This ensures small deltas (which are common in nearby cells) use fewer bits
+/// in variable-length encoding schemes like DacsOpt.
 fn zigzag_encode(v: i32) -> i32 {
     if v < 0 {
         (-2 * v) - 1
@@ -963,9 +1078,41 @@ impl MSTStats {
     }
 }
 
-/// MST-based encoding of a subarray (block of cells)
-/// Uses raw expression values with deltas along MST edges (no median)
-/// Cells are stored in DFS order with parent offsets for efficient compression
+/// Compress spatial single-cell RNA-seq data using MST-based delta encoding
+///
+/// This function implements the complete MST-based compression pipeline:
+///
+/// # Algorithm
+///
+/// 1. **Convert to Sparse Representation**: Extract non-zero expression values for each cell
+/// 2. **Build kNN Graph**: Compute k-nearest neighbors based on L0 distance (number of differing genes)
+/// 3. **Extract MST**: Use Prim's algorithm to find minimum spanning tree
+/// 4. **DFS Traversal**: Compute deterministic ordering and parent relationships
+/// 5. **Encode Root**: Store root cell's expression directly (sparse format)
+/// 6. **Encode Deltas**: For each non-root cell, compute and encode differences from parent
+///
+/// # Arguments
+///
+/// * `points` - Array of cell positions/metadata (used for spatial context)
+/// * `data` - Sparse CSR matrix of gene expression values (cells × genes)
+/// * `depth` - Tree depth level (for logging/statistics)
+///
+/// # Returns
+///
+/// Returns `Some((encoded, dfs_order, stats))` where:
+/// - `encoded`: Compressed representation as `EncodedDiffsMST`
+/// - `dfs_order`: Mapping from DFS position to original cell index
+/// - `stats`: Compression statistics (sparsity, pattern changes, etc.)
+///
+/// Returns `None` if input is empty.
+///
+/// # Example
+///
+/// ```ignore
+/// let (encoded, dfs_order, stats) = encode_subarray_mst(&points, &csr, 0)?;
+/// // Reconstruct any cell by DFS position
+/// let cell_expr = encoded.decode_cell_at_dfs_pos(dfs_pos);
+/// ```
 pub(crate) fn encode_subarray_mst(
     points: &[Point], 
     data: &CsMat<u16>, 
@@ -1129,8 +1276,34 @@ impl EncodedDiffsMST {
         dfs_pos.saturating_sub(offset)
     }
     
-    /// Decode the expression vector for a cell at given DFS position
-    /// Uses new simplified format: indices = (dfs_pos-1)*num_genes + gene
+    /// Reconstruct a cell's full expression vector from compressed MST representation
+    ///
+    /// This function performs lossless decompression by:
+    /// 1. Starting from the root cell's expression values
+    /// 2. Walking the path from root to the target cell in the MST
+    /// 3. Incrementally applying deltas at each step
+    ///
+    /// # Arguments
+    ///
+    /// * `dfs_pos` - Position of the cell in DFS traversal order (0 = root)
+    ///
+    /// # Returns
+    ///
+    /// Dense expression vector of length `num_genes` with u16 values.
+    /// Genes not expressed (value = 0) are represented explicitly.
+    ///
+    /// # Complexity
+    ///
+    /// Time complexity is O(tree_depth × avg_nonzero_genes), where tree_depth
+    /// is the distance from root to target cell in the MST (typically log(n) to sqrt(n)).
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let encoded: EncodedDiffsMST = /* ... */;
+    /// let cell_expr = encoded.decode_cell_at_dfs_pos(5);
+    /// assert_eq!(cell_expr.len(), num_genes);
+    /// ```
     pub(crate) fn decode_cell_at_dfs_pos(&self, dfs_pos: usize) -> Vec<u16> {
         let mut expression = vec![0u16; self.num_genes as usize];
         
