@@ -75,10 +75,39 @@ impl HybridSparseVec {
         }
     }
 
+    pub fn num_bytes(&self) -> usize {
+        match self {
+            Self::Bit(b) => b.len() * 8,
+            Self::EF(b) => b.0.write_bytes(),
+        }
+    }
+
     pub fn len(&self) -> usize {
         match self {
             Self::EF(e) => e.0.len(),
             Self::Bit(e) => e.count_bit_ones(),
+        }
+    }
+
+    /// Convert to a vector of indices
+    pub fn indices_vec(&self) -> Vec<u64> {
+        match self {
+            Self::EF(e) => {
+                e.0.iter().collect()
+            }
+            Self::Bit(b) => {
+                let mut result = Vec::new();
+                for (i, &word) in b.iter().enumerate() {
+                    if word != 0 {
+                        for bit in 0..64 {
+                            if (word & (1u64 << bit)) != 0 {
+                                result.push((i * 64 + bit) as u64);
+                            }
+                        }
+                    }
+                }
+                result
+            }
         }
     }
 
