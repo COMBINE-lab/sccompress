@@ -127,13 +127,8 @@ pub(crate) struct EncodedDiffsMST {
     pub(crate) parent_offset: DacsOpt,          // parent_offset[i] = i - parent_position (one per cell)
     pub(crate) root_indices: HybridSparseVec,   // Root's non-zero gene indices
     pub(crate) root_vals: DacsOpt,              // Root's expression values
-    // V2 FORMAT: Separate cell boundaries from gene indices
-    pub(crate) cell_boundaries: DacsOpt,        // Cumulative count of deltas for each non-root cell (V2)
-    pub(crate) gene_indices: DacsOpt,           // Just gene indices 0-num_genes (V2) - can have duplicates
-    pub(crate) delta_vals: DacsOpt,             // Delta values (zigzag encoded), parallel to gene_indices
-    // V1 FORMAT: Combined indices (deprecated but kept for compatibility)
-    pub(crate) indices: HybridSparseVec,        // (dfs_pos-1)*num_genes + gene for non-root cells (V1)
-    pub(crate) use_v2_format: bool,             // true = use cell_boundaries+gene_indices, false = use indices
+    pub(crate) indices: HybridSparseVec,        // (dfs_pos-1)*num_genes + gene for non-root cells
+    pub(crate) delta_vals: DacsOpt,             // Delta values (zigzag encoded), parallel to indices
 }
 
 impl EncodedDiffsMST {
@@ -143,11 +138,8 @@ impl EncodedDiffsMST {
             parent_offset: DacsOpt::default(),
             root_indices: HybridSparseVec::empty(),
             root_vals: DacsOpt::default(),
-            cell_boundaries: DacsOpt::default(),
-            gene_indices: DacsOpt::default(),
-            delta_vals: DacsOpt::default(),
             indices: HybridSparseVec::empty(),
-            use_v2_format: true,  // Default to V2 format for new instances
+            delta_vals: DacsOpt::default(),
         }
     }
     
@@ -165,44 +157,26 @@ impl EncodedDiffsMST {
         self.parent_offset.len()
     }
 
-    pub(crate) fn bytes_breakdown(&self) -> (usize, usize, usize, usize, usize, usize, usize, usize) {
+    pub(crate) fn bytes_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
         let parent_offset_bytes = self.parent_offset.size_in_bytes();
         let root_indices_bytes = self.root_indices.num_bytes();
         let root_vals_bytes = self.root_vals.size_in_bytes();
+        let indices_bytes = self.indices.num_bytes();
         let delta_vals_bytes = self.delta_vals.size_in_bytes();
         let num_genes_bytes = 4;
-        
-        if self.use_v2_format {
-            let cell_boundaries_bytes = self.cell_boundaries.size_in_bytes();
-            let gene_indices_bytes = self.gene_indices.size_in_bytes();  // Now DacsOpt
-            (
-                parent_offset_bytes,
-                root_indices_bytes,
-                root_vals_bytes,
-                cell_boundaries_bytes,
-                gene_indices_bytes,
-                delta_vals_bytes,
-                num_genes_bytes,
-                1, // format flag byte
-            )
-        } else {
-            let indices_bytes = self.indices.num_bytes();
-            (
-                parent_offset_bytes,
-                root_indices_bytes,
-                root_vals_bytes,
-                0, // no cell_boundaries in V1
-                indices_bytes,
-                delta_vals_bytes,
-                num_genes_bytes,
-                1, // format flag byte
-            )
-        }
+        (
+            parent_offset_bytes,
+            root_indices_bytes,
+            root_vals_bytes,
+            indices_bytes,
+            delta_vals_bytes,
+            num_genes_bytes,
+        )
     }
 
     pub(crate) fn total_bytes(&self) -> usize {
-        let (p, ri, rv, cb, gi_or_i, dv, ng, flag) = self.bytes_breakdown();
-        p + ri + rv + cb + gi_or_i + dv + ng + flag
+        let (p, ri, rv, i, dv, ng) = self.bytes_breakdown();
+        p + ri + rv + i + dv + ng
     }
 }
 
@@ -213,8 +187,6 @@ impl Encode for EncodedDiffsMST {
         &self,
         encoder: &mut E,
     ) -> core::result::Result<(), bincode::error::EncodeError> {
-        // Encode format version first
-        Encode::encode(&self.use_v2_format, encoder)?;
         Encode::encode(&self.num_genes, encoder)?;
         
         // Serialize parent_offset
@@ -231,21 +203,8 @@ impl Encode for EncodedDiffsMST {
             .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
         Encode::encode(&root_vals_bytes, encoder)?;
         
-        if self.use_v2_format {
-            // V2 format: cell_boundaries + gene_indices (both DacsOpt)
-            let mut cell_boundaries_bytes = Vec::new();
-            self.cell_boundaries.serialize_into(&mut cell_boundaries_bytes)
-                .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-            Encode::encode(&cell_boundaries_bytes, encoder)?;
-            
-            let mut gene_indices_bytes = Vec::new();
-            self.gene_indices.serialize_into(&mut gene_indices_bytes)
-                .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-            Encode::encode(&gene_indices_bytes, encoder)?;
-        } else {
-            // V1 format: combined indices
-            Encode::encode(&self.indices, encoder)?;
-        }
+        // indices as HybridSparseVec
+        Encode::encode(&self.indices, encoder)?;
         
         let mut delta_vals_bytes = Vec::new();
         self.delta_vals.serialize_into(&mut delta_vals_bytes)
@@ -260,7 +219,6 @@ impl<Context> Decode<Context> for EncodedDiffsMST {
     fn decode<D: bincode::de::Decoder<Context = Context>>(
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
-        let use_v2_format: bool = Decode::decode(decoder)?;
         let num_genes: u32 = Decode::decode(decoder)?;
         
         let parent_offset_bytes: Vec<u8> = Decode::decode(decoder)?;
@@ -273,22 +231,7 @@ impl<Context> Decode<Context> for EncodedDiffsMST {
         let root_vals = DacsOpt::deserialize_from(&root_vals_bytes[..])
             .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
         
-        let (cell_boundaries, gene_indices, indices) = if use_v2_format {
-            // V2 format (both DacsOpt)
-            let cell_boundaries_bytes: Vec<u8> = Decode::decode(decoder)?;
-            let cell_boundaries = DacsOpt::deserialize_from(&cell_boundaries_bytes[..])
-                .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
-            
-            let gene_indices_bytes: Vec<u8> = Decode::decode(decoder)?;
-            let gene_indices = DacsOpt::deserialize_from(&gene_indices_bytes[..])
-                .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
-            
-            (cell_boundaries, gene_indices, HybridSparseVec::empty())
-        } else {
-            // V1 format
-            let indices: HybridSparseVec = Decode::decode(decoder)?;
-            (DacsOpt::default(), DacsOpt::default(), indices)
-        };
+        let indices: HybridSparseVec = Decode::decode(decoder)?;
         
         let delta_vals_bytes: Vec<u8> = Decode::decode(decoder)?;
         let delta_vals = DacsOpt::deserialize_from(&delta_vals_bytes[..])
@@ -299,11 +242,8 @@ impl<Context> Decode<Context> for EncodedDiffsMST {
             parent_offset,
             root_indices,
             root_vals,
-            cell_boundaries,
-            gene_indices,
-            delta_vals,
             indices,
-            use_v2_format,
+            delta_vals,
         })
     }
 }
@@ -1237,9 +1177,10 @@ pub(crate) fn encode_subarray_mst(
     let root_genes_vec: Vec<u32> = root_expr.iter().map(|(g, _)| *g).collect();
     let root_vals_vec: Vec<u32> = root_expr.iter().map(|(_, v)| *v as u32).collect();
     
-    // Step 5: Encode deltas using V2 FORMAT (separate cell boundaries and gene indices)
-    let mut gene_indices_per_cell: Vec<Vec<u32>> = Vec::new();
-    let mut delta_vals_per_cell: Vec<Vec<u32>> = Vec::new();
+    // Step 5: Encode deltas using SAME FORMAT as old encoding
+    // Index = (dfs_pos - 1) * num_genes + gene (combined cell+gene in one index)
+    let mut combined_indices = Vec::new();
+    let mut delta_vals_raw = Vec::new();
     let mut total_pattern_changes = 0usize;
     let mut total_non_zeros = root_expr.len();
     
@@ -1254,15 +1195,13 @@ pub(crate) fn encode_subarray_mst(
         
         let diff_list = sparse_subtract(child_expr, parent_expr);
         
-        // V2: Store just gene indices (not combined with cell offset)
-        let mut genes = Vec::new();
-        let mut deltas = Vec::new();
+        // Use (dfs_pos - 1) since root is stored separately
+        let cell_offset = ((dfs_pos - 1) as u64) * (num_genes as u64);
+        
         for (g, d) in &diff_list {
-            genes.push(*g);
-            deltas.push(*d as u32);
+            combined_indices.push(cell_offset + (*g as u64));
+            delta_vals_raw.push(*d as u32);
         }
-        gene_indices_per_cell.push(genes);
-        delta_vals_per_cell.push(deltas);
     }
     
     // Parent offsets: small positive numbers (usually 1-10), compress very well!
@@ -1284,52 +1223,37 @@ pub(crate) fn encode_subarray_mst(
         DacsOpt::from_slice(&root_vals_vec, Some(root_k)).expect("should fit")
     };
     
-    // V2: Build cumulative cell boundaries
-    let mut boundaries = Vec::new();
-    let mut cumsum = 0u32;
-    for genes in &gene_indices_per_cell {
-        cumsum += genes.len() as u32;
-        boundaries.push(cumsum);
-    }
+    // Use HybridSparseVec for combined indices (same as old encoding!)
+    // CRITICAL: Sort indices and delta_vals together to maintain parallel relationship
+    // HybridSparseVec may sort indices internally, so we need to sort them together first
+    let mut indexed_deltas: Vec<(u64, u32)> = combined_indices.iter().zip(delta_vals_raw.iter())
+        .map(|(&idx, &val)| (idx, val))
+        .collect();
+    indexed_deltas.sort_by_key(|&(idx, _)| idx);
     
-    // Flatten gene indices and delta values
-    let mut flat_genes: Vec<u32> = gene_indices_per_cell.into_iter().flatten().collect();
-    let mut flat_deltas: Vec<u32> = delta_vals_per_cell.into_iter().flatten().collect();
-    
-    // Note: No need to sort - we keep them in cell order for parallel access with delta_vals
-    
-    // V2: Encode cell boundaries
-    let boundaries_k = find_optimal_dacs_k(&boundaries).unwrap_or(3);
-    let cell_boundaries = if boundaries.is_empty() {
-        DacsOpt::default()
-    } else {
-        DacsOpt::from_slice(&boundaries, Some(boundaries_k)).expect("should fit")
-    };
-    
-    // V2: Encode gene indices as DacsOpt (can have duplicates, values 0-num_genes-1)
-    let gene_k = find_optimal_dacs_k(&flat_genes).unwrap_or(3);
-    let gene_indices = if flat_genes.is_empty() {
-        DacsOpt::default()
-    } else {
-        DacsOpt::from_slice(&flat_genes, Some(gene_k)).expect("should fit")
-    };
-    
-    debug!("Gene encoding: gene_k={}, gene_indices count={}, boundaries count={}", 
-           gene_k, flat_genes.len(), boundaries.len());
-    
-    // OPTIMIZATION: Find optimal k for delta values based on their distribution
-    let delta_k = find_optimal_dacs_k(&flat_deltas).unwrap_or(3);
-    let delta_vals = if flat_deltas.is_empty() {
-        DacsOpt::default()
-    } else {
-        DacsOpt::from_slice(&flat_deltas, Some(delta_k)).expect("should fit")
-    };
+    let (sorted_indices, sorted_delta_vals): (Vec<u64>, Vec<u32>) = indexed_deltas.into_iter().unzip();
     
     let edges_possible = (points.len() - 1) * (num_genes as usize);
     let change_pct = if edges_possible > 0 {
         total_pattern_changes as f64 / edges_possible as f64 * 100.0
     } else {
         0.0
+    };
+    
+    let sparsity = if edges_possible > 0 {
+        sorted_indices.len() as f64 / edges_possible as f64
+    } else {
+        0.0
+    };
+    
+    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
+    
+    // OPTIMIZATION: Find optimal k for delta values based on their distribution
+    let delta_k = find_optimal_dacs_k(&sorted_delta_vals).unwrap_or(3);
+    let delta_vals = if sorted_delta_vals.is_empty() {
+        DacsOpt::default()
+    } else {
+        DacsOpt::from_slice(&sorted_delta_vals, Some(delta_k)).expect("should fit")
     };
     
     let stats = MSTStats {
@@ -1353,17 +1277,14 @@ pub(crate) fn encode_subarray_mst(
         } else { 0.0 }
     );
     
-    // Size breakdown for V2 format
+    // Size breakdown
     info!(
-        "  V2 Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes (k={}), cell_boundaries={} bytes (k={}), gene_indices={} bytes (k={}), delta_vals={} bytes (k={})",
+        "  Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes (k={}), indices={} bytes, delta_vals={} bytes (k={})",
         parent_offset.size_in_bytes(),
         root_indices.num_bytes(),
         root_vals.size_in_bytes(),
         root_k,
-        cell_boundaries.size_in_bytes(),
-        boundaries_k,
-        gene_indices.size_in_bytes(),
-        gene_k,
+        indices.num_bytes(),
         delta_vals.size_in_bytes(),
         delta_k
     );
@@ -1373,11 +1294,8 @@ pub(crate) fn encode_subarray_mst(
         parent_offset,
         root_indices,
         root_vals,
-        cell_boundaries,
-        gene_indices,
+        indices,
         delta_vals,
-        indices: HybridSparseVec::empty(),  // V1 format not used
-        use_v2_format: true,
     };
 
     /* 
@@ -1459,11 +1377,7 @@ impl EncodedDiffsMST {
         // path_dfs[0] is root (no delta needed), path_dfs[1..] need deltas
         for i in 1..path_dfs.len() {
             let cell_dfs = path_dfs[i];
-            let deltas = if self.use_v2_format {
-                self.get_cell_deltas_v2(cell_dfs)
-            } else {
-                self.get_cell_deltas_new(cell_dfs)
-            };
+            let deltas = self.get_cell_deltas_new(cell_dfs);
             acc = self.apply_deltas(&acc, &deltas);
         }
         
@@ -1473,30 +1387,6 @@ impl EncodedDiffsMST {
         }
         
         expression
-    }
-    
-    /// Get deltas for cell at dfs_pos using V2 format (cell_boundaries + gene_indices)
-    fn get_cell_deltas_v2(&self, dfs_pos: usize) -> Vec<(u32, i32)> {
-        if dfs_pos == 0 {
-            return Vec::new(); // Root has no deltas
-        }
-        
-        // Get boundaries for this cell (dfs_pos - 1 because root has no entry in boundaries)
-        let start_idx = if dfs_pos == 1 {
-            0
-        } else {
-            self.cell_boundaries.access(dfs_pos - 2).unwrap_or(0) as usize
-        };
-        let end_idx = self.cell_boundaries.access(dfs_pos - 1).unwrap_or(0) as usize;
-        
-        // Extract genes and deltas for this cell from DacsOpt
-        let mut deltas = Vec::new();
-        for i in start_idx..end_idx {
-            let gene = self.gene_indices.access(i).unwrap_or(0) as u32;
-            let delta = self.delta_vals.access(i).unwrap_or(0) as i32;
-            deltas.push((gene, delta));
-        }
-        deltas
     }
     
     /// Get deltas for cell at dfs_pos using new index format and provided cached indices
