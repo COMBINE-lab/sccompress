@@ -997,11 +997,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut total_ng = 0;
 
             for ediff in &d.data {
-                let (p, ri, rv, i, dv, ng) = ediff.bytes_breakdown();
+                let (p, ri, rv, cb, gi_or_i, dv, ng, _flag) = ediff.bytes_breakdown();
                 total_p += p;
                 total_ri += ri;
                 total_rv += rv;
-                total_i += i;
+                total_i += cb + gi_or_i;  // Combine cell_boundaries + gene_indices (or just indices for V1)
                 total_dv += dv;
                 total_ng += ng;
             }
