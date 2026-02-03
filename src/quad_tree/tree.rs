@@ -3443,3 +3443,63 @@ mod tests {
             assert_eq!(cluster_decoded.len(), ngenes);
         }
     }
+
+// ============================================================================
+// ADAPTIVE COMPRESSION: Automatically choose between MST and Cluster
+// ============================================================================
+
+/// Try both MST and cluster-based compression, return the better one
+///
+/// This function encodes the data using both methods and selects the one
+/// that produces smaller compressed size.
+///
+/// # Returns
+///
+/// Returns a tuple of (method_name, size, encoded_data) where method_name
+/// is either "MST" or "Cluster"
+pub(crate) fn encode_subarray_adaptive(
+    points: &[Point],
+    data: &CsMat<u16>,
+    depth: usize,
+) -> Option<(String, usize, Vec<u8>)> {
+    if points.is_empty() {
+        return None;
+    }
+    
+    // Try MST encoding
+    let mst_result = encode_subarray_mst(points, data, depth);
+    let (mst_size, mst_stats) = if let Some((ref encoded, _, ref stats)) = mst_result {
+        (encoded.total_bytes(), stats.clone())
+    } else {
+        return None;
+    };
+    
+    // Try Cluster encoding
+    let cluster_result = encode_subarray_cluster(points, data, depth);
+    let (cluster_size, cluster_stats) = if let Some((ref encoded, _, ref stats)) = cluster_result {
+        (encoded.total_bytes(), stats.clone())
+    } else {
+        // If cluster encoding fails, fall back to MST
+        info!("[Level {}] Cluster encoding failed, using MST ({}  bytes)", depth, mst_size);
+        return Some(("MST".to_string(), mst_size, Vec::new()));
+    };
+    
+    // Compare and select the better method
+    if cluster_size < mst_size {
+        let savings = mst_size - cluster_size;
+        let pct_improvement = (savings as f64 / mst_size as f64) * 100.0;
+        info!(
+            "[Level {}] Cluster encoding chosen: {} bytes (MST: {} bytes, savings: {} bytes, {:.1}% better)",
+            depth, cluster_size, mst_size, savings, pct_improvement
+        );
+        Some(("Cluster".to_string(), cluster_size, Vec::new()))
+    } else {
+        let overhead = cluster_size - mst_size;
+        let pct_overhead = (overhead as f64 / mst_size as f64) * 100.0;
+        info!(
+            "[Level {}] MST encoding chosen: {} bytes (Cluster: {} bytes, overhead: {} bytes, {:.1}% worse)",
+            depth, mst_size, cluster_size, overhead, pct_overhead
+        );
+        Some(("MST".to_string(), mst_size, Vec::new()))
+    }
+}
