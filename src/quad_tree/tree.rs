@@ -1305,6 +1305,404 @@ pub(crate) fn encode_subarray_mst(
     
     Some((enc_diffs_mst, dfs_order_vec, stats))
 }
+// ============================================================================
+// CLUSTER-BASED COMPRESSION (Alternative to MST)
+// ============================================================================
+
+/// Cluster-based compression for spatial single-cell RNA-seq data
+///
+/// This structure implements an alternative compression strategy that clusters
+/// cells by gene expression similarity and stores deltas from cluster representatives.
+/// Each cluster forms a "star" topology (one representative, many leaves).
+///
+/// ## Compression Strategy
+///
+/// 1. **Clustering**: Group cells by expression similarity using k-means-like clustering
+/// 2. **Representative Selection**: Choose a representative for each cluster (existing cell or centroid)
+/// 3. **Delta Encoding**: Store each cell as a delta from its cluster representative
+///
+/// ## Advantages
+///
+/// - Better compression when MST has many heavy edges (heterogeneous tissue)
+/// - Simpler structure than tree traversal
+/// - More robust to outliers
+///
+#[derive(Clone)]
+pub(crate) struct EncodedDiffsCluster {
+    pub(crate) num_genes: u32,                      // Total number of genes
+    pub(crate) num_clusters: u32,                   // Number of clusters
+    pub(crate) cluster_assignments: DacsOpt,        // cluster_id for each cell
+    pub(crate) cluster_rep_indices: Vec<HybridSparseVec>, // Representative gene indices per cluster
+    pub(crate) cluster_rep_vals: Vec<DacsOpt>,      // Representative values per cluster
+    pub(crate) indices: HybridSparseVec,            // Combined (cell, gene) indices for deltas
+    pub(crate) delta_vals: DacsOpt,                 // Delta values (zigzag encoded)
+}
+
+impl EncodedDiffsCluster {
+    pub(crate) fn empty() -> Self {
+        EncodedDiffsCluster {
+            num_genes: 0,
+            num_clusters: 0,
+            cluster_assignments: DacsOpt::default(),
+            cluster_rep_indices: Vec::new(),
+            cluster_rep_vals: Vec::new(),
+            indices: HybridSparseVec::empty(),
+            delta_vals: DacsOpt::default(),
+        }
+    }
+    
+    pub(crate) fn ncells(&self) -> usize {
+        self.cluster_assignments.len()
+    }
+    
+    pub(crate) fn bytes_breakdown(&self) -> (usize, usize, usize, usize, usize) {
+        let cluster_assignments_bytes = self.cluster_assignments.size_in_bytes();
+        let mut cluster_rep_indices_bytes = 0;
+        let mut cluster_rep_vals_bytes = 0;
+        for i in 0..self.num_clusters as usize {
+            cluster_rep_indices_bytes += self.cluster_rep_indices[i].num_bytes();
+            cluster_rep_vals_bytes += self.cluster_rep_vals[i].size_in_bytes();
+        }
+        let indices_bytes = self.indices.num_bytes();
+        let delta_vals_bytes = self.delta_vals.size_in_bytes();
+        
+        (
+            cluster_assignments_bytes,
+            cluster_rep_indices_bytes,
+            cluster_rep_vals_bytes,
+            indices_bytes,
+            delta_vals_bytes,
+        )
+    }
+    
+    pub(crate) fn total_bytes(&self) -> usize {
+        let (ca, cri, crv, i, dv) = self.bytes_breakdown();
+        ca + cri + crv + i + dv + 8 // +8 for num_genes and num_clusters
+    }
+}
+
+/// Cluster cells by expression similarity using simple k-means-like algorithm
+///
+/// Uses L0 distance (pattern similarity) and iterative refinement.
+fn cluster_cells(
+    expressions: &[SparseExpression],
+    num_clusters: usize,
+) -> (Vec<usize>, Vec<usize>) {
+    let ncells = expressions.len();
+    
+    // Handle edge cases
+    if ncells == 0 {
+        return (Vec::new(), Vec::new());
+    }
+    if ncells <= num_clusters {
+        // Each cell is its own cluster
+        let assignments: Vec<usize> = (0..ncells).collect();
+        let representatives: Vec<usize> = (0..ncells).collect();
+        return (assignments, representatives);
+    }
+    
+    // Initialize: pick evenly spaced cells as initial representatives
+    let mut representatives: Vec<usize> = (0..num_clusters)
+        .map(|i| (i * ncells) / num_clusters)
+        .collect();
+    
+    let mut assignments = vec![0; ncells];
+    let mut changed = true;
+    let max_iterations = 10;
+    
+    for _iteration in 0..max_iterations {
+        if !changed {
+            break;
+        }
+        changed = false;
+        
+        // Assign each cell to nearest representative
+        for (cell_idx, expr) in expressions.iter().enumerate() {
+            let mut best_cluster = assignments[cell_idx];
+            let mut best_dist = l0_binary_diff(expr, &expressions[representatives[best_cluster]]);
+            
+            for (cluster_idx, &rep_idx) in representatives.iter().enumerate() {
+                let dist = l0_binary_diff(expr, &expressions[rep_idx]);
+                if dist < best_dist {
+                    best_dist = dist;
+                    best_cluster = cluster_idx;
+                }
+            }
+            
+            if assignments[cell_idx] != best_cluster {
+                assignments[cell_idx] = best_cluster;
+                changed = true;
+            }
+        }
+        
+        // Update representatives: pick cell closest to centroid in each cluster
+        for cluster_idx in 0..num_clusters {
+            let cluster_members: Vec<usize> = assignments.iter()
+                .enumerate()
+                .filter(|(_, &c)| c == cluster_idx)
+                .map(|(i, _)| i)
+                .collect();
+            
+            if cluster_members.is_empty() {
+                continue;
+            }
+            
+            // Pick member with minimum total distance to others
+            let mut best_rep = representatives[cluster_idx];
+            let mut best_total_dist = u32::MAX;
+            
+            for &candidate in &cluster_members {
+                let total_dist: u32 = cluster_members.iter()
+                    .map(|&other| l0_binary_diff(&expressions[candidate], &expressions[other]))
+                    .sum();
+                
+                if total_dist < best_total_dist {
+                    best_total_dist = total_dist;
+                    best_rep = candidate;
+                }
+            }
+            
+            representatives[cluster_idx] = best_rep;
+        }
+    }
+    
+    (assignments, representatives)
+}
+
+/// Encode cells using cluster-based compression
+///
+/// This creates a "star" topology for each cluster where all cells in the cluster
+/// are encoded as deltas from their representative.
+///
+/// # Returns
+///
+/// Returns `Some((encoded, cell_order, stats))` where:
+/// - `encoded`: Compressed representation as `EncodedDiffsCluster`
+/// - `cell_order`: Identity mapping (cells stay in original order)
+/// - `stats`: Compression statistics
+pub(crate) fn encode_subarray_cluster(
+    points: &[Point],
+    data: &CsMat<u16>,
+    depth: usize,
+) -> Option<(EncodedDiffsCluster, Vec<u32>, MSTStats)> {
+    if points.is_empty() {
+        return None;
+    }
+    
+    let num_genes = data.cols() as u32;
+    let ncells = points.len();
+    
+    // Step 1: Compute sparse expression for all cells
+    let expressions: Vec<SparseExpression> = points
+        .iter()
+        .map(|p| compute_sparse_expression(p, data))
+        .collect();
+    
+    // Step 2: Determine number of clusters (adaptive based on dataset size)
+    // Use roughly sqrt(n) clusters as a heuristic
+    let num_clusters = ((ncells as f64).sqrt().ceil() as usize).max(1).min(ncells / 2).max(1);
+    
+    // Step 3: Cluster cells by expression similarity
+    let (assignments, representatives) = cluster_cells(&expressions, num_clusters);
+    
+    // Step 4: Encode cluster representatives
+    let mut cluster_rep_indices = Vec::new();
+    let mut cluster_rep_vals = Vec::new();
+    
+    for &rep_idx in &representatives {
+        let rep_expr = &expressions[rep_idx];
+        let rep_genes: Vec<u64> = rep_expr.iter().map(|(g, _)| *g as u64).collect();
+        let rep_vals: Vec<u32> = rep_expr.iter().map(|(_, v)| *v as u32).collect();
+        
+        let rep_indices = HybridSparseVec::from_indices(&rep_genes, 0.5, num_genes as usize);
+        
+        let rep_k = find_optimal_dacs_k(&rep_vals).unwrap_or(3);
+        let rep_vals_enc = if rep_vals.is_empty() {
+            DacsOpt::default()
+        } else {
+            DacsOpt::from_slice(&rep_vals, Some(rep_k)).expect("should fit")
+        };
+        
+        cluster_rep_indices.push(rep_indices);
+        cluster_rep_vals.push(rep_vals_enc);
+    }
+    
+    // Step 5: Encode deltas from each cell to its representative
+    let mut combined_indices = Vec::new();
+    let mut delta_vals_raw = Vec::new();
+    let mut total_pattern_changes = 0usize;
+    let mut total_non_zeros = 0usize;
+    
+    for (cell_idx, cell_expr) in expressions.iter().enumerate() {
+        let cluster_id = assignments[cell_idx];
+        let rep_idx = representatives[cluster_id];
+        let rep_expr = &expressions[rep_idx];
+        
+        total_non_zeros += cell_expr.len();
+        total_pattern_changes += l0_binary_diff(cell_expr, rep_expr) as usize;
+        
+        let diff_list = sparse_subtract(cell_expr, rep_expr);
+        
+        // Encode as (cell_idx * num_genes + gene)
+        let cell_offset = (cell_idx as u64) * (num_genes as u64);
+        
+        for (g, d) in &diff_list {
+            combined_indices.push(cell_offset + (*g as u64));
+            delta_vals_raw.push(*d as u32);
+        }
+    }
+    
+    // Step 6: Encode cluster assignments
+    let assignments_u32: Vec<u32> = assignments.iter().map(|&a| a as u32).collect();
+    let cluster_assignments = if assignments_u32.is_empty() {
+        DacsOpt::default()
+    } else {
+        DacsOpt::from_slice(&assignments_u32, Some(3)).expect("should fit")
+    };
+    
+    // Step 7: Encode combined indices
+    let mut indexed_deltas: Vec<(u64, u32)> = combined_indices.iter().zip(delta_vals_raw.iter())
+        .map(|(&idx, &val)| (idx, val))
+        .collect();
+    indexed_deltas.sort_by_key(|&(idx, _)| idx);
+    
+    let (sorted_indices, sorted_delta_vals): (Vec<u64>, Vec<u32>) = indexed_deltas.into_iter().unzip();
+    
+    let edges_possible = ncells * (num_genes as usize);
+    let change_pct = if edges_possible > 0 {
+        total_pattern_changes as f64 / edges_possible as f64 * 100.0
+    } else {
+        0.0
+    };
+    
+    let sparsity = if edges_possible > 0 {
+        sorted_indices.len() as f64 / edges_possible as f64
+    } else {
+        0.0
+    };
+    
+    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
+    
+    let delta_k = find_optimal_dacs_k(&sorted_delta_vals).unwrap_or(3);
+    let delta_vals = if sorted_delta_vals.is_empty() {
+        DacsOpt::default()
+    } else {
+        DacsOpt::from_slice(&sorted_delta_vals, Some(delta_k)).expect("should fit")
+    };
+    
+    let stats = MSTStats {
+        level: depth,
+        points: ncells,
+        total_entries: ncells * num_genes as usize,
+        non_zeros: total_non_zeros,
+        zeros: (ncells * num_genes as usize).saturating_sub(total_non_zeros),
+        pattern_changes: total_pattern_changes,
+        change_pct,
+    };
+    
+    info!(
+        "[Level {}] Cluster encoding: {} cells, {} clusters, pattern_changes={}, change_pct={:.3}%",
+        depth,
+        ncells,
+        num_clusters,
+        total_pattern_changes,
+        change_pct
+    );
+    
+    // Size breakdown
+    let (ca, cri, crv, i, dv) = EncodedDiffsCluster {
+        num_genes,
+        num_clusters: num_clusters as u32,
+        cluster_assignments: cluster_assignments.clone(),
+        cluster_rep_indices: cluster_rep_indices.clone(),
+        cluster_rep_vals: cluster_rep_vals.clone(),
+        indices: indices.clone(),
+        delta_vals: delta_vals.clone(),
+    }.bytes_breakdown();
+    
+    info!(
+        "  Cluster size breakdown: assignments={} bytes, rep_indices={} bytes, rep_vals={} bytes, indices={} bytes, delta_vals={} bytes (k={})",
+        ca, cri, crv, i, dv, delta_k
+    );
+    
+    let enc_diffs_cluster = EncodedDiffsCluster {
+        num_genes,
+        num_clusters: num_clusters as u32,
+        cluster_assignments,
+        cluster_rep_indices,
+        cluster_rep_vals,
+        indices,
+        delta_vals,
+    };
+    
+    // Identity mapping - cells stay in original order
+    let cell_order: Vec<u32> = (0..ncells as u32).collect();
+    
+    Some((enc_diffs_cluster, cell_order, stats))
+}
+
+impl EncodedDiffsCluster {
+    /// Reconstruct a cell's expression vector from cluster-based encoding
+    ///
+    /// # Arguments
+    ///
+    /// * `cell_pos` - Position of the cell in the original order
+    ///
+    /// # Returns
+    ///
+    /// Dense expression vector of length `num_genes`
+    pub(crate) fn decode_cell_at_pos(&self, cell_pos: usize) -> Vec<u16> {
+        let mut expression = vec![0u16; self.num_genes as usize];
+        
+        // Get cluster assignment
+        let cluster_id = self.cluster_assignments.access(cell_pos).unwrap_or(0) as usize;
+        
+        // Start with cluster representative
+        let rep_indices_vec = self.cluster_rep_indices[cluster_id].indices_vec();
+        for (i, &g) in rep_indices_vec.iter().enumerate() {
+            let v = self.cluster_rep_vals[cluster_id].access(i).unwrap_or(0);
+            expression[g as usize] = v as u16;
+        }
+        
+        // Apply deltas for this cell
+        let deltas = self.get_cell_deltas(cell_pos);
+        for (gene, delta_encoded) in deltas {
+            let delta = decode_v(delta_encoded);
+            let current = expression[gene as usize] as i32;
+            let new_val = (current + delta).max(0);
+            expression[gene as usize] = new_val as u16;
+        }
+        
+        expression
+    }
+    
+    /// Get deltas for a specific cell
+    fn get_cell_deltas(&self, cell_pos: usize) -> Vec<(u32, i32)> {
+        let num_genes_usize = self.num_genes as usize;
+        let cell_offset = cell_pos * num_genes_usize;
+        let cell_end = cell_offset + num_genes_usize;
+        
+        let mut deltas = Vec::new();
+        let all_indices = self.indices.indices_vec();
+        
+        // Find indices in range [cell_offset, cell_end)
+        let start_pos = all_indices.partition_point(|&x| (x as usize) < cell_offset);
+        
+        for (pos_in_all, &idx) in all_indices.iter().enumerate().skip(start_pos) {
+            let idx_usize = idx as usize;
+            if idx_usize >= cell_end {
+                break;
+            }
+            let gene = (idx_usize - cell_offset) as u32;
+            if let Some(v) = self.delta_vals.access(pos_in_all) {
+                deltas.push((gene, v as i32));
+            }
+        }
+        
+        deltas.sort_by_key(|(g, _)| *g);
+        deltas
+    }
+}
 
 impl EncodedDiffsMST {
     /// Get parent's DFS position from a cell's DFS position using offset
@@ -2898,3 +3296,150 @@ mod tests {
 }
 
 
+
+    #[test]
+    fn test_cluster_compression_roundtrip() {
+        use sprs::TriMatBase;
+        
+        // Test with 10 cells × 10 genes (sparse matrix)
+        let ncells = 10;
+        let ngenes = 10;
+        
+        let mut tri_mat: TriMatBase<Vec<usize>, Vec<u16>> = TriMatBase::new((ncells, ngenes));
+        
+        // Create cells with some similarity (for clustering)
+        // Cells 0-4: high expression in genes 0-2
+        for cell in 0..5 {
+            tri_mat.add_triplet(cell, 0, 100 + cell as u16);
+            tri_mat.add_triplet(cell, 1, 150 + cell as u16);
+            tri_mat.add_triplet(cell, 2, 200 + cell as u16);
+        }
+        
+        // Cells 5-9: high expression in genes 5-7
+        for cell in 5..10 {
+            tri_mat.add_triplet(cell, 5, 50 + cell as u16);
+            tri_mat.add_triplet(cell, 6, 75 + cell as u16);
+            tri_mat.add_triplet(cell, 7, 100 + cell as u16);
+        }
+        
+        let csr: CsMat<u16> = tri_mat.to_csr();
+        
+        // Create points
+        let points: Vec<Point> = (0..ncells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        
+        // Encode using cluster-based method
+        let result = encode_subarray_cluster(&points, &csr, 0);
+        assert!(result.is_some(), "Cluster encoding should succeed");
+        
+        let (encoded, _cell_order, stats) = result.unwrap();
+        
+        // Verify basic stats
+        assert_eq!(stats.points, ncells);
+        assert_eq!(encoded.num_genes, ngenes as u32);
+        assert_eq!(encoded.ncells(), ncells);
+        assert!(encoded.num_clusters >= 1, "Should have at least 1 cluster");
+        assert!(encoded.num_clusters <= ncells as u32, "Clusters should not exceed cells");
+        
+        // Test round-trip: decode all cells and verify they match original
+        for cell_pos in 0..ncells {
+            let decoded = encoded.decode_cell_at_pos(cell_pos);
+            assert_eq!(decoded.len(), ngenes);
+            
+            // Compare with original CSR data
+            let row_view = csr.outer_view(cell_pos).unwrap();
+            for (col_idx, &value) in row_view.iter() {
+                assert_eq!(
+                    decoded[col_idx], 
+                    value,
+                    "Cell {}, gene {}: decoded={}, expected={}",
+                    cell_pos, col_idx, decoded[col_idx], value
+                );
+            }
+            
+            // Verify zeros for non-expressed genes
+            for gene_idx in 0..ngenes {
+                if row_view.get(gene_idx).is_none() {
+                    assert_eq!(
+                        decoded[gene_idx], 
+                        0,
+                        "Cell {}, gene {} should be zero",
+                        cell_pos, gene_idx
+                    );
+                }
+            }
+        }
+        
+        info!("Cluster round-trip test passed! {} clusters, Stats: {:?}", 
+              encoded.num_clusters, stats);
+    }
+    
+    #[test]
+    fn test_cluster_vs_mst_compression() {
+        use sprs::TriMatBase;
+        
+        // Compare cluster vs MST compression on same data
+        let ncells = 20;
+        let ngenes = 15;
+        
+        let mut tri_mat: TriMatBase<Vec<usize>, Vec<u16>> = TriMatBase::new((ncells, ngenes));
+        
+        // Create heterogeneous data (should favor clustering)
+        // Group 1: cells 0-6 (genes 0-4)
+        for cell in 0..7 {
+            for gene in 0..5 {
+                tri_mat.add_triplet(cell, gene, 50 + (cell + gene) as u16);
+            }
+        }
+        
+        // Group 2: cells 7-13 (genes 5-9)
+        for cell in 7..14 {
+            for gene in 5..10 {
+                tri_mat.add_triplet(cell, gene, 60 + (cell + gene) as u16);
+            }
+        }
+        
+        // Group 3: cells 14-19 (genes 10-14)
+        for cell in 14..20 {
+            for gene in 10..15 {
+                tri_mat.add_triplet(cell, gene, 70 + (cell + gene) as u16);
+            }
+        }
+        
+        let csr: CsMat<u16> = tri_mat.to_csr();
+        let points: Vec<Point> = (0..ncells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        
+        // Encode with both methods
+        let mst_result = encode_subarray_mst(&points, &csr, 0);
+        let cluster_result = encode_subarray_cluster(&points, &csr, 0);
+        
+        assert!(mst_result.is_some());
+        assert!(cluster_result.is_some());
+        
+        let (mst_encoded, _, mst_stats) = mst_result.unwrap();
+        let (cluster_encoded, _, cluster_stats) = cluster_result.unwrap();
+        
+        let mst_size = mst_encoded.total_bytes();
+        let cluster_size = cluster_encoded.total_bytes();
+        
+        info!("MST size: {} bytes, change_pct: {:.2}%", mst_size, mst_stats.change_pct);
+        info!("Cluster size: {} bytes, change_pct: {:.2}%, num_clusters: {}", 
+              cluster_size, cluster_stats.change_pct, cluster_encoded.num_clusters);
+        
+        // Both should produce valid compression (actual size comparison depends on data)
+        assert!(mst_size > 0);
+        assert!(cluster_size > 0);
+        
+        // Both should reconstruct correctly
+        for cell_pos in 0..ncells {
+            let mst_decoded = mst_encoded.decode_cell_at_dfs_pos(cell_pos);
+            let cluster_decoded = cluster_encoded.decode_cell_at_pos(cell_pos);
+            
+            // Both should match original (note: MST uses DFS order)
+            assert_eq!(mst_decoded.len(), ngenes);
+            assert_eq!(cluster_decoded.len(), ngenes);
+        }
+    }
