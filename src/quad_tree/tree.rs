@@ -43,6 +43,7 @@
 
 use crate::bits::HybridSparseVec;
 use crate::arith_encode::ArithmeticEncoded;
+use crate::delta_indices::DeltaEncodedIndices;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
 use hnsw_rs::prelude::*;
@@ -124,9 +125,9 @@ pub(crate) struct EncodedDiffs {
 pub(crate) struct EncodedDiffsMST {
     pub(crate) num_genes: u32,                  // Total number of genes (needed for output vector size)
     pub(crate) parent_offset: ArithmeticEncoded,// parent_offset[i] = i - parent_position (one per cell)
-    pub(crate) root_indices: HybridSparseVec,   // Root's non-zero gene indices
+    pub(crate) root_indices: DeltaEncodedIndices, // Root's non-zero gene indices (delta-encoded)
     pub(crate) root_vals: ArithmeticEncoded,    // Root's expression values
-    pub(crate) indices: HybridSparseVec,        // (dfs_pos-1)*num_genes + gene for non-root cells
+    pub(crate) indices: DeltaEncodedIndices,    // (dfs_pos-1)*num_genes + gene for non-root cells (delta-encoded)
     pub(crate) delta_vals: ArithmeticEncoded,   // Delta values (zigzag encoded), parallel to indices
 }
 
@@ -135,9 +136,9 @@ impl EncodedDiffsMST {
         EncodedDiffsMST {
             num_genes: 0,
             parent_offset: ArithmeticEncoded::default(),
-            root_indices: HybridSparseVec::empty(),
+            root_indices: DeltaEncodedIndices::empty(),
             root_vals: ArithmeticEncoded::default(),
-            indices: HybridSparseVec::empty(),
+            indices: DeltaEncodedIndices::empty(),
             delta_vals: ArithmeticEncoded::default(),
         }
     }
@@ -158,9 +159,9 @@ impl EncodedDiffsMST {
 
     pub(crate) fn bytes_breakdown(&self) -> (usize, usize, usize, usize, usize, usize) {
         let parent_offset_bytes = self.parent_offset.size_in_bytes();
-        let root_indices_bytes = self.root_indices.num_bytes();
+        let root_indices_bytes = self.root_indices.size_in_bytes();
         let root_vals_bytes = self.root_vals.size_in_bytes();
-        let indices_bytes = self.indices.num_bytes();
+        let indices_bytes = self.indices.size_in_bytes();
         let delta_vals_bytes = self.delta_vals.size_in_bytes();
         let num_genes_bytes = 4;
         (
@@ -179,37 +180,18 @@ impl EncodedDiffsMST {
     }
 }
 
-// Manual implementation of de/serialization for `Rect`.
-// We don't need to store the edges since they can computed from the other fields.
+// Manual implementation of de/serialization for `EncodedDiffsMST`.
 impl Encode for EncodedDiffsMST {
     fn encode<E: bincode::enc::Encoder>(
         &self,
         encoder: &mut E,
     ) -> core::result::Result<(), bincode::error::EncodeError> {
         Encode::encode(&self.num_genes, encoder)?;
-        
-        // Serialize parent_offset
-        let mut parent_offset_bytes = Vec::new();
-        self.parent_offset.serialize_into(&mut parent_offset_bytes)
-            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-        Encode::encode(&parent_offset_bytes, encoder)?;
-        
-        // HybridSparseVec has built-in Encode
+        Encode::encode(&self.parent_offset, encoder)?;
         Encode::encode(&self.root_indices, encoder)?;
-        
-        let mut root_vals_bytes = Vec::new();
-        self.root_vals.serialize_into(&mut root_vals_bytes)
-            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-        Encode::encode(&root_vals_bytes, encoder)?;
-        
-        // indices as HybridSparseVec
+        Encode::encode(&self.root_vals, encoder)?;
         Encode::encode(&self.indices, encoder)?;
-        
-        let mut delta_vals_bytes = Vec::new();
-        self.delta_vals.serialize_into(&mut delta_vals_bytes)
-            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-        Encode::encode(&delta_vals_bytes, encoder)?;
-        
+        Encode::encode(&self.delta_vals, encoder)?;
         Ok(())
     }
 }
@@ -219,12 +201,10 @@ impl<Context> Decode<Context> for EncodedDiffsMST {
         decoder: &mut D,
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
         let num_genes: u32 = Decode::decode(decoder)?;
-        
-        // Decode ArithmeticEncoded fields using their own Decode impl
         let parent_offset: ArithmeticEncoded = Decode::decode(decoder)?;
-        let root_indices: HybridSparseVec = Decode::decode(decoder)?;
+        let root_indices: DeltaEncodedIndices = Decode::decode(decoder)?;
         let root_vals: ArithmeticEncoded = Decode::decode(decoder)?;
-        let indices: HybridSparseVec = Decode::decode(decoder)?;
+        let indices: DeltaEncodedIndices = Decode::decode(decoder)?;
         let delta_vals: ArithmeticEncoded = Decode::decode(decoder)?;
         
         Ok(Self {
@@ -1151,9 +1131,9 @@ pub(crate) fn encode_subarray_mst(
         ArithmeticEncoded::from_slice(&parent_offset_vec).expect("should fit")
     };
     
-    // Use HybridSparseVec for root indices
+    // Use DeltaEncodedIndices for root indices
     let root_genes_u64: Vec<u64> = root_genes_vec.iter().map(|&g| g as u64).collect();
-    let root_indices = HybridSparseVec::from_indices(&root_genes_u64, 0.5, num_genes as usize);
+    let root_indices = DeltaEncodedIndices::from_indices(&root_genes_u64);
     
     // Encode root values using arithmetic encoding
     let root_vals = if root_vals_vec.is_empty() {
@@ -1162,9 +1142,8 @@ pub(crate) fn encode_subarray_mst(
         ArithmeticEncoded::from_slice(&root_vals_vec).expect("should fit")
     };
     
-    // Use HybridSparseVec for combined indices (same as old encoding!)
+    // Use DeltaEncodedIndices for combined indices
     // CRITICAL: Sort indices and delta_vals together to maintain parallel relationship
-    // HybridSparseVec may sort indices internally, so we need to sort them together first
     let mut indexed_deltas: Vec<(u64, u32)> = combined_indices.iter().zip(delta_vals_raw.iter())
         .map(|(&idx, &val)| (idx, val))
         .collect();
@@ -1185,7 +1164,7 @@ pub(crate) fn encode_subarray_mst(
         0.0
     };
     
-    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
+    let indices = DeltaEncodedIndices::from_indices(&sorted_indices);
     
     // Encode delta values using arithmetic encoding
     let delta_vals = if sorted_delta_vals.is_empty() {
@@ -1219,9 +1198,9 @@ pub(crate) fn encode_subarray_mst(
     info!(
         "  Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes, indices={} bytes, delta_vals={} bytes",
         parent_offset.size_in_bytes(),
-        root_indices.num_bytes(),
+        root_indices.size_in_bytes(),
         root_vals.size_in_bytes(),
-        indices.num_bytes(),
+        indices.size_in_bytes(),
         delta_vals.size_in_bytes()
     );
     
@@ -1268,9 +1247,9 @@ pub(crate) struct EncodedDiffsCluster {
     pub(crate) num_genes: u32,                      // Total number of genes
     pub(crate) num_clusters: u32,                   // Number of clusters
     pub(crate) cluster_assignments: ArithmeticEncoded, // cluster_id for each cell
-    pub(crate) cluster_rep_indices: Vec<HybridSparseVec>, // Representative gene indices per cluster
+    pub(crate) cluster_rep_indices: Vec<DeltaEncodedIndices>, // Representative gene indices per cluster (delta-encoded)
     pub(crate) cluster_rep_vals: Vec<ArithmeticEncoded>,  // Representative values per cluster
-    pub(crate) indices: HybridSparseVec,            // Combined (cell, gene) indices for deltas
+    pub(crate) indices: DeltaEncodedIndices,        // Combined (cell, gene) indices for deltas (delta-encoded)
     pub(crate) delta_vals: ArithmeticEncoded,       // Delta values (zigzag encoded)
 }
 
@@ -1282,7 +1261,7 @@ impl EncodedDiffsCluster {
             cluster_assignments: ArithmeticEncoded::default(),
             cluster_rep_indices: Vec::new(),
             cluster_rep_vals: Vec::new(),
-            indices: HybridSparseVec::empty(),
+            indices: DeltaEncodedIndices::empty(),
             delta_vals: ArithmeticEncoded::default(),
         }
     }
@@ -1296,10 +1275,10 @@ impl EncodedDiffsCluster {
         let mut cluster_rep_indices_bytes = 0;
         let mut cluster_rep_vals_bytes = 0;
         for i in 0..self.num_clusters as usize {
-            cluster_rep_indices_bytes += self.cluster_rep_indices[i].num_bytes();
+            cluster_rep_indices_bytes += self.cluster_rep_indices[i].size_in_bytes();
             cluster_rep_vals_bytes += self.cluster_rep_vals[i].size_in_bytes();
         }
-        let indices_bytes = self.indices.num_bytes();
+        let indices_bytes = self.indices.size_in_bytes();
         let delta_vals_bytes = self.delta_vals.size_in_bytes();
         
         (
@@ -1450,7 +1429,7 @@ pub(crate) fn encode_subarray_cluster(
         let rep_genes: Vec<u64> = rep_expr.iter().map(|(g, _)| *g as u64).collect();
         let rep_vals: Vec<u32> = rep_expr.iter().map(|(_, v)| *v as u32).collect();
         
-        let rep_indices = HybridSparseVec::from_indices(&rep_genes, 0.5, num_genes as usize);
+        let rep_indices = DeltaEncodedIndices::from_indices(&rep_genes);
         
         // Encode representative values using arithmetic encoding
         let rep_vals_enc = if rep_vals.is_empty() {
@@ -1517,7 +1496,7 @@ pub(crate) fn encode_subarray_cluster(
         0.0
     };
     
-    let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
+    let indices = DeltaEncodedIndices::from_indices(&sorted_indices);
     
     // Encode delta values using arithmetic encoding
     let delta_vals = if sorted_delta_vals.is_empty() {
@@ -1594,7 +1573,7 @@ impl EncodedDiffsCluster {
         let cluster_id = self.cluster_assignments.access(cell_pos).unwrap_or(0) as usize;
         
         // Start with cluster representative
-        let rep_indices_vec = self.cluster_rep_indices[cluster_id].indices_vec();
+        let rep_indices_vec = self.cluster_rep_indices[cluster_id].decode_all();
         for (i, &g) in rep_indices_vec.iter().enumerate() {
             let v = self.cluster_rep_vals[cluster_id].access(i).unwrap_or(0);
             expression[g as usize] = v as u16;
@@ -1619,7 +1598,7 @@ impl EncodedDiffsCluster {
         let cell_end = cell_offset + num_genes_usize;
         
         let mut deltas = Vec::new();
-        let all_indices = self.indices.indices_vec();
+        let all_indices = self.indices.decode_all();
         
         // Find indices in range [cell_offset, cell_end)
         let start_pos = all_indices.partition_point(|&x| (x as usize) < cell_offset);
@@ -1683,7 +1662,7 @@ impl EncodedDiffsMST {
         
         // Start with root's raw expression values
         let mut acc: Vec<(u32, i32)> = Vec::new();
-        let root_indices_vec = self.root_indices.indices_vec();
+        let root_indices_vec = self.root_indices.decode_all();
         for (i, &g) in root_indices_vec.iter().enumerate() {
             let v = self.root_vals.access(i).unwrap_or(0) as i32;
             acc.push((g as u32, v));
@@ -1758,7 +1737,7 @@ impl EncodedDiffsMST {
     /// Get deltas for cell at dfs_pos using new index format
     /// Index = (dfs_pos - 1) * num_genes + gene
     pub(crate) fn get_cell_deltas_new(&self, dfs_pos: usize) -> Vec<(u32, i32)> {
-        let all_indices = self.indices.indices_vec();
+        let all_indices = self.indices.decode_all();
         self.get_cell_deltas_with_indices(dfs_pos, &all_indices)
     }
     
@@ -1816,9 +1795,9 @@ impl EncodedDiffsMST {
     pub fn bytes(&self) -> usize {
         4  // num_genes only (ncells derived from parent_offset.len())
             + self.parent_offset.size_in_bytes()
-            + self.root_indices.num_bytes()
+            + self.root_indices.size_in_bytes()
             + self.root_vals.size_in_bytes()
-            + self.indices.num_bytes()  // HybridSparseVec for combined indices
+            + self.indices.size_in_bytes()  // DeltaEncodedIndices for combined indices
             + self.delta_vals.size_in_bytes()
     }
     
@@ -1851,13 +1830,13 @@ pub(crate) struct ExpressionVecIterMST<'a> {
 impl<'a> ExpressionVecIterMST<'a> {
     fn new(ediff: &'a EncodedDiffsMST) -> Self {
         let ncells = ediff.ncells();
-        let all_indices = ediff.indices.indices_vec();
+        let all_indices = ediff.indices.decode_all();
         let mut states = Vec::with_capacity(ncells);
         
         if ncells > 0 {
             // Initial state: root's sparse expression
             let mut root_acc = Vec::new();
-            let root_indices_vec = ediff.root_indices.indices_vec();
+            let root_indices_vec = ediff.root_indices.decode_all();
             for (i, &g) in root_indices_vec.iter().enumerate() {
                 let v = ediff.root_vals.access(i).unwrap_or(0) as i32;
                 root_acc.push((g as u32, v));

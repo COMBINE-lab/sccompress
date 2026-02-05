@@ -43,6 +43,11 @@ pub struct DeltaEncodedIndices {
 }
 
 impl DeltaEncodedIndices {
+    /// Create an empty DeltaEncodedIndices
+    pub fn empty() -> Self {
+        Self::default()
+    }
+    
     /// Create delta-encoded indices from a sorted slice of indices
     /// 
     /// # Arguments
