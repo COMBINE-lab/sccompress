@@ -1,6 +1,7 @@
 pub mod bits;
 pub mod quad_tree;
 pub mod h5_utils;
+pub mod arith_encode;
 //pub mod lossy_compression;
 use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
 //use crate::lossy_compression::LloydMaxQuantizer;

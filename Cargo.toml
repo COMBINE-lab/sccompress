@@ -24,6 +24,7 @@ mimalloc = "0.1.48"
 sucds = "0.8.3"
 petgraph = "0.6"
 hnsw_rs = "0.3"
+constriction = "0.4"
 
 [[bin]]
 name = "quadtree"
