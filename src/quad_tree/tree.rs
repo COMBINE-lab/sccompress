@@ -16,7 +16,7 @@
 //! - [`encode_subarray_mst`]: Compression function
 //! - [`decode_cell_at_dfs_pos`]: Decompression function
 //! - [`HybridSparseVec`]: Adaptive position encoding (Elias-Fano vs bitvector)
-//! - [`DacsOpt`]: Variable-length integer encoding
+//! - [`ArithmeticEncoded`]: Arithmetic (ANS) encoding for integer values
 //!
 //! # Compression Pipeline
 //!
@@ -29,7 +29,7 @@
 //! # Adaptive Encoding
 //!
 //! - **Position Encoding**: Automatically selects Elias-Fano (>75% sparse) or bitvector (≤75% sparse)
-//! - **Value Encoding**: Uses DacsOpt for variable-length encoding of zigzag-encoded deltas
+//! - **Value Encoding**: Uses arithmetic coding (ANS) for efficient encoding of integer values
 //!
 //! # Example
 //!
@@ -42,6 +42,7 @@
 //! ```
 
 use crate::bits::HybridSparseVec;
+use crate::arith_encode::ArithmeticEncoded;
 use bincode::{BorrowDecode, Decode, Encode};
 use bitm::{self, BitAccess};
 use hnsw_rs::prelude::*;
@@ -52,9 +53,7 @@ use sux::traits::BitFieldSliceMut;
 use tracing::{debug, error, info, warn};
 //use rayon::scope;
 use sprs::{CsMat, CsVecViewI};
-use sucds::int_vectors::DacsOpt;
 use sucds::int_vectors::Access;
-use sucds::Serializable;
 
 // MST-based encoding (using petgraph)
 //use medians::medianu64;
@@ -80,8 +79,8 @@ impl CostLog {
 pub(crate) struct EncodedDiffs {
     pub(crate) indices: HybridSparseVec,
     pub(crate) ncells: u32,
-    pub(crate) values: DacsOpt,              // Raw expression values (no median subtraction)
-    pub(crate) num_genes: u32,               // Total number of genes
+    pub(crate) values: ArithmeticEncoded,      // Raw expression values (no median subtraction)
+    pub(crate) num_genes: u32,                 // Total number of genes
 }
 
 /// MST-based compression for spatial single-cell RNA-seq data
@@ -104,7 +103,7 @@ pub(crate) struct EncodedDiffs {
 ///
 /// 4. **Delta Encoding**: Each non-root cell stores only differences from its parent:
 ///    - **Position Encoding**: Adaptive selection between Elias-Fano (sparse) and bitvector (dense)
-///    - **Value Encoding**: Variable-length encoding (DacsOpt) with zigzag encoding for signed deltas
+///    - **Value Encoding**: Arithmetic coding (ANS) with zigzag encoding for signed deltas
 ///
 /// ## Decompression
 ///
@@ -124,22 +123,22 @@ pub(crate) struct EncodedDiffs {
 #[derive(Clone)]
 pub(crate) struct EncodedDiffsMST {
     pub(crate) num_genes: u32,                  // Total number of genes (needed for output vector size)
-    pub(crate) parent_offset: DacsOpt,          // parent_offset[i] = i - parent_position (one per cell)
+    pub(crate) parent_offset: ArithmeticEncoded,// parent_offset[i] = i - parent_position (one per cell)
     pub(crate) root_indices: HybridSparseVec,   // Root's non-zero gene indices
-    pub(crate) root_vals: DacsOpt,              // Root's expression values
+    pub(crate) root_vals: ArithmeticEncoded,    // Root's expression values
     pub(crate) indices: HybridSparseVec,        // (dfs_pos-1)*num_genes + gene for non-root cells
-    pub(crate) delta_vals: DacsOpt,             // Delta values (zigzag encoded), parallel to indices
+    pub(crate) delta_vals: ArithmeticEncoded,   // Delta values (zigzag encoded), parallel to indices
 }
 
 impl EncodedDiffsMST {
     pub(crate) fn empty() -> Self {
         EncodedDiffsMST {
             num_genes: 0,
-            parent_offset: DacsOpt::default(),
+            parent_offset: ArithmeticEncoded::default(),
             root_indices: HybridSparseVec::empty(),
-            root_vals: DacsOpt::default(),
+            root_vals: ArithmeticEncoded::default(),
             indices: HybridSparseVec::empty(),
-            delta_vals: DacsOpt::default(),
+            delta_vals: ArithmeticEncoded::default(),
         }
     }
     
@@ -221,21 +220,12 @@ impl<Context> Decode<Context> for EncodedDiffsMST {
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
         let num_genes: u32 = Decode::decode(decoder)?;
         
-        let parent_offset_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let parent_offset = DacsOpt::deserialize_from(&parent_offset_bytes[..])
-            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
-        
+        // Decode ArithmeticEncoded fields using their own Decode impl
+        let parent_offset: ArithmeticEncoded = Decode::decode(decoder)?;
         let root_indices: HybridSparseVec = Decode::decode(decoder)?;
-        
-        let root_vals_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let root_vals = DacsOpt::deserialize_from(&root_vals_bytes[..])
-            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
-        
+        let root_vals: ArithmeticEncoded = Decode::decode(decoder)?;
         let indices: HybridSparseVec = Decode::decode(decoder)?;
-        
-        let delta_vals_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let delta_vals = DacsOpt::deserialize_from(&delta_vals_bytes[..])
-            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
+        let delta_vals: ArithmeticEncoded = Decode::decode(decoder)?;
         
         Ok(Self {
             num_genes,
@@ -304,7 +294,7 @@ impl EncodedDiffs {
         EncodedDiffs {
             indices: HybridSparseVec::empty(),
             ncells: 0,
-            values: DacsOpt::default(),
+            values: ArithmeticEncoded::default(),
             num_genes: 0,
         }
     }
@@ -502,15 +492,8 @@ impl Encode for EncodedDiffs {
     ) -> core::result::Result<(), bincode::error::EncodeError> {
         Encode::encode(&self.indices, encoder)?;
         Encode::encode(&self.ncells, encoder)?;
-
-        let mut values_bytes = Vec::new();
-        self.values.serialize_into(&mut values_bytes)
-            .map_err(|_| bincode::error::EncodeError::OtherString("DacsOpt serialize failed".into()))?;
-        Encode::encode(&values_bytes, encoder)?;
-
-        // Encode num_genes
+        Encode::encode(&self.values, encoder)?;
         Encode::encode(&self.num_genes, encoder)?;
-        
         Ok(())
     }
 }
@@ -521,12 +504,7 @@ impl<Context> Decode<Context> for EncodedDiffs {
     ) -> core::result::Result<Self, bincode::error::DecodeError> {
         let indices = Decode::decode(decoder)?;
         let ncells = Decode::decode(decoder)?;
-
-        let values_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let values = DacsOpt::deserialize_from(&values_bytes[..])
-            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
-
-        // Decode num_genes
+        let values: ArithmeticEncoded = Decode::decode(decoder)?;
         let num_genes = Decode::decode(decoder)?;
         
         Ok(Self {
@@ -544,12 +522,7 @@ impl<'de, Context> BorrowDecode<'de, Context> for EncodedDiffs {
     ) -> Result<Self, bincode::error::DecodeError> {
         let indices = BorrowDecode::borrow_decode(decoder)?;
         let ncells = BorrowDecode::borrow_decode(decoder)?;
-
-        let values_bytes: Vec<u8> = Decode::decode(decoder)?;
-        let values = DacsOpt::deserialize_from(&values_bytes[..])
-            .map_err(|_| bincode::error::DecodeError::OtherString("DacsOpt deserialize failed".into()))?;
-
-        // Decode num_genes
+        let values: ArithmeticEncoded = BorrowDecode::borrow_decode(decoder)?;
         let num_genes: u32 = Decode::decode(decoder)?;
         
         Ok(Self {
@@ -604,11 +577,11 @@ pub(crate) fn encode_subarray(points: &[Point], data: &CsMat<u16>) -> Option<Enc
 
     let indices = HybridSparseVec::from_indices(&indices, sparsity, tot);
     
-    // Store raw values (no zigzag encoding needed since values are unsigned)
+    // Store raw values using arithmetic encoding
     let values = if raw_values.is_empty() {
-        DacsOpt::default()
+        ArithmeticEncoded::default()
     } else {
-        DacsOpt::from_slice(&raw_values, Some(3)).expect("should fit")
+        ArithmeticEncoded::from_slice(&raw_values).expect("should fit")
     };
     
     assert_eq!(indices.len(), values.len());
@@ -830,39 +803,6 @@ fn zigzag_encode(v: i32) -> i32 {
 
 /// Find optimal k parameter for DacsOpt encoding based on value distribution
 ///
-/// DacsOpt uses a parameter k that controls the encoding efficiency.
-/// This function tests different k values and returns the one that gives the smallest size.
-///
-/// # Arguments
-///
-/// * `values` - The values to encode
-///
-/// # Returns
-///
-/// Optimal k value (typically 2-5 for gene expression deltas)
-fn find_optimal_dacs_k(values: &[u32]) -> Option<usize> {
-    if values.is_empty() {
-        return Some(3); // Default
-    }
-    
-    let test_k_values = [2, 3, 4, 5, 6];
-    let mut best_k = 3;
-    let mut best_size = usize::MAX;
-    
-    for &k in &test_k_values {
-        if let Ok(encoded) = DacsOpt::from_slice(values, Some(k)) {
-            let size = encoded.size_in_bytes();
-            if size < best_size {
-                best_size = size;
-                best_k = k;
-            }
-        }
-    }
-    
-    Some(best_k)
-}
-
-/// Build symmetric kNN graph for all points using grid-based spatial index
 /// Returns adjacency list where neighbors[i] contains all neighbors of cell i
 /// Build symmetric kNN graph based on expression sparsity pattern similarity
 fn build_expression_knn(expressions: &[SparseExpression], k: usize) -> Vec<Vec<usize>> {
@@ -1206,21 +1146,20 @@ pub(crate) fn encode_subarray_mst(
     
     // Parent offsets: small positive numbers (usually 1-10), compress very well!
     let parent_offset = if parent_offset_vec.is_empty() {
-        DacsOpt::default()
+        ArithmeticEncoded::default()
     } else {
-        DacsOpt::from_slice(&parent_offset_vec, Some(3)).expect("should fit")
+        ArithmeticEncoded::from_slice(&parent_offset_vec).expect("should fit")
     };
     
     // Use HybridSparseVec for root indices
     let root_genes_u64: Vec<u64> = root_genes_vec.iter().map(|&g| g as u64).collect();
     let root_indices = HybridSparseVec::from_indices(&root_genes_u64, 0.5, num_genes as usize);
     
-    // OPTIMIZATION: Find optimal k for root values
-    let root_k = find_optimal_dacs_k(&root_vals_vec).unwrap_or(3);
+    // Encode root values using arithmetic encoding
     let root_vals = if root_vals_vec.is_empty() {
-        DacsOpt::default()
+        ArithmeticEncoded::default()
     } else {
-        DacsOpt::from_slice(&root_vals_vec, Some(root_k)).expect("should fit")
+        ArithmeticEncoded::from_slice(&root_vals_vec).expect("should fit")
     };
     
     // Use HybridSparseVec for combined indices (same as old encoding!)
@@ -1248,12 +1187,11 @@ pub(crate) fn encode_subarray_mst(
     
     let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
     
-    // OPTIMIZATION: Find optimal k for delta values based on their distribution
-    let delta_k = find_optimal_dacs_k(&sorted_delta_vals).unwrap_or(3);
+    // Encode delta values using arithmetic encoding
     let delta_vals = if sorted_delta_vals.is_empty() {
-        DacsOpt::default()
+        ArithmeticEncoded::default()
     } else {
-        DacsOpt::from_slice(&sorted_delta_vals, Some(delta_k)).expect("should fit")
+        ArithmeticEncoded::from_slice(&sorted_delta_vals).expect("should fit")
     };
     
     let stats = MSTStats {
@@ -1279,14 +1217,12 @@ pub(crate) fn encode_subarray_mst(
     
     // Size breakdown
     info!(
-        "  Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes (k={}), indices={} bytes, delta_vals={} bytes (k={})",
+        "  Size breakdown: parent_offset={} bytes, root_indices={} bytes, root_vals={} bytes, indices={} bytes, delta_vals={} bytes",
         parent_offset.size_in_bytes(),
         root_indices.num_bytes(),
         root_vals.size_in_bytes(),
-        root_k,
         indices.num_bytes(),
-        delta_vals.size_in_bytes(),
-        delta_k
+        delta_vals.size_in_bytes()
     );
     
     let enc_diffs_mst = EncodedDiffsMST {
@@ -1331,11 +1267,11 @@ pub(crate) fn encode_subarray_mst(
 pub(crate) struct EncodedDiffsCluster {
     pub(crate) num_genes: u32,                      // Total number of genes
     pub(crate) num_clusters: u32,                   // Number of clusters
-    pub(crate) cluster_assignments: DacsOpt,        // cluster_id for each cell
+    pub(crate) cluster_assignments: ArithmeticEncoded, // cluster_id for each cell
     pub(crate) cluster_rep_indices: Vec<HybridSparseVec>, // Representative gene indices per cluster
-    pub(crate) cluster_rep_vals: Vec<DacsOpt>,      // Representative values per cluster
+    pub(crate) cluster_rep_vals: Vec<ArithmeticEncoded>,  // Representative values per cluster
     pub(crate) indices: HybridSparseVec,            // Combined (cell, gene) indices for deltas
-    pub(crate) delta_vals: DacsOpt,                 // Delta values (zigzag encoded)
+    pub(crate) delta_vals: ArithmeticEncoded,       // Delta values (zigzag encoded)
 }
 
 impl EncodedDiffsCluster {
@@ -1343,11 +1279,11 @@ impl EncodedDiffsCluster {
         EncodedDiffsCluster {
             num_genes: 0,
             num_clusters: 0,
-            cluster_assignments: DacsOpt::default(),
+            cluster_assignments: ArithmeticEncoded::default(),
             cluster_rep_indices: Vec::new(),
             cluster_rep_vals: Vec::new(),
             indices: HybridSparseVec::empty(),
-            delta_vals: DacsOpt::default(),
+            delta_vals: ArithmeticEncoded::default(),
         }
     }
     
@@ -1516,11 +1452,11 @@ pub(crate) fn encode_subarray_cluster(
         
         let rep_indices = HybridSparseVec::from_indices(&rep_genes, 0.5, num_genes as usize);
         
-        let rep_k = find_optimal_dacs_k(&rep_vals).unwrap_or(3);
+        // Encode representative values using arithmetic encoding
         let rep_vals_enc = if rep_vals.is_empty() {
-            DacsOpt::default()
+            ArithmeticEncoded::default()
         } else {
-            DacsOpt::from_slice(&rep_vals, Some(rep_k)).expect("should fit")
+            ArithmeticEncoded::from_slice(&rep_vals).expect("should fit")
         };
         
         cluster_rep_indices.push(rep_indices);
@@ -1555,9 +1491,9 @@ pub(crate) fn encode_subarray_cluster(
     // Step 6: Encode cluster assignments
     let assignments_u32: Vec<u32> = assignments.iter().map(|&a| a as u32).collect();
     let cluster_assignments = if assignments_u32.is_empty() {
-        DacsOpt::default()
+        ArithmeticEncoded::default()
     } else {
-        DacsOpt::from_slice(&assignments_u32, Some(3)).expect("should fit")
+        ArithmeticEncoded::from_slice(&assignments_u32).expect("should fit")
     };
     
     // Step 7: Encode combined indices
@@ -1583,11 +1519,11 @@ pub(crate) fn encode_subarray_cluster(
     
     let indices = HybridSparseVec::from_indices(&sorted_indices, sparsity, edges_possible);
     
-    let delta_k = find_optimal_dacs_k(&sorted_delta_vals).unwrap_or(3);
+    // Encode delta values using arithmetic encoding
     let delta_vals = if sorted_delta_vals.is_empty() {
-        DacsOpt::default()
+        ArithmeticEncoded::default()
     } else {
-        DacsOpt::from_slice(&sorted_delta_vals, Some(delta_k)).expect("should fit")
+        ArithmeticEncoded::from_slice(&sorted_delta_vals).expect("should fit")
     };
     
     let stats = MSTStats {
@@ -1621,8 +1557,8 @@ pub(crate) fn encode_subarray_cluster(
     }.bytes_breakdown();
     
     info!(
-        "  Cluster size breakdown: assignments={} bytes, rep_indices={} bytes, rep_vals={} bytes, indices={} bytes, delta_vals={} bytes (k={})",
-        ca, cri, crv, i, dv, delta_k
+        "  Cluster size breakdown: assignments={} bytes, rep_indices={} bytes, rep_vals={} bytes, indices={} bytes, delta_vals={} bytes",
+        ca, cri, crv, i, dv
     );
     
     let enc_diffs_cluster = EncodedDiffsCluster {

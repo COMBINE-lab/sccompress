@@ -59,6 +59,17 @@ impl ArithmeticEncoded {
         let max_val = *values.iter().max().unwrap();
         let alphabet_size = max_val + 1;
 
+        // Special case: if all values are the same, use a simple encoding
+        if alphabet_size == 1 {
+            // All values are 0, just store the count
+            return Ok(ArithmeticEncoded {
+                compressed: vec![],
+                length: values.len(),
+                probabilities: vec![values.len() as u32],
+                alphabet_size: 1,
+            });
+        }
+
         // Build histogram
         let mut histogram = vec![0u32; alphabet_size as usize];
         for &val in values {
@@ -66,19 +77,25 @@ impl ArithmeticEncoded {
         }
 
         // Ensure no zero probabilities (add Laplace smoothing)
+        // This also handles the case where we have very few symbols
         for count in histogram.iter_mut() {
-            if *count == 0 {
-                *count = 1;
-            }
+            *count += 1;  // Add 1 to all (Laplace smoothing)
         }
 
-        // Create entropy model
+        // Create entropy model with normalized probabilities
         let probabilities = histogram.clone();
+        
+        // Convert to f64 and normalize
+        let total: f64 = probabilities.iter().map(|&x| x as f64).sum();
+        let normalized_probs: Vec<f64> = probabilities.iter()
+            .map(|&x| (x as f64) / total)
+            .collect();
+        
         let model = DefaultContiguousCategoricalEntropyModel::from_floating_point_probabilities_fast(
-            &probabilities.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            &normalized_probs,
             None,
         )
-        .map_err(|e| format!("Failed to create entropy model: {:?}", e))?;
+        .map_err(|e| format!("Failed to create entropy model for {} symbols: {:?}", alphabet_size, e))?;
 
         // Encode values (ANS doesn't require reversing on encode in this implementation)
         let mut coder = DefaultAnsCoder::new();
@@ -142,9 +159,19 @@ impl ArithmeticEncoded {
             return Ok(Vec::new());
         }
 
-        // Create entropy model from stored probabilities
+        // Special case: if alphabet size is 1, all values are 0
+        if self.alphabet_size == 1 {
+            return Ok(vec![0; self.length]);
+        }
+
+        // Create entropy model from stored probabilities with normalization
+        let total: f64 = self.probabilities.iter().map(|&x| x as f64).sum();
+        let normalized_probs: Vec<f64> = self.probabilities.iter()
+            .map(|&x| (x as f64) / total)
+            .collect();
+        
         let model = DefaultContiguousCategoricalEntropyModel::from_floating_point_probabilities_fast(
-            &self.probabilities.iter().map(|&x| x as f64).collect::<Vec<_>>(),
+            &normalized_probs,
             None,
         )
         .map_err(|e| format!("Failed to create entropy model: {:?}", e))?;
