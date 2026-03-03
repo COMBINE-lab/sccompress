@@ -6,9 +6,7 @@
 
 use bincode::{Decode, Encode};
 use constriction::stream::{
-    model::DefaultContiguousCategoricalEntropyModel, 
-    stack::DefaultAnsCoder, 
-    Decode as AnsDecode,
+    model::DefaultContiguousCategoricalEntropyModel, stack::DefaultAnsCoder, Decode as AnsDecode,
     Encode as AnsEncode,
 };
 use std::convert::TryInto;
@@ -79,23 +77,28 @@ impl ArithmeticEncoded {
         // Ensure no zero probabilities (add Laplace smoothing)
         // This also handles the case where we have very few symbols
         for count in histogram.iter_mut() {
-            *count += 1;  // Add 1 to all (Laplace smoothing)
+            *count += 1; // Add 1 to all (Laplace smoothing)
         }
 
         // Create entropy model with normalized probabilities
         let probabilities = histogram.clone();
-        
+
         // Convert to f64 and normalize
         let total: f64 = probabilities.iter().map(|&x| x as f64).sum();
-        let normalized_probs: Vec<f64> = probabilities.iter()
-            .map(|&x| (x as f64) / total)
-            .collect();
-        
-        let model = DefaultContiguousCategoricalEntropyModel::from_floating_point_probabilities_fast(
-            &normalized_probs,
-            None,
-        )
-        .map_err(|e| format!("Failed to create entropy model for {} symbols: {:?}", alphabet_size, e))?;
+        let normalized_probs: Vec<f64> =
+            probabilities.iter().map(|&x| (x as f64) / total).collect();
+
+        let model =
+            DefaultContiguousCategoricalEntropyModel::from_floating_point_probabilities_fast(
+                &normalized_probs,
+                None,
+            )
+            .map_err(|e| {
+                format!(
+                    "Failed to create entropy model for {} symbols: {:?}",
+                    alphabet_size, e
+                )
+            })?;
 
         // Encode values (ANS doesn't require reversing on encode in this implementation)
         let mut coder = DefaultAnsCoder::new();
@@ -105,7 +108,9 @@ impl ArithmeticEncoded {
                 .map_err(|e| format!("Encoding failed: {:?}", e))?;
         }
 
-        let compressed = coder.into_compressed().map_err(|e| format!("Failed to get compressed: {:?}", e))?;
+        let compressed = coder
+            .into_compressed()
+            .map_err(|e| format!("Failed to get compressed: {:?}", e))?;
 
         Ok(ArithmeticEncoded {
             compressed: compressed.to_vec(),
@@ -129,6 +134,7 @@ impl ArithmeticEncoded {
     }
 
     /// Check if empty
+    #[allow(dead_code)]
     pub fn is_empty(&self) -> bool {
         self.length == 0
     }
@@ -166,15 +172,18 @@ impl ArithmeticEncoded {
 
         // Create entropy model from stored probabilities with normalization
         let total: f64 = self.probabilities.iter().map(|&x| x as f64).sum();
-        let normalized_probs: Vec<f64> = self.probabilities.iter()
+        let normalized_probs: Vec<f64> = self
+            .probabilities
+            .iter()
             .map(|&x| (x as f64) / total)
             .collect();
-        
-        let model = DefaultContiguousCategoricalEntropyModel::from_floating_point_probabilities_fast(
-            &normalized_probs,
-            None,
-        )
-        .map_err(|e| format!("Failed to create entropy model: {:?}", e))?;
+
+        let model =
+            DefaultContiguousCategoricalEntropyModel::from_floating_point_probabilities_fast(
+                &normalized_probs,
+                None,
+            )
+            .map_err(|e| format!("Failed to create entropy model: {:?}", e))?;
 
         // Decode values - need to convert to owned Vec for the decoder
         let compressed_vec = self.compressed.clone();

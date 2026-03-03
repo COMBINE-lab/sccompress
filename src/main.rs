@@ -1,1212 +1,1314 @@
-pub mod bits;
-pub mod quad_tree;
-pub mod h5_utils;
-pub mod arith_encode;
-pub mod delta_indices;
-//pub mod lossy_compression;
-use crate::quad_tree::tree::{ErrorMetric, Point, QuadTree, Rect};
-//use crate::lossy_compression::LloydMaxQuantizer;
+mod arith_encode;
+mod delta_indices;
+mod index_stream;
+mod matrix_io;
+mod mst_codec;
+
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use csv::ReaderBuilder;
-use hdf5::types::FixedAscii;
-use hdf5::File as Hdf5File;
-use ndarray::ArrayD;
-use parquet::file::reader::{FileReader, SerializedFileReader};
-use parquet::record::RowAccessor;
-use quad_tree::tree::{BitFieldQuadTree, DatalessPoint, EncodedDiffsMST, PointLike};
-//use std::error::Error;
-use std::fmt::Write as FmtWrite;
+use flate2::read::GzDecoder;
+use flate2::write::GzEncoder;
+use flate2::Compression;
+use index_stream::IndexStreamCodec;
+use matrix_io::{load_10x_with_positions, InputPosType, Platform};
+use mimalloc::MiMalloc;
+use mst_codec::{
+    encode_subarray_mst_with_metric, DatalessPoint, EncodedDiffsMST, KnnDistanceMetric,
+    MstWeightMode, Point,
+};
+use ndarray::Array2;
+use rayon::prelude::*;
+use sprs::CsMat;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
-use flate2::Compression;
-use flate2::write::GzEncoder;
-use flate2::read::GzDecoder;
-use sprs::CsMat;
-// removed unused bincode::{Encode, Decode} import
 
-use mimalloc::MiMalloc;
-use std::collections::HashMap;
-use std::io::BufRead;
+use linfa::prelude::{Fit, Predict};
+use linfa::DatasetBase;
+use linfa_clustering::KMeans;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// Simple ArrayData type to replace anndata::ArrayData
 #[derive(Clone)]
-pub struct ArrayData {
-    pub data: ArrayD<u16>,
+struct CompressionResult {
+    quantizers_requested: usize,
+    quantizers_used: usize,
+    quantizer_bins: usize,
+    total_mst_bytes: usize,
+    gzip_bytes_estimate: usize,
+    rate_bits_per_value: f64,
+    mse: f64,
+    rmse: f64,
+    cluster_sizes: Vec<usize>,
+    encoded_blocks: Vec<EncodedDiffsMST>,
+    positions: Vec<DatalessPoint>,
+    row_order: Vec<u32>,
+    gene_order: Vec<u32>,
 }
 
-impl ArrayData {
-    pub fn new(data: ArrayD<u16>) -> Self {
-        Self { data }
-    }
-    
-    pub fn shape(&self) -> &[usize] {
-        self.data.shape()
-    }
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum KnnMetricArg {
+    L0,
+    L2,
+    Hamming,
+    Jaccard,
 }
 
-// Sparse gene expression data - much more memory efficient!
-//#[derive(Clone)]
-//pub struct SparseGeneData {
-//    pub gene_indices: Vec<usize>,    // Which genes are expressed
-//    pub expression_values: Vec<u16>,  // Expression counts
-//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
-//}
-//    pub expression_values: Vec<u16>,  // Expression counts
-//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
-//}
-//    pub num_genes: usize,            // Total number of genes (for dense conversion if needed)
-//}
-
-//impl SparseGeneData {
-//    pub fn new(gene_indices: Vec<usize>, expression_values: Vec<u16>, num_genes: usize) -> Self {
-//        Self { gene_indices, expression_values, num_genes }
-//    }
-
-// Convert to dense only when needed
-//    pub fn to_dense(&self) -> Vec<u16> {
-//        let mut dense = vec![0u16; self.num_genes];
-//        for (idx, &value) in self.gene_indices.iter().zip(&self.expression_values) {
-//            dense[*idx] = value;
-//        }
-//        dense
-//    }
-//    }
-
-// Memory usage in bytes
-//    pub fn memory_usage(&self) -> usize {
-//        self.gene_indices.len() * std::mem::size_of::<usize>() +
-//        self.expression_values.len() * std::mem::size_of::<u16>() +
-//        std::mem::size_of::<usize>()
-//    }
-
-// Get expression for a specific gene
-//    pub fn get_gene_expression(&self, gene_idx: usize) -> u16 {
-//        if let Some(pos) = self.gene_indices.binary_search(&gene_idx).ok() {
-//            self.expression_values[pos]
-//        } else {
-//            0
-//        }
-//    }
-//    }
-//}
-
-// Helper function to extract numeric data from ArrayData
-fn extract_numeric_data(data: &ArrayData) -> Vec<u16> {
-    data.data.as_slice().unwrap().to_vec()
-}
-
-//use af_anndata::H5 as H52;
-
-fn read_strings_dynamic(file: &Hdf5File, path: &str) -> anyhow::Result<Vec<String>> {
-    let dataset = file.dataset(path)?;
-    let dtype = dataset.dtype()?;
-    let dsize = dtype.size();
-    
-    // Try Variable Length Unicode
-    if let Ok(v) = dataset.read_1d::<hdf5::types::VarLenUnicode>() {
-        return Ok(v.iter().map(|s| s.to_string()).collect());
-    }
-    
-    // Use the exact size match for FixedAscii to prevent truncation
-    match dsize {
-        6  => if let Ok(v) = dataset.read_1d::<FixedAscii<6>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        7  => if let Ok(v) = dataset.read_1d::<FixedAscii<7>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        11 => if let Ok(v) = dataset.read_1d::<FixedAscii<11>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        15 => if let Ok(v) = dataset.read_1d::<FixedAscii<15>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        16 => if let Ok(v) = dataset.read_1d::<FixedAscii<16>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        18 => if let Ok(v) = dataset.read_1d::<FixedAscii<18>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        21 => if let Ok(v) = dataset.read_1d::<FixedAscii<21>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        23 => if let Ok(v) = dataset.read_1d::<FixedAscii<23>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        25 => if let Ok(v) = dataset.read_1d::<FixedAscii<25>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        32 => if let Ok(v) = dataset.read_1d::<FixedAscii<32>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        64 => if let Ok(v) = dataset.read_1d::<FixedAscii<64>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        _ => {}
-    }
-    
-    // Fallback: Read as raw bytes and try to guess the length
-    let bytes = dataset.read_1d::<u8>()?.to_vec();
-    let shape = dataset.shape();
-    let num_strings = if shape.is_empty() { 0 } else { shape[0] };
-    if num_strings > 0 && bytes.len() % num_strings == 0 {
-        let len = bytes.len() / num_strings;
-        let mut strings = Vec::with_capacity(num_strings);
-        for i in 0..num_strings {
-            let start = i * len;
-            let end = start + len;
-            let s = String::from_utf8_lossy(&bytes[start..end]).trim_matches('\0').to_string();
-            strings.push(s);
-        }
-        return Ok(strings);
-    }
-    
-    anyhow::bail!("Unsupported string format for dataset: {}", path)
-}
-
-fn read_10x_features<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<Vec<String>> {
-    let file = Hdf5File::open(h5_path.as_ref())?;
-    read_strings_dynamic(&file, "matrix/features/name")
-}
-
-fn tree_from_csv<T: AsRef<Path>>(
-    file_path: T,
-    idx_x: usize,
-    idx_y: usize,
-    idx_gene_start: usize,
-    idx_gene_end: Option<usize>,
-    _method: ErrorMetric,
-    _lossless: bool,
-) -> anyhow::Result<(QuadTree, CsMat<u16>)> {
-    let mut coords = Vec::new();
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-    //let mut mind = Vec::new();
-    //let mut maxd = Vec::new();
-
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(true) // Set to true to skip the header row
-        .flexible(true) // Allow varying number of fields
-        .from_path(file_path)
-        .map_err(|e| anyhow::anyhow!("Failed to open file: {}", e))?;
-
-    // Read all records into memory
-    let records: Vec<_> = rdr
-        .records()
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| anyhow::anyhow!("Failed to read records: {}", e))?;
-
-    println!("Total records read: {}", records.len());
-
-    // Get the number of columns from the first record
-    let num_columns = records[0].len();
-    let idx_gene_end = idx_gene_end.unwrap_or(num_columns);
-    println!("num_columns: {}", num_columns);
-    let num_genes = idx_gene_end - idx_gene_start;
-    
-    // Build dense matrix first, then convert to CSR
-    use ndarray::Array2;
-    let mut dense_data = Vec::new();
-    
-    for record in &records {
-        for j in idx_gene_start..idx_gene_end {
-            let value: i16 = match record[j].parse::<f64>() {
-                Ok(v) => v as i16,
-                Err(_) => 0,
-            };
-            dense_data.push(value);
+impl From<KnnMetricArg> for KnnDistanceMetric {
+    fn from(value: KnnMetricArg) -> Self {
+        match value {
+            KnnMetricArg::L0 => KnnDistanceMetric::L0,
+            KnnMetricArg::L2 => KnnDistanceMetric::L2,
+            KnnMetricArg::Hamming => KnnDistanceMetric::Hamming,
+            KnnMetricArg::Jaccard => KnnDistanceMetric::Jaccard,
         }
     }
-    
-    let dense = Array2::from_shape_vec((records.len(), num_genes), dense_data)?;
-    let csr_i16 = CsMat::csr_from_dense(dense.view(), 0i16);
-    
-    // Convert i16 CSR to u16 CSR
-    let (rows, cols) = csr_i16.shape();
-    let (indptr, indices, data_i16) = csr_i16.into_raw_storage();
-    let data_u16: Vec<u16> = data_i16.into_iter().map(|x| x as u16).collect();
-    let csr = CsMat::new((rows, cols), indptr, indices, data_u16);
-    // Process all records
-    for row_idx in 0..records.len() {
-        let record = &records[row_idx];
-        //println!("i: {:?}", i);
-        // Read coordinates
-        let x: f64 = record[idx_x].parse().map_err(|e| {
-            anyhow::anyhow!("Failed to parse x coordinate at column {}: {}", idx_x, e)
-        })?;
-        let y: f64 = record[idx_y].parse().map_err(|e| {
-            anyhow::anyhow!("Failed to parse y coordinate at column {}: {}", idx_y, e)
-        })?;
-        xs.push(x);
-        ys.push(y);
-        //println!("x: {}, y: {}", x, y);
+}
 
-        // Read gene expression data
-        let mut cells = Vec::new();
-        for j in idx_gene_start..idx_gene_end {
-            let value: u16 = match record[j].parse::<f64>() {
-                Ok(v) => v as u16,
-                Err(_e) => 0,
-            };
-            cells.push(value);
-            // println!("cells: {:?}", cells);
-            /*
-            if mind.len() <= j - idx_gene_start {
-                mind.push(value);
-                maxd.push(value);
-            } else {
-                mind[j - idx_gene_start] = mind[j - idx_gene_start].min(value);
-                maxd[j - idx_gene_start] = maxd[j - idx_gene_start].max(value);
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum IndexCodecArg {
+    Arithmetic,
+    StreamVbyte,
+}
+
+impl From<IndexCodecArg> for IndexStreamCodec {
+    fn from(value: IndexCodecArg) -> Self {
+        match value {
+            IndexCodecArg::Arithmetic => IndexStreamCodec::Arithmetic,
+            IndexCodecArg::StreamVbyte => IndexStreamCodec::StreamVByte,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum MstWeightArg {
+    Metric,
+    EncodingCost,
+}
+
+impl From<MstWeightArg> for MstWeightMode {
+    fn from(value: MstWeightArg) -> Self {
+        match value {
+            MstWeightArg::Metric => MstWeightMode::Metric,
+            MstWeightArg::EncodingCost => MstWeightMode::EncodingCost,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SweepMetric {
+    quantizers_requested: usize,
+    quantizers_used: usize,
+    gzip_bytes_estimate: usize,
+    rate_bits_per_value: f64,
+    mse: f64,
+    rmse: f64,
+}
+
+fn normalize_quantizer_counts(selected: usize, sweep: &[usize]) -> Vec<usize> {
+    let selected = selected.max(1);
+    let mut counts = Vec::new();
+
+    if sweep.is_empty() {
+        counts.push(selected);
+        return counts;
+    }
+
+    for &value in sweep {
+        let normalized = value.max(1);
+        if !counts.contains(&normalized) {
+            counts.push(normalized);
+        }
+    }
+
+    if !counts.contains(&selected) {
+        counts.push(selected);
+    }
+
+    counts
+}
+
+fn build_cell_features(
+    points: &[Point],
+    data: &CsMat<u16>,
+    feature_dims: usize,
+) -> anyhow::Result<Array2<f64>> {
+    let feature_dims = feature_dims.max(8);
+    let mut features = Array2::<f64>::zeros((points.len(), feature_dims));
+
+    for (point_idx, point) in points.iter().enumerate() {
+        let row = data
+            .outer_view(point.row_index)
+            .ok_or_else(|| anyhow::anyhow!("Missing CSR row {}", point.row_index))?;
+        for (gene_idx, &value) in row.iter() {
+            let bucket = gene_idx % feature_dims;
+            features[(point_idx, bucket)] += (value as f64).ln_1p();
+        }
+    }
+
+    for row_idx in 0..features.nrows() {
+        let mut norm_sq = 0.0;
+        for col_idx in 0..features.ncols() {
+            let v = features[(row_idx, col_idx)];
+            norm_sq += v * v;
+        }
+        let norm = norm_sq.sqrt();
+        if norm > 0.0 {
+            for col_idx in 0..features.ncols() {
+                features[(row_idx, col_idx)] /= norm;
             }
-            */
         }
-        coords.push(Point::new(x, y, row_idx));
     }
 
-    let minx = xs.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    let miny = ys.iter().cloned().fold(f64::INFINITY, f64::min) - 1.0;
-    let maxx = xs.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
-    let maxy = ys.iter().cloned().fold(f64::NEG_INFINITY, f64::max) + 1.0;
-    let w = maxx - minx;
-    let h = maxy - miny;
-
-    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0);
-
-     // Divide the quadtree
-    qtree.divide_recursive(&csr);
-    
-    Ok((qtree, csr))
+    Ok(features)
 }
 
-/* 
-fn read_parquet_file(file_path: &str) -> Result<(), ParquetError> { 
-    let file = File::open(Path::new(file_path))?; 
-    let reader = SerializedFileReader::new(file)?;  
-    let data = reader.read_all()?;
-    return reader;
-}*/
+fn cluster_cells_with_kmeans(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let nrows = features.nrows();
+    if nrows == 0 {
+        return Ok(Vec::new());
+    }
 
-fn tree_from_10x<T: AsRef<Path>>(
-    h5_path: T,
-    pos_path: T,
-    pos_type: InputPosType,
-    _file_type: InputDataType,
-    pos_x_col: usize,
-    pos_y_col: usize,
-    _method: ErrorMetric,
-    _lossless: bool,
-) -> anyhow::Result<(QuadTree, CsMat<u16>)> {
-    // Read features from 10x HDF5 file
-    println!(
-        "Reading features from HDF5 file: {}",
-        h5_path.as_ref().display()
-    );
-    let features = read_10x_features(&h5_path)?;
-    println!(
-        "Found {} features: {:?}",
-        features.len(),
-        &features[..features.len().min(5)]
-    ); // Show first 5 features
+    let k = num_clusters.max(1).min(nrows);
+    let dataset = DatasetBase::from(features.clone());
+    let model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?;
 
-    // Read all feature information
-    let file = Hdf5File::open(h5_path.as_ref())?;
+    Ok(model.predict(&dataset).to_vec())
+}
 
-    // Check if matrix group exists
-    let matrix_group = match file.group("matrix") {
-        Ok(g) => g,
-        Err(_) => return Err(anyhow::anyhow!("No 'matrix' group; use molecule_info path")),
+fn group_points_by_cluster(assignments: &[usize], num_clusters: usize) -> Vec<Vec<usize>> {
+    let mut clusters = vec![Vec::new(); num_clusters];
+    for (point_idx, &cluster_id) in assignments.iter().enumerate() {
+        if cluster_id < num_clusters {
+            clusters[cluster_id].push(point_idx);
+        }
+    }
+    clusters.retain(|cluster| !cluster.is_empty());
+    clusters
+}
+
+fn slice_feature_rows(features: &Array2<f64>, row_ids: &[usize]) -> Array2<f64> {
+    let mut sliced = Array2::<f64>::zeros((row_ids.len(), features.ncols()));
+    for (dst_row, &src_row) in row_ids.iter().enumerate() {
+        for col in 0..features.ncols() {
+            sliced[(dst_row, col)] = features[(src_row, col)];
+        }
+    }
+    sliced
+}
+
+fn split_oversized_clusters(
+    initial_clusters: Vec<Vec<usize>>,
+    features: &Array2<f64>,
+    max_cluster_size: Option<usize>,
+) -> anyhow::Result<Vec<Vec<usize>>> {
+    let Some(max_cluster_size_raw) = max_cluster_size else {
+        return Ok(initial_clusters);
     };
+    let max_cluster_size = max_cluster_size_raw.max(1);
 
-    // Read gene names (dynamic)
-    let gene_names = read_strings_dynamic(&file, "matrix/features/name")?;
+    let mut pending = initial_clusters;
+    let mut final_clusters = Vec::new();
 
-    // Read gene IDs (dynamic) - tolerant of missing dataset
-    let gene_ids = read_strings_dynamic(&file, "matrix/features/id").unwrap_or_else(|_| vec!["".to_string(); gene_names.len()]);
-
-    // Read feature types (dynamic) - tolerant of missing dataset
-    let feature_types = read_strings_dynamic(&file, "matrix/features/feature_type").unwrap_or_else(|_| vec!["".to_string(); gene_names.len()]);
-
-    // Read genome references (dynamic) - tolerant of missing dataset
-    let genomes = read_strings_dynamic(&file, "matrix/features/genome").unwrap_or_else(|_| vec!["".to_string(); gene_names.len()]);
-
-    println!("Gene names: {:?}", &gene_names[..5]);
-    println!("Gene IDs: {:?}", &gene_ids[..5]);
-    println!("Feature types: {:?}", &feature_types[..5]);
-    println!("Genomes: {:?}", &genomes[..5]);
-
-    // Read the shape of the matrix
-    let shape_dataset = matrix_group.dataset("shape")?;
-    let shape_array = shape_dataset.read_1d::<usize>()?;
-    let shape: Vec<usize> = shape_array.to_vec();
-    let num_features = shape[0];
-    let num_cells = shape[1];
-
-    println!(
-        "Matrix shape: {} cells x {} features",
-        num_cells, num_features
-    );
-
-    //TODO: read from h5ad file need to be a function by itself
-    // Read the sparse matrix components
-    let data_dataset = matrix_group.dataset("data")?;
-    let indices_dataset = matrix_group.dataset("indices")?;
-    let indptr_dataset = matrix_group.dataset("indptr")?;
-    let _barcodes_dataset = matrix_group.dataset("barcodes")?;
-
-    let data_array = data_dataset.read_1d::<u16>()?;
-    // Use array directly instead of converting to Vec to avoid ownership issues
-    let data_slice = data_array.as_slice().unwrap();
-    let indices_array = indices_dataset.read_1d::<usize>()?;
-    let indices: Vec<usize> = indices_array.to_vec();
-    let indptr_array = indptr_dataset.read_1d::<usize>()?;
-    let indptr: Vec<usize> = indptr_array.to_vec();
-
-    info!("Sparse matrix data: {} non-zero elements", data_slice.len());
-    // Build CSR matrix
-    let csr: CsMat<u16> = CsMat::new(
-        (num_cells, num_features),
-        indptr.clone(),
-        indices.clone(),
-        data_slice.to_vec(),
-    );
-    let pos_file = std::fs::File::open(pos_path.as_ref()).unwrap();
-    let mut coords = Vec::new();
-    let mut xs = Vec::new();
-    let mut ys = Vec::new();
-
-    // Pre-allocate vectors with capacity
-    coords.reserve(num_cells);
-    xs.reserve(num_cells);
-    ys.reserve(num_cells);
-
-    // Read all barcodes from HDF5 (dynamic)
-    let barcodes = read_strings_dynamic(&file, "matrix/barcodes")?;
-
-    // Build a map from barcode -> (x, y) from the positions file
-    use std::collections::HashMap;
-    let mut pos_map: HashMap<String, (f64, f64)> = HashMap::with_capacity(num_cells);
-
-    match pos_type {
-        InputPosType::Csv => {
-            // Visium tissue_positions_list.csv has no header and columns:
-            // [barcode, in_tissue, array_row, array_col, pxl_col_in_fullres, pxl_row_in_fullres]
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(true)
-                .has_headers(false)
-                .from_reader(pos_file);
-            for rec in rdr.records() {
-                let rec = rec?;
-                if rec.len() <= pos_y_col {
-                    return Err(anyhow::anyhow!(
-                        "Invalid number of columns in positions file"
-                    ));
-                }
-                let bc = rec.get(0).unwrap().to_string();
-                let x_str = rec
-                    .get(pos_x_col)
-                    .ok_or_else(|| anyhow::anyhow!("Missing x column {}", pos_x_col))?;
-                let y_str = rec
-                    .get(pos_y_col)
-                    .ok_or_else(|| anyhow::anyhow!("Missing y column {}", pos_y_col))?;
-                let x: f64 = x_str.parse()?;
-                let y: f64 = y_str.parse()?;
-                pos_map.insert(bc, (x, y));
-            }
-        }
-        InputPosType::Parquet => {
-            let reader = SerializedFileReader::new(pos_file).unwrap();
-            let mut iter = reader.get_row_iter(None).unwrap();
-            while let Some(Ok(parquet_row)) = iter.next() {
-                let bc = parquet_row.get_string(0).unwrap().to_string();
-                //println!("x: {}", pos_x_col);
-                let x = parquet_row.get_double(pos_x_col).unwrap();
-                let y = parquet_row.get_double(pos_y_col).unwrap();
-                pos_map.insert(bc, (x, y));
-            }
-        }
-    }
-
-    // Walk HDF5 barcodes in order and look up positions by barcode
-    for row_idx in 0..num_cells {
-        let barcode = &barcodes[row_idx];
-        let (x_coord, y_coord) = pos_map.get(barcode).copied().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing position for HDF5 barcode '{}' at row {} in positions file",
-                barcode,
-                row_idx
-            )
-        })?;
-
-        xs.push(x_coord);
-        ys.push(y_coord);
-
-        // Extract gene expression data for this cell from the sparse matrix
-        let start_idx = indptr[row_idx];
-        let end_idx = indptr[row_idx + 1];
-
-        // Create sparse representation - only store non-zero values
-        let mut gene_indices = Vec::new();
-        let mut expression_values = Vec::new();
-        for i in start_idx..end_idx {
-            let gene_idx = indices[i];
-            let expression_value = data_slice[i];
-            if expression_value > 0 {
-                gene_indices.push(gene_idx);
-                expression_values.push(expression_value);
-            }
-        }
-
-        // let sparse_data = SparseGeneData::new(gene_indices, expression_values, num_features);
-        /*
-        if row_idx < 5 {
-            let dense_memory = num_features * std::mem::size_of::<u16>();
-            let sparse_memory = sparse_data.memory_usage();
-            println!(
-                "Cell {}: Dense={} bytes, Sparse={} bytes, Savings={:.1}%",
-                row_idx,
-                dense_memory,
-                sparse_memory,
-                (1.0 - sparse_memory as f64 / dense_memory as f64) * 100.0
-            );
-        }
-        */
-      //  let array_data = ArrayData::new(csr.row(row_idx));
-
-        coords.push(Point::new(x_coord, y_coord, row_idx));
-    }
-
-    info!("num_rows: {}", num_cells);
-
-    let minx = xs.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0; // |a, &b| pattern matching, does not need clone() 
-    let miny = ys.iter().fold(f64::INFINITY, |a, &b| a.min(b)) - 1.0;
-    let maxx = xs.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
-    let maxy = ys.iter().fold(f64::NEG_INFINITY, |a, &b| a.max(b)) + 1.0;
-    let w = maxx - minx;
-    let h = maxy - miny;
-
-    let domain = Rect::new(minx + w / 2.0_f64, miny + h / 2.0_f64, w, h);
-    let mut qtree = QuadTree::new(domain, coords, 0);
-
-    // Divide the quadtree
-    qtree.divide_recursive(&csr);
-    
-    Ok((qtree, csr))
-}
-
-/// Read cluster assignments from a file where each line contains cell IDs separated by semicolons
-fn read_cluster_file_semicolon<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<String>>> {
-    let file = File::open(cluster_path)?;
-    let reader = BufReader::new(file);
-    
-    let mut clusters = Vec::new();
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        let cell_ids: Vec<String> = line
-            .split(';')
-            .map(|s| s.trim().trim_matches('"').trim().to_string())  // Strip quotes and whitespace
-            .filter(|s| !s.is_empty())
-            .collect();
-        
-        if !cell_ids.is_empty() {
-            info!("Cluster {}: {} cells", line_num, cell_ids.len());
-            clusters.push(cell_ids);
-        }
-    }
-    
-    info!("Total clusters loaded: {}", clusters.len());
-    Ok(clusters)
-}
-
-/// Read cluster assignments from a two-column file (cell_id, cluster_id)
-fn read_cluster_file_two_column<T: AsRef<Path>>(cluster_path: T) -> anyhow::Result<Vec<Vec<String>>> {
-    let file = File::open(cluster_path)?;
-    let reader = BufReader::new(file);
-    
-    // Use a HashMap to group cells by cluster ID
-    let mut cluster_map: HashMap<String, Vec<String>> = HashMap::new();
-    let mut first_line = true;
-    
-    for (line_num, line) in reader.lines().enumerate() {
-        let line = line?;
-        let line = line.trim();
-        
-        // Skip empty lines
-        if line.is_empty() {
+    while let Some(cluster) = pending.pop() {
+        if cluster.len() <= max_cluster_size {
+            final_clusters.push(cluster);
             continue;
         }
-        
-        // Skip header line if it looks like a header
-        if first_line {
-            first_line = false;
-            // Check if this looks like a header (contains "Barcode" or "Cluster" etc.)
-            let lower = line.to_lowercase();
-            if lower.contains("barcode") || lower.contains("cell") || 
-               (lower.contains("cluster") && !line.chars().next().unwrap_or('0').is_numeric()) {
-                info!("Skipping header line: {}", line);
+
+        let split_k = ((cluster.len() + max_cluster_size - 1) / max_cluster_size)
+            .max(2)
+            .min(cluster.len());
+
+        info!(
+            "Re-clustering oversized cluster: size={} target_subclusters={} max_cluster_size={}",
+            cluster.len(),
+            split_k,
+            max_cluster_size
+        );
+
+        let subfeatures = slice_feature_rows(features, &cluster);
+        let sub_assignments = match cluster_cells_with_kmeans(&subfeatures, split_k) {
+            Ok(a) => a,
+            Err(err) => {
+                warn!(
+                    "Sub-clustering failed ({}). Falling back to deterministic chunk split.",
+                    err
+                );
+                let mut offset = 0usize;
+                while offset < cluster.len() {
+                    let end = (offset + max_cluster_size).min(cluster.len());
+                    final_clusters.push(cluster[offset..end].to_vec());
+                    offset = end;
+                }
                 continue;
             }
-        }
-        
-        // Try splitting by comma first (CSV format), then fall back to whitespace
-        let parts: Vec<&str> = if line.contains(',') {
-            line.split(',').collect()
-        } else {
-            line.split_whitespace().collect()
         };
-        
-        if parts.len() < 2 {
-            warn!("Line {}: Expected 2 columns, found {}. Skipping.", line_num + 1, parts.len());
+
+        let local_clusters = group_points_by_cluster(&sub_assignments, split_k);
+        let max_local_size = local_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
+        if local_clusters.len() <= 1 || max_local_size == cluster.len() {
+            warn!(
+                "Sub-clustering made no progress (size={}): using deterministic chunk split.",
+                cluster.len()
+            );
+            let mut offset = 0usize;
+            while offset < cluster.len() {
+                let end = (offset + max_cluster_size).min(cluster.len());
+                final_clusters.push(cluster[offset..end].to_vec());
+                offset = end;
+            }
             continue;
         }
-        
-        // First column: cell ID, second column: cluster ID
-        let cell_id = parts[0].trim().trim_matches('"').to_string();
-        let cluster_id = parts[1].trim().trim_matches('"').to_string();
-        
-        cluster_map.entry(cluster_id).or_insert_with(Vec::new).push(cell_id);
+
+        for local_cluster in local_clusters {
+            let mapped: Vec<usize> = local_cluster
+                .into_iter()
+                .map(|local_idx| cluster[local_idx])
+                .collect();
+            if mapped.len() > max_cluster_size {
+                pending.push(mapped);
+            } else {
+                final_clusters.push(mapped);
+            }
+        }
     }
-    
-    // Convert HashMap to Vec<Vec<String>> sorted by cluster ID
-    let mut cluster_ids: Vec<String> = cluster_map.keys().cloned().collect();
-    cluster_ids.sort();
-    
-    let mut clusters = Vec::new();
-    for cluster_id in cluster_ids {
-        let cell_ids = cluster_map.remove(&cluster_id).unwrap();
-        info!("Cluster '{}': {} cells", cluster_id, cell_ids.len());
-        clusters.push(cell_ids);
-    }
-    
-    info!("Total clusters loaded: {}", clusters.len());
-    Ok(clusters)
+
+    final_clusters.sort_unstable_by_key(|cluster| cluster[0]);
+    Ok(final_clusters)
 }
 
-/// Encode clusters from HDF5 data
-fn encode_clusters_from_h5<T: AsRef<Path>>(
-    h5_path: T,
-    pos_path: T,
-    cluster_path: T,
-    pos_type: InputPosType,
-    cluster_format: ClusterFormat,
-    pos_x_col: usize,
-    pos_y_col: usize,
-) -> anyhow::Result<Vec<(EncodedDiffsMST, Vec<DatalessPoint>)>> {
-    info!("Loading HDF5 data from: {}", h5_path.as_ref().display());
-    
-    // Read features from HDF5
-    let file = Hdf5File::open(h5_path.as_ref())?;
-    let matrix_group = file.group("matrix")?;
-    
-    // Read matrix shape
-    let shape_dataset = matrix_group.dataset("shape")?;
-    let shape_array = shape_dataset.read_1d::<usize>()?;
-    let shape: Vec<usize> = shape_array.to_vec();
-    let num_features = shape[0];
-    let num_cells = shape[1];
-    
-    info!("Matrix shape: {} cells x {} features", num_cells, num_features);
-    
-    // Read sparse matrix components
-    let data_dataset = matrix_group.dataset("data")?;
-    let indices_dataset = matrix_group.dataset("indices")?;
-    let indptr_dataset = matrix_group.dataset("indptr")?;
-    let barcodes_dataset = matrix_group.dataset("barcodes")?;
-    
-    let data_array = data_dataset.read_1d::<u16>()?;
-    let data_slice = data_array.as_slice().unwrap();
-    let indices_array = indices_dataset.read_1d::<usize>()?;
-    let indices: Vec<usize> = indices_array.to_vec();
-    let indptr_array = indptr_dataset.read_1d::<usize>()?;
-    let indptr: Vec<usize> = indptr_array.to_vec();
-    
-    // Build CSR matrix
-    let csr: CsMat<u16> = CsMat::new(
-        (num_cells, num_features),
-        indptr.clone(),
-        indices.clone(),
-        data_slice.to_vec(),
-    );
-    
-    // Read barcodes and create barcode -> row index map (needed for two-column format)
-    let barcodes_arr = barcodes_dataset.read_1d::<FixedAscii<23>>()?;
-    let barcodes: Vec<String> = barcodes_arr
-        .iter()
-        .map(|b| b.as_str().trim_end_matches('\0').to_string())
+fn projection_weight(col: usize, seed: u64) -> f64 {
+    let mut z = (col as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seed);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    let unit = (z as f64) / (u64::MAX as f64);
+    (unit * 2.0) - 1.0
+}
+
+fn reorder_rows_within_clusters(
+    clusters: &[Vec<usize>],
+    features: &Array2<f64>,
+) -> Vec<Vec<usize>> {
+    let ncols = features.ncols();
+    let w1: Vec<f64> = (0..ncols)
+        .map(|c| projection_weight(c, 0x1234_5678_9ABC_DEF0))
         .collect();
-    
-    let barcode_to_idx: HashMap<String, usize> = barcodes
-        .iter()
-        .enumerate()
-        .map(|(idx, bc)| (bc.clone(), idx))
+    let w2: Vec<f64> = (0..ncols)
+        .map(|c| projection_weight(c, 0x0FED_CBA9_8765_4321))
         .collect();
-    
-    // Read position data into a map indexed by row number
-    let pos_file = File::open(pos_path.as_ref())?;
-    let mut pos_map: HashMap<usize, (f64, f64)> = HashMap::with_capacity(num_cells);
-    
-    match pos_type {
-        InputPosType::Csv => {
-            let mut rdr = csv::ReaderBuilder::new()
-                .has_headers(false)
-                .from_reader(pos_file);
-            for (row_idx, rec) in rdr.records().enumerate() {
-                let rec = rec?;
-                let x: f64 = rec.get(pos_x_col).ok_or_else(|| anyhow::anyhow!("Missing x column"))?.parse()?;
-                let y: f64 = rec.get(pos_y_col).ok_or_else(|| anyhow::anyhow!("Missing y column"))?.parse()?;
-                pos_map.insert(row_idx, (x, y));
+
+    clusters
+        .par_iter()
+        .map(|cluster| {
+            let mut scored = Vec::with_capacity(cluster.len());
+            for &point_idx in cluster {
+                let mut p1 = 0.0f64;
+                let mut p2 = 0.0f64;
+                for col in 0..ncols {
+                    let v = features[(point_idx, col)];
+                    p1 += v * w1[col];
+                    p2 += v * w2[col];
+                }
+                scored.push((point_idx, p1, p2));
             }
-        }
-        InputPosType::Parquet => {
-            let reader = SerializedFileReader::new(pos_file)?;
-            let mut iter = reader.get_row_iter(None)?;
-            let mut row_idx = 0;
-            while let Some(Ok(parquet_row)) = iter.next() {
-                let x = parquet_row.get_double(pos_x_col)
-                    .map_err(|e| anyhow::anyhow!("Failed to read x: {}", e))?;
-                let y = parquet_row.get_double(pos_y_col)
-                    .map_err(|e| anyhow::anyhow!("Failed to read y: {}", e))?;
-                pos_map.insert(row_idx, (x, y));
-                row_idx += 1;
+
+            scored.sort_unstable_by(|a, b| {
+                a.1.total_cmp(&b.1)
+                    .then_with(|| a.2.total_cmp(&b.2))
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            scored.into_iter().map(|(idx, _, _)| idx).collect()
+        })
+        .collect()
+}
+
+fn compute_gene_permutation_from_row_stream(
+    points: &[Point],
+    data: &CsMat<u16>,
+    row_stream_point_indices: &[usize],
+) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
+    let ncols = data.cols();
+    let mut counts = vec![0u64; ncols];
+    let mut sum_positions = vec![0u128; ncols];
+    let mut sig_a = vec![0f64; ncols];
+    let mut sig_b = vec![0f64; ncols];
+    let mut sig_c = vec![0f64; ncols];
+    let mut sig_d = vec![0f64; ncols];
+
+    for (stream_pos, &point_idx) in row_stream_point_indices.iter().enumerate() {
+        let point = points
+            .get(point_idx)
+            .ok_or_else(|| anyhow::anyhow!("Invalid point index in row stream: {}", point_idx))?;
+
+        let pa = projection_weight(stream_pos, 0xA5A5_A5A5_A5A5_A5A5);
+        let pb = projection_weight(stream_pos, 0xC3C3_C3C3_C3C3_C3C3);
+        let pc = projection_weight(stream_pos, 0x5A5A_5A5A_5A5A_5A5A);
+        let pd = projection_weight(stream_pos, 0x3C3C_3C3C_3C3C_3C3C);
+
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value == 0 {
+                    continue;
+                }
+                counts[gene_idx] += 1;
+                sum_positions[gene_idx] += stream_pos as u128;
+                sig_a[gene_idx] += pa;
+                sig_b[gene_idx] += pb;
+                sig_c[gene_idx] += pc;
+                sig_d[gene_idx] += pd;
             }
         }
     }
-    
-    // Read cluster assignments based on format
-    let clusters = match cluster_format {
-        ClusterFormat::Semicolon => read_cluster_file_semicolon(cluster_path)?,
-        ClusterFormat::TwoColumn => read_cluster_file_two_column(cluster_path)?,
+
+    let mut new_to_old: Vec<usize> = (0..ncols).collect();
+    new_to_old.sort_unstable_by(|&ga, &gb| {
+        let ca = counts[ga];
+        let cb = counts[gb];
+        match (ca == 0, cb == 0) {
+            (true, true) => ga.cmp(&gb),
+            (true, false) => std::cmp::Ordering::Greater,
+            (false, true) => std::cmp::Ordering::Less,
+            (false, false) => {
+                let na1 = sig_a[ga] / ca as f64;
+                let nb1 = sig_a[gb] / cb as f64;
+                let na2 = sig_b[ga] / ca as f64;
+                let nb2 = sig_b[gb] / cb as f64;
+                let na3 = sig_c[ga] / ca as f64;
+                let nb3 = sig_c[gb] / cb as f64;
+                let na4 = sig_d[ga] / ca as f64;
+                let nb4 = sig_d[gb] / cb as f64;
+                let left = sum_positions[ga].saturating_mul(cb as u128);
+                let right = sum_positions[gb].saturating_mul(ca as u128);
+                na1.total_cmp(&nb1)
+                    .then_with(|| na2.total_cmp(&nb2))
+                    .then_with(|| na3.total_cmp(&nb3))
+                    .then_with(|| na4.total_cmp(&nb4))
+                    .then_with(|| left.cmp(&right))
+                    .then_with(|| cb.cmp(&ca))
+                    .then_with(|| ga.cmp(&gb))
+            }
+        }
+    });
+
+    let mut old_to_new = vec![0u32; ncols];
+    for (new_idx, &old_idx) in new_to_old.iter().enumerate() {
+        old_to_new[old_idx] = new_idx as u32;
+    }
+
+    Ok((
+        new_to_old.into_iter().map(|g| g as u32).collect(),
+        old_to_new,
+    ))
+}
+
+fn downsample_values(values: &[u16], max_values: usize) -> Vec<u16> {
+    if values.len() <= max_values {
+        return values.to_vec();
+    }
+    let step = ((values.len() as f64) / (max_values as f64)).ceil() as usize;
+    values.iter().step_by(step.max(1)).copied().collect()
+}
+
+fn nearest_center(value: u16, centers: &[u16]) -> u16 {
+    let mut best = centers[0];
+    let mut best_dist = value.abs_diff(best);
+    for &center in centers.iter().skip(1) {
+        let dist = value.abs_diff(center);
+        if dist < best_dist {
+            best = center;
+            best_dist = dist;
+        }
+    }
+    best
+}
+
+fn train_quantizer_with_kmeans(values: &[u16], bins: usize) -> anyhow::Result<Vec<u16>> {
+    if values.is_empty() {
+        return Ok(vec![0]);
+    }
+
+    let mut unique = values.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+
+    let capped_bins = bins.max(1).min(unique.len());
+    if capped_bins == unique.len() {
+        return Ok(unique);
+    }
+
+    let sampled = downsample_values(values, 200_000);
+    let mut samples = Array2::<f64>::zeros((sampled.len(), 1));
+    for (i, &value) in sampled.iter().enumerate() {
+        samples[(i, 0)] = value as f64;
+    }
+
+    let dataset = DatasetBase::from(samples);
+    let model = KMeans::params(capped_bins)
+        .max_n_iterations(40)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("k-means quantizer training failed: {}", e))?;
+
+    let mut centers: Vec<u16> = model
+        .centroids()
+        .column(0)
+        .iter()
+        .map(|&c| c.round().clamp(0.0, u16::MAX as f64) as u16)
+        .collect();
+
+    centers.sort_unstable();
+    centers.dedup();
+    if centers.is_empty() {
+        centers.push(0);
+    }
+
+    Ok(centers)
+}
+
+fn quantize_matrix_by_cluster(
+    data: &CsMat<u16>,
+    points: &[Point],
+    cluster_assignments: &[usize],
+    num_clusters: usize,
+    bins: usize,
+) -> anyhow::Result<CsMat<u16>> {
+    let mut row_to_cluster = vec![usize::MAX; data.rows()];
+    for (point_idx, point) in points.iter().enumerate() {
+        let cluster_id = *cluster_assignments
+            .get(point_idx)
+            .ok_or_else(|| anyhow::anyhow!("Missing cluster assignment for point {}", point_idx))?;
+        if cluster_id >= num_clusters {
+            anyhow::bail!(
+                "Invalid cluster assignment {} for point {}",
+                cluster_id,
+                point_idx
+            );
+        }
+        row_to_cluster[point.row_index] = cluster_id;
+    }
+
+    let indptr_binding = data.indptr();
+    let indptr = indptr_binding.raw_storage();
+    let indices = data.indices().to_vec();
+    let values = data.data();
+
+    let mut values_by_cluster: Vec<Vec<u16>> = vec![Vec::new(); num_clusters];
+    for row_idx in 0..data.rows() {
+        let cluster_id = row_to_cluster[row_idx];
+        if cluster_id == usize::MAX {
+            continue;
+        }
+        for pos in indptr[row_idx]..indptr[row_idx + 1] {
+            values_by_cluster[cluster_id].push(values[pos]);
+        }
+    }
+
+    let mut quantizers = Vec::with_capacity(num_clusters);
+    for cluster_values in &values_by_cluster {
+        quantizers.push(train_quantizer_with_kmeans(cluster_values, bins)?);
+    }
+
+    let mut quantized_values = values.to_vec();
+    for row_idx in 0..data.rows() {
+        let cluster_id = row_to_cluster[row_idx];
+        if cluster_id == usize::MAX {
+            continue;
+        }
+        let centers = &quantizers[cluster_id];
+        for pos in indptr[row_idx]..indptr[row_idx + 1] {
+            quantized_values[pos] = nearest_center(quantized_values[pos], centers);
+        }
+    }
+
+    Ok(CsMat::new(
+        (data.rows(), data.cols()),
+        indptr.to_vec(),
+        indices,
+        quantized_values,
+    ))
+}
+
+fn sparse_quantization_sse(original: &CsMat<u16>, quantized: &CsMat<u16>) -> anyhow::Result<f64> {
+    if original.shape() != quantized.shape() {
+        anyhow::bail!("Shape mismatch between original and quantized matrix");
+    }
+    if original.nnz() != quantized.nnz() {
+        anyhow::bail!("NNZ mismatch between original and quantized matrix");
+    }
+
+    let sse = original
+        .data()
+        .iter()
+        .zip(quantized.data().iter())
+        .map(|(&orig, &quant)| {
+            let diff = orig as f64 - quant as f64;
+            diff * diff
+        })
+        .sum();
+
+    Ok(sse)
+}
+
+fn estimate_gzip_payload_size(
+    encoded_blocks: &[EncodedDiffsMST],
+    positions: &[DatalessPoint],
+    row_order: &[u32],
+    gene_order: &[u32],
+) -> anyhow::Result<usize> {
+    let config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    bincode::encode_into_std_write(encoded_blocks, &mut encoder, config)?;
+    bincode::encode_into_std_write(positions, &mut encoder, config)?;
+    bincode::encode_into_std_write(row_order, &mut encoder, config)?;
+    bincode::encode_into_std_write(gene_order, &mut encoder, config)?;
+    Ok(encoder.finish()?.len())
+}
+
+fn run_clustered_compression(
+    points: &[Point],
+    data: &CsMat<u16>,
+    quantizers_requested: usize,
+    quantizer_bins: usize,
+    quantize_values: bool,
+    verify_lossless: bool,
+    max_cluster_size: Option<usize>,
+    knn_metric: KnnDistanceMetric,
+    mst_weight_mode: MstWeightMode,
+    index_codec: IndexStreamCodec,
+    full_row_fallback_ratio: Option<f32>,
+) -> anyhow::Result<CompressionResult> {
+    if points.is_empty() {
+        anyhow::bail!("Cannot encode empty point set");
+    }
+
+    let requested_clusters = quantizers_requested.max(1).min(points.len());
+    let features = build_cell_features(points, data, 24)?;
+    let assignments = match cluster_cells_with_kmeans(&features, requested_clusters) {
+        Ok(a) => a,
+        Err(err) => {
+            warn!(
+                "Cell clustering failed ({}). Falling back to round-robin assignment.",
+                err
+            );
+            (0..points.len())
+                .map(|idx| idx % requested_clusters)
+                .collect::<Vec<_>>()
+        }
     };
-    
-    // Encode each cluster
-    let mut encoded_clusters = Vec::new();
-    
-    for (cluster_idx, cell_ids) in clusters.iter().enumerate() {
-        info!("Encoding cluster {} with {} cells", cluster_idx, cell_ids.len());
-        if cell_ids.len() == 1 {
-            info!("this cellid {} is a single cell cluster", cell_ids[0]);
-        }
-        
-        // Build Point vector for this cluster
-        let mut points = Vec::new();
-        let mut positions = Vec::new();
-        
-        for cell_id_str in cell_ids {
-            // For two-column format, try barcode lookup first, then fall back to row index
-            // For semicolon format, always parse as row index
-            let row_idx_opt = if matches!(cluster_format, ClusterFormat::TwoColumn) {
-                // Try as barcode first
-                barcode_to_idx.get(cell_id_str).copied()
-                    .or_else(|| {
-                        // Fall back to parsing as row index
-                        cell_id_str.parse::<usize>().ok()
-                    })
-            } else {
-                // Semicolon format: always parse as row index
-                cell_id_str.parse::<usize>().ok()
-            };
-            
-            match row_idx_opt {
-                Some(row_idx) => {
-                    // Check if row index is valid
-                    if row_idx >= num_cells {
-                        warn!("Cell '{}' maps to row index {} which is out of bounds (max: {})", 
-                              cell_id_str, row_idx, num_cells - 1);
-                        continue;
-                    }
-                    
-                    // Look up position by row index
-                    if let Some(&(x, y)) = pos_map.get(&row_idx) {
-                        points.push(Point::new(x, y, row_idx));
-                        positions.push(DatalessPoint::new(x, y));
-                    } else {
-                        warn!("Cell '{}' (row {}) not found in position data", cell_id_str, row_idx);
-                    }
-                }
-                None => {
-                    warn!("Cell ID '{}' not found as barcode and cannot be parsed as row index", cell_id_str);
-                }
-            }
-        }
-        
-        // Encode this cluster
-        if let Some((encoded, dfs_order, _)) = quad_tree::tree::encode_subarray_mst(&points, &csr, 0) {
-            info!("Cluster {} encoded: {} bytes", cluster_idx, encoded.bytes());
-            // Reorder positions to match DFS order
-            let reordered_positions: Vec<DatalessPoint> = dfs_order.iter()
-                .map(|&idx| positions[idx as usize].clone())
-                .collect();
-            encoded_clusters.push((encoded, reordered_positions));
-        } else {
-            warn!("Failed to encode cluster {}", cluster_idx);
+
+    let initial_quantizers_used = assignments
+        .iter()
+        .copied()
+        .max()
+        .map(|m| m + 1)
+        .unwrap_or(1);
+
+    let initial_clusters = group_points_by_cluster(&assignments, initial_quantizers_used);
+    let initial_max = initial_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
+    let clusters = split_oversized_clusters(initial_clusters, &features, max_cluster_size)?;
+    let clusters = reorder_rows_within_clusters(&clusters, &features);
+    let final_max = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
+
+    info!(
+        "Cluster layout: requested={} initial={} final={} largest_initial={} largest_final={} max_cluster_size={:?}",
+        quantizers_requested,
+        initial_quantizers_used,
+        clusters.len(),
+        initial_max,
+        final_max,
+        max_cluster_size
+    );
+
+    let mut refined_assignments = vec![usize::MAX; points.len()];
+    for (cluster_id, cluster) in clusters.iter().enumerate() {
+        for &point_idx in cluster {
+            refined_assignments[point_idx] = cluster_id;
         }
     }
-    
-    Ok(encoded_clusters)
+    if refined_assignments.iter().any(|&x| x == usize::MAX) {
+        anyhow::bail!("Internal error: some points were not assigned to a final cluster");
+    }
+
+    let quantized_data = if quantize_values {
+        quantize_matrix_by_cluster(
+            data,
+            points,
+            &refined_assignments,
+            clusters.len(),
+            quantizer_bins,
+        )?
+    } else {
+        data.clone()
+    };
+
+    let row_stream_point_indices: Vec<usize> = clusters
+        .iter()
+        .flat_map(|cluster| cluster.iter().copied())
+        .collect();
+    if row_stream_point_indices.len() != points.len() {
+        anyhow::bail!(
+            "Internal error: row stream covers {} points, expected {}",
+            row_stream_point_indices.len(),
+            points.len()
+        );
+    }
+
+    let (gene_order, gene_old_to_new) = compute_gene_permutation_from_row_stream(
+        points,
+        &quantized_data,
+        &row_stream_point_indices,
+    )?;
+
+    let mut encoded_blocks = Vec::new();
+    let mut positions = Vec::new();
+    let mut row_order = Vec::new();
+    let mut cluster_sizes = Vec::new();
+    let mut total_mst_bytes = 0usize;
+
+    let cluster_results: Vec<
+        anyhow::Result<
+            Option<(
+                usize,
+                EncodedDiffsMST,
+                Vec<DatalessPoint>,
+                Vec<u32>,
+                usize,
+                usize,
+            )>,
+        >,
+    > = clusters
+        .par_iter()
+        .enumerate()
+        .map(|(cluster_idx, cluster)| {
+            if cluster.is_empty() {
+                return Ok(None);
+            }
+
+            let cluster_points: Vec<Point> =
+                cluster.iter().map(|&idx| points[idx].clone()).collect();
+            let Some((encoded, dfs_order)) = encode_subarray_mst_with_metric(
+                &cluster_points,
+                &quantized_data,
+                knn_metric,
+                mst_weight_mode,
+                Some(&gene_old_to_new),
+                index_codec,
+                full_row_fallback_ratio,
+            ) else {
+                return Ok(None);
+            };
+
+            let bytes = encoded.total_bytes();
+            let mut cluster_positions = Vec::with_capacity(cluster_points.len());
+            let mut cluster_row_order = Vec::with_capacity(cluster_points.len());
+
+            for &local_idx_u32 in &dfs_order {
+                let local_idx = local_idx_u32 as usize;
+                let point = cluster_points
+                    .get(local_idx)
+                    .ok_or_else(|| anyhow::anyhow!("Invalid DFS local index {}", local_idx))?;
+                cluster_positions.push(DatalessPoint::new(point.x, point.y));
+                cluster_row_order.push(point.row_index as u32);
+            }
+
+            Ok(Some((
+                cluster_idx,
+                encoded,
+                cluster_positions,
+                cluster_row_order,
+                cluster_points.len(),
+                bytes,
+            )))
+        })
+        .collect();
+
+    let mut ordered = Vec::new();
+    for result in cluster_results {
+        if let Some(v) = result? {
+            ordered.push(v);
+        }
+    }
+    ordered.sort_unstable_by_key(|(cluster_idx, _, _, _, _, _)| *cluster_idx);
+
+    for (_idx, encoded, cluster_positions, cluster_row_order, cluster_ncells, bytes) in ordered {
+        total_mst_bytes += bytes;
+        cluster_sizes.push(cluster_ncells);
+        positions.extend(cluster_positions);
+        row_order.extend(cluster_row_order);
+        encoded_blocks.push(encoded);
+    }
+
+    if verify_lossless && !quantize_values {
+        let reconstructed = reconstruct_csr_from_clustered_payload(
+            &encoded_blocks,
+            &row_order,
+            &gene_order,
+            data.rows(),
+            data.cols(),
+        )?;
+        compare_csr_exact(data, &reconstructed)?;
+    }
+
+    let sse = if quantize_values {
+        sparse_quantization_sse(data, &quantized_data)?
+    } else {
+        0.0
+    };
+    let total_entries = (points.len() * data.cols()).max(1);
+    let mse = sse / total_entries as f64;
+    let rmse = mse.sqrt();
+    let gzip_bytes_estimate =
+        estimate_gzip_payload_size(&encoded_blocks, &positions, &row_order, &gene_order)?;
+    let rate_bits_per_value = (gzip_bytes_estimate as f64 * 8.0) / total_entries as f64;
+
+    Ok(CompressionResult {
+        quantizers_requested,
+        quantizers_used: clusters.len(),
+        quantizer_bins,
+        total_mst_bytes,
+        gzip_bytes_estimate,
+        rate_bits_per_value,
+        mse,
+        rmse,
+        cluster_sizes,
+        encoded_blocks,
+        positions,
+        row_order,
+        gene_order,
+    })
+}
+
+fn decode_clustered_payload(
+    input: &Path,
+) -> anyhow::Result<(Vec<EncodedDiffsMST>, Vec<DatalessPoint>, Vec<u32>, Vec<u32>)> {
+    let file = File::open(input)?;
+    let mut reader = BufReader::new(file);
+    let gz = GzDecoder::new(&mut reader);
+    let mut gz_reader = BufReader::new(gz);
+    let config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+
+    let encoded_blocks: Vec<EncodedDiffsMST> =
+        bincode::decode_from_std_read(&mut gz_reader, config)?;
+    let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut gz_reader, config)?;
+    let row_order: Vec<u32> = bincode::decode_from_std_read(&mut gz_reader, config)?;
+    let gene_order: Vec<u32> = bincode::decode_from_std_read(&mut gz_reader, config)?;
+    Ok((encoded_blocks, positions, row_order, gene_order))
+}
+
+fn reconstruct_csr_from_clustered_payload(
+    encoded_blocks: &[EncodedDiffsMST],
+    row_order: &[u32],
+    gene_order: &[u32],
+    nrows: usize,
+    ncols: usize,
+) -> anyhow::Result<CsMat<u16>> {
+    let mut tri = sprs::TriMatI::<u16, usize>::new((nrows, ncols));
+    let mut cursor = 0usize;
+
+    for block in encoded_blocks {
+        for sparse_row in block.sparse_expression_iter() {
+            let row_idx = *row_order
+                .get(cursor)
+                .ok_or_else(|| anyhow::anyhow!("Row-order mapping shorter than decoded rows"))?
+                as usize;
+            if row_idx >= nrows {
+                anyhow::bail!(
+                    "Row-order entry {} out of bounds for {} rows",
+                    row_idx,
+                    nrows
+                );
+            }
+            for (gene_idx, value) in sparse_row {
+                let mapped_gene = if gene_order.is_empty() {
+                    gene_idx as usize
+                } else {
+                    *gene_order.get(gene_idx as usize).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Gene-order mapping missing index {} (len={})",
+                            gene_idx,
+                            gene_order.len()
+                        )
+                    })? as usize
+                };
+                if mapped_gene >= ncols {
+                    anyhow::bail!(
+                        "Mapped gene index {} out of bounds for {} columns",
+                        mapped_gene,
+                        ncols
+                    );
+                }
+                tri.add_triplet(row_idx, mapped_gene, value);
+            }
+            cursor += 1;
+        }
+    }
+
+    if cursor != row_order.len() {
+        anyhow::bail!(
+            "Decoded row count ({}) differs from row-order length ({})",
+            cursor,
+            row_order.len()
+        );
+    }
+
+    Ok(tri.to_csr::<usize>())
+}
+
+fn compare_csr_exact(expected: &CsMat<u16>, actual: &CsMat<u16>) -> anyhow::Result<()> {
+    if expected.shape() != actual.shape() {
+        anyhow::bail!(
+            "Shape mismatch: expected {}x{}, actual {}x{}",
+            expected.rows(),
+            expected.cols(),
+            actual.rows(),
+            actual.cols()
+        );
+    }
+
+    for row_idx in 0..expected.rows() {
+        let exp = expected.outer_view(row_idx);
+        let act = actual.outer_view(row_idx);
+        match (exp, act) {
+            (None, None) => {}
+            (Some(e), Some(a)) => {
+                if e.nnz() != a.nnz() {
+                    anyhow::bail!(
+                        "Row {} nnz mismatch: expected {}, actual {}",
+                        row_idx,
+                        e.nnz(),
+                        a.nnz()
+                    );
+                }
+
+                let mut e_vals: Vec<(usize, u16)> = e.iter().map(|(i, &v)| (i, v)).collect();
+                let mut a_vals: Vec<(usize, u16)> = a.iter().map(|(i, &v)| (i, v)).collect();
+                e_vals.sort_unstable_by_key(|(i, _)| *i);
+                a_vals.sort_unstable_by_key(|(i, _)| *i);
+
+                if e_vals != a_vals {
+                    anyhow::bail!("Row {} values differ", row_idx);
+                }
+            }
+            (Some(e), None) => {
+                anyhow::bail!(
+                    "Row {} missing in reconstructed matrix (nnz={})",
+                    row_idx,
+                    e.nnz()
+                );
+            }
+            (None, Some(a)) => {
+                anyhow::bail!("Row {} unexpectedly present (nnz={})", row_idx, a.nnz());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn resolve_position_columns(
+    platform: Option<Platform>,
+    pos_x_col: Option<usize>,
+    pos_y_col: Option<usize>,
+) -> (usize, usize) {
+    match platform {
+        Some(Platform::Visium) => (4, 5),
+        Some(Platform::Xenium) => (1, 2),
+        None => (pos_x_col.unwrap_or(1), pos_y_col.unwrap_or(2)),
+    }
 }
 
 #[derive(Parser)]
-#[command(version, about, long_about = None)]
-#[command(propagate_version = true)]
+#[command(version, about = "Clustered MST encoder (lossless + lossy)")]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Commands {
     #[command(arg_required_else_help = true)]
     Build(BuildCommand),
     #[command(arg_required_else_help = true)]
-    Dump(DumpCommand),
-    #[command(arg_required_else_help = true)]
-    EncodeClusters(EncodeClustersCommand),
+    RoundtripCheck(RoundtripCheckCommand),
 }
 
-#[derive(Debug, Clone, ValueEnum)]
-enum InputPosType {
-    Csv,
-    Parquet,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum InputDataType {
-    Csr,
-    Csv,
-    H5ad,
-   // Mtx,
-   // v2,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum Platform {
-    Visium,
-    Xenium,
-}
-
-#[derive(Debug, Clone, ValueEnum)]
-enum ClusterFormat {
-    /// Semicolon-separated format: each line is a cluster with cells separated by semicolons
-    Semicolon,
-    /// Two-column format: cell_id cluster_id (whitespace or tab separated)
-    TwoColumn,
-}
-
-/// Build a quadtree representation of spatial transcriptomics data
 #[derive(Debug, Args)]
-#[command(version, about, long_about = None)]
-struct DumpCommand {
-    /// the output serialized from build
+struct BuildCommand {
     #[arg(short = 'i', long)]
     input: PathBuf,
-    /// Output file
-    #[arg(short = 'o', long)]
-    output: PathBuf,
-}
-
-/// Encode clusters from a cluster assignment file
-#[derive(Debug, Args)]
-#[command(version, about, long_about = None)]
-struct EncodeClustersCommand {
-    /// HDF5 file with gene expression matrix
-    #[arg(short = 'i', long)]
-    input: PathBuf,
-    /// Position file (CSV or Parquet)
-    #[arg(short = 'p', long)]
+    #[arg(short = 'p', long = "input-pos")]
     input_pos: PathBuf,
-    /// Cluster assignment file
-    #[arg(short = 'c', long)]
-    clusters: PathBuf,
-    /// Output file (default "clusters_encoded.bin.gz")
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
-    /// Input position file format (csv or parquet)
     #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
-    /// Platform (visium or xenium)
     #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
-    /// Cluster file format
-    #[arg(short = 'f', long = "cluster-format", value_enum, default_value_t = ClusterFormat::Semicolon)]
-    cluster_format: ClusterFormat,
-}
-
-/// Build a quadtree representation of spatial transcriptomics data
-#[derive(Debug, Args)]
-#[command(version, about, long_about = None)]
-struct BuildCommand {
-    /// Input file (CSV or HDF5)
-    #[arg(short = 'i', long)]
-    input: PathBuf,
-    /// Input CSV file for position data (only needed for CSV input)
-    #[arg(short = 'p')]
-    input_pos: Option<PathBuf>,
-    /// Output file (default "output.bin.gz")
-    #[arg(short = 'o', long)]
-    output: Option<PathBuf>,
-    /// Input file format (csv or csr, csc, h5ad, mtx)
-    #[arg(short = 'f', long, value_enum, default_value_t = InputDataType::Csr)]
-    format: InputDataType,
-    /// Positions file x column index (0-based)
     #[arg(long = "pos-x-col")]
     pos_x_col: Option<usize>,
-    /// Positions file y column index (0-based)
     #[arg(long = "pos-y-col")]
     pos_y_col: Option<usize>,
-    // !!combine pos_x_col and pos_y_col into one argument!!
-    /// Index of x coordinate, default 6
-    #[arg(short = 'x', long, default_value_t = 6)]
-    idx_x: usize,
-    /// Index of y coordinate, default 7
-    #[arg(short = 'y', long, default_value_t = 7)]
-    idx_y: usize,
-    /// Index of gene start, default 10
-    #[arg(short = 's', long, default_value_t = 10)]
-    idx_gene_start: usize,
-    /// Index of gene end, default all remaining columns
-    #[arg(short = 'e', long)]
-    idx_gene_end: Option<usize>,
-    /// Input position file format (csv or parquet)
+    #[arg(long = "max-cells")]
+    max_cells: Option<usize>,
+    #[arg(long, default_value_t = false)]
+    lossy: bool,
+    #[arg(long = "lossy-lossless", default_value_t = false)]
+    lossy_lossless: bool,
+    #[arg(long = "lossy-verify-lossless", default_value_t = false)]
+    lossy_verify_lossless: bool,
+    #[arg(long = "lossy-quantizers", default_value_t = 8)]
+    lossy_quantizers: usize,
+    #[arg(long = "lossy-bins", default_value_t = 16)]
+    lossy_bins: usize,
+    #[arg(long = "lossy-sweep", value_delimiter = ',')]
+    lossy_sweep: Vec<usize>,
+    /// Maximum allowed cells per cluster (applies to both lossy and lossless modes).
+    /// Oversized clusters are recursively re-clustered.
+    #[arg(long = "max-cluster-size")]
+    max_cluster_size: Option<usize>,
+    /// Distance metric used for KNN graph construction prior to MST.
+    #[arg(long = "knn-metric", value_enum, default_value_t = KnnMetricArg::L0)]
+    knn_metric: KnnMetricArg,
+    /// Edge weighting used during MST construction.
+    #[arg(long = "mst-weight", value_enum, default_value_t = MstWeightArg::Metric)]
+    mst_weight: MstWeightArg,
+    /// Codec used for index-like streams in MST payloads.
+    #[arg(long = "index-codec", value_enum, default_value_t = IndexCodecArg::Arithmetic)]
+    index_codec: IndexCodecArg,
+    /// If set, disable per-child full-row fallback when edit deltas are too large.
+    #[arg(long = "disable-full-row-fallback", default_value_t = false)]
+    disable_full_row_fallback: bool,
+    /// Trigger full-row storage for a child when `delta_edits > ratio * child_nnz`.
+    #[arg(long = "full-row-fallback-ratio", default_value_t = 1.0)]
+    full_row_fallback_ratio: f32,
+}
+
+#[derive(Debug, Args)]
+struct RoundtripCheckCommand {
+    #[arg(short = 'e', long = "encoded")]
+    encoded: PathBuf,
+    #[arg(short = 'i', long)]
+    input: PathBuf,
+    #[arg(short = 'p', long = "input-pos")]
+    input_pos: PathBuf,
     #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
     #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
+    #[arg(long = "pos-x-col")]
+    pos_x_col: Option<usize>,
+    #[arg(long = "pos-y-col")]
+    pos_y_col: Option<usize>,
+    #[arg(long = "max-cells")]
+    max_cells: Option<usize>,
 }
-
-struct Data {
-    pub data: Vec<EncodedDiffsMST>,
-    pub pos: Vec<DatalessPoint>,
-    // pub sep: Vec<usize>,
-}
-
-impl Data {
-    pub fn new() -> Self {
-        Self {
-            data: Vec::new(),
-            pos: Vec::new(),
-            //  sep: Vec::new(),
-        }
-    }
-}
-/* 
-fn main() -> Result<(), Box<dyn Error>> {
-    // Check the `RUST_LOG` variable for the logger level and
-    // respect the value found there. If this environment
-    // variable is not set then set the logging level to
-    // INFO.
-    tracing_subscriber::registry()
-        .with(fmt::layer())
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(LevelFilter::INFO.into())
-                .from_env_lossy()
-                // we don't want to hear anything below a warning from ureq
-                .add_directive("ureq=warn".parse()?),
-        )
-        .init();
-
-    // Test reading HDF5 file directly with hdf5 crate
-    println!("Testing HDF5 file reading...");
-    let file_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cell_feature_matrix.h5";
-    let parquet_path = "/Users/zhezhenwang/Documents/patro/data/Xenium_V1_hKidney_nondiseased_section_outs/cells.parquet";
-    tree_from_10X(file_path, parquet_path, ErrorMetric::Mean, true)?;
-    Ok(())
-}
-    */
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Check the `RUST_LOG` variable for the logger level and
-    // respect the value found there. If this environment
-    // variable is not set then set the logging level to
-    // INFO.
     tracing_subscriber::registry()
         .with(fmt::layer())
         .with(
             EnvFilter::builder()
                 .with_default_directive(LevelFilter::INFO.into())
                 .from_env_lossy()
-                // we don't want to hear anything below a warning from ureq
                 .add_directive("ureq=warn".parse()?),
         )
         .init();
 
-    let cli_args = Cli::parse();
+    let cli = Cli::parse();
 
-    match cli_args.command {
+    match cli.command {
         Commands::Build(args) => {
-            //TODO: combine csv and 10x format function into one
-            let (pos_x_col, pos_y_col) = match args.platform {
-                Some(Platform::Visium) => (4, 5),
-                Some(Platform::Xenium) => (1, 2),
-                None => (args.idx_x, args.idx_y),
-            };
-            let (qtree, csr) = match args.format {
-                InputDataType::Csv => {
-                    // let file_path_pos = args.input_pos.ok_or_else(|| {
-                    //    anyhow::anyhow!("Position file required for CSV format")
-                    //})?;
-                    //println!("tree_from_csv");
-                    tree_from_csv(
-                        &args.input,
-                        //file_path_pos,
-                        args.idx_x,          // idx_x
-                        args.idx_y,          // idx_y
-                        args.idx_gene_start, // idx_gene_start
-                        args.idx_gene_end,   // idx_gene_end (will use all remaining columns)
-                        ErrorMetric::Mean,
-                        true,
-                    )?
-                }
-                InputDataType::Csr
-                | InputDataType::H5ad => {
-                    let file_path_pos = args
-                        .input_pos
-                        .ok_or_else(|| anyhow::anyhow!("Position file required for HDF5 format"))?;
-                    tree_from_10x(
-                        &args.input,
-                        &file_path_pos,
-                        match args.pos_format {
-                            InputPosType::Csv => InputPosType::Csv,
-                            InputPosType::Parquet => InputPosType::Parquet,
-                        },
-                        match args.format {
-                            InputDataType::Csr => InputDataType::Csr,
-                            InputDataType::Csv => InputDataType::Csv,
-                            InputDataType::H5ad => InputDataType::H5ad,
-                            //InputDataType::Mtx => InputDataType::Mtx,
-                            //InputDataType::v2 => InputDataType::v2,
-                        },
-                        pos_x_col,
-                        pos_y_col,
-                        ErrorMetric::Mean,
-                        true,
-                    )?
-                }
-            };
+            let (pos_x_col, pos_y_col) =
+                resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
 
-            // only serialize the the bit fields
-            let config = bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding();
-            let ofname = args.output.unwrap_or(PathBuf::from("output.bin.gz"));
-            let file = File::create(ofname).unwrap();
-            let writer = BufWriter::new(file);
-            let mut encoder = GzEncoder::new(writer, Compression::default());
-            let bit_field_tree = qtree.compute_quadtree_bit_fields(&csr);
-            let mut d = Data::new();
-
-            let mut collect_data = |n: &BitFieldQuadTree| {
-                if !n.divided && n.encoded_diffs.ncells() > 0 {
-                    d.data.push(n.encoded_diffs.clone());
-                    d.pos.extend_from_slice(&n.positions);
-                }
-            };
-            bit_field_tree.visit(&mut collect_data);
-
-            let mut total_p = 0;
-            let mut total_ri = 0;
-            let mut total_rv = 0;
-            let mut total_i = 0;
-            let mut total_dv = 0;
-            let mut total_ng = 0;
-
-            for ediff in &d.data {
-                let (p, ri, rv, i, dv, ng) = ediff.bytes_breakdown();
-                total_p += p;
-                total_ri += ri;
-                total_rv += rv;
-                total_i += i;
-                total_dv += dv;
-                total_ng += ng;
-            }
-
-            let total_mst_bytes = total_p + total_ri + total_rv + total_i + total_dv + total_ng;
-
-            info!(
-                "QuadTree Blocks: (non-zero blocks: {})",
-                qtree.non_zero_blocks(&csr)
-            );
-            info!("Collected Encoded Diffs : {}", d.data.len());
-            
-            if total_mst_bytes > 0 {
-                info!("Final Size Breakdown for MST-encoded data:");
-                info!("  parent_offset: {:>10} bytes ({:>6.2}%)", total_p, (total_p as f64 / total_mst_bytes as f64) * 100.0);
-                info!("  root_indices:  {:>10} bytes ({:>6.2}%)", total_ri, (total_ri as f64 / total_mst_bytes as f64) * 100.0);
-                info!("  root_vals:     {:>10} bytes ({:>6.2}%)", total_rv, (total_rv as f64 / total_mst_bytes as f64) * 100.0);
-                info!("  indices:       {:>10} bytes ({:>6.2}%)", total_i, (total_i as f64 / total_mst_bytes as f64) * 100.0);
-                info!("  delta_vals:    {:>10} bytes ({:>6.2}%)", total_dv, (total_dv as f64 / total_mst_bytes as f64) * 100.0);
-                info!("  num_genes:     {:>10} bytes ({:>6.2}%)", total_ng, (total_ng as f64 / total_mst_bytes as f64) * 100.0);
-                info!("  Total:         {:>10} bytes (uncompressed)", total_mst_bytes);
-            }
-            
-            //bincode::encode_into_std_write(&d.data, &mut writer, config).unwrap();
-            //bincode::encode_into_std_write(&d.pos, &mut writer, config).unwrap();
-            bincode::encode_into_std_write(&d.data, &mut encoder, config).unwrap();
-            bincode::encode_into_std_write(&d.pos, &mut encoder, config).unwrap();
-
-        }
-        Commands::Dump(args) => {
-            info!("start dump");
-            let ifile = std::fs::File::open(args.input)?;
-            let mut rdr = std::io::BufReader::new(ifile);
-            let gz = GzDecoder::new(&mut rdr);
-            let mut rdr = BufReader::new(gz);
-
-            let config = bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding();
-
-            let ofile = std::fs::File::create(args.output)?;
-            let mut ofile = std::io::BufWriter::new(ofile);
-            let mut d = Data::new();
-            d.data = bincode::decode_from_std_read(&mut rdr, config)?;
-            d.pos = bincode::decode_from_std_read(&mut rdr, config)?;
-            let mut start = 0;
-
-            info!("d.data.len(): {}", d.data.len());
-            let mut str_out = String::new();
-            for compressed_diffs in d.data.iter() {
-                let n = compressed_diffs.num_cells();
-                for (cell_id, loc) in d.pos.iter().skip(start).take(n).enumerate() {
-                    str_out.clear();
-                    for e in compressed_diffs
-                        .expression_vec_iter()
-                        .nth(cell_id)
-                        .unwrap_or_default()
-                        .iter()
-                    {
-                        let _ = write!(&mut str_out, "{e}, ");
-                    }
-                    str_out.pop();
-                    str_out.pop();
-                    ofile.write_all(
-                        format!("{},{},{}\n", loc.xpos(), loc.ypos(), str_out).as_bytes(),
-                    )?;
-                    //writeln!(ofile, "{},{},{}", loc.xpos(), loc.ypos(), expression)?;
-                }
-                start += n;
-            }
-        }
-        Commands::EncodeClusters(args) => {
-            info!("Starting cluster encoding");
-            
-            // Determine position columns based on platform
-            let (pos_x_col, pos_y_col) = match args.platform {
-                Some(Platform::Visium) => (4, 5),
-                Some(Platform::Xenium) => (1, 2),
-                None => (1, 2), // Default to Xenium format
-            };
-            
-            // Encode clusters
-            let encoded_clusters = encode_clusters_from_h5(
+            let (csr, points) = load_10x_with_positions(
                 &args.input,
                 &args.input_pos,
-                &args.clusters,
                 args.pos_format,
-                args.cluster_format,
                 pos_x_col,
                 pos_y_col,
+                args.max_cells,
             )?;
-            
-            info!("Successfully encoded {} clusters", encoded_clusters.len());
-            
-            // Serialize to file
+
+            info!(
+                "Loaded matrix rows={}, cols={}, nnz={}, points={}",
+                csr.rows(),
+                csr.cols(),
+                csr.nnz(),
+                points.len()
+            );
+
+            let quantize_values = args.lossy && !args.lossy_lossless;
+            let target_quantizers = args.lossy_quantizers.max(1);
+            let quantizer_bins = args.lossy_bins.max(1);
+            let sweep_counts = normalize_quantizer_counts(target_quantizers, &args.lossy_sweep);
+            let index_codec = IndexStreamCodec::from(args.index_codec);
+            let mst_weight_mode = MstWeightMode::from(args.mst_weight);
+            let fallback_ratio = if args.disable_full_row_fallback {
+                None
+            } else {
+                Some(args.full_row_fallback_ratio.max(0.0))
+            };
+
+            info!(
+                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} full_row_fallback={:?}",
+                if quantize_values { "lossy" } else { "lossless" },
+                target_quantizers,
+                quantizer_bins,
+                sweep_counts,
+                args.max_cluster_size,
+                args.knn_metric,
+                args.mst_weight,
+                args.index_codec,
+                fallback_ratio
+            );
+
+            let mut metrics = Vec::new();
+            let mut selected: Option<CompressionResult> = None;
+
+            for &quantizer_count in &sweep_counts {
+                let result = run_clustered_compression(
+                    &points,
+                    &csr,
+                    quantizer_count,
+                    quantizer_bins,
+                    quantize_values,
+                    args.lossy_verify_lossless,
+                    args.max_cluster_size,
+                    args.knn_metric.into(),
+                    mst_weight_mode,
+                    index_codec,
+                    fallback_ratio,
+                )?;
+
+                info!(
+                    "q={} (used={}): gzip≈{} bytes, rate={:.4} bits/value, mse={:.6}, rmse={:.6}",
+                    result.quantizers_requested,
+                    result.quantizers_used,
+                    result.gzip_bytes_estimate,
+                    result.rate_bits_per_value,
+                    result.mse,
+                    result.rmse
+                );
+
+                metrics.push(SweepMetric {
+                    quantizers_requested: result.quantizers_requested,
+                    quantizers_used: result.quantizers_used,
+                    gzip_bytes_estimate: result.gzip_bytes_estimate,
+                    rate_bits_per_value: result.rate_bits_per_value,
+                    mse: result.mse,
+                    rmse: result.rmse,
+                });
+
+                if quantizer_count == target_quantizers {
+                    selected = Some(result);
+                }
+            }
+
+            let selected = selected.ok_or_else(|| {
+                anyhow::anyhow!("Failed to build selected setting q={}", target_quantizers)
+            })?;
+
+            info!("Rate-distortion sweep summary:");
+            for metric in &metrics {
+                info!(
+                    "  q={} (used={}): rate={:.4}, mse={:.6}, rmse={:.6}, gzip≈{} bytes",
+                    metric.quantizers_requested,
+                    metric.quantizers_used,
+                    metric.rate_bits_per_value,
+                    metric.mse,
+                    metric.rmse,
+                    metric.gzip_bytes_estimate
+                );
+            }
+
+            let output = args
+                .output
+                .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
             let config = bincode::config::standard()
                 .with_little_endian()
                 .with_fixed_int_encoding();
-            let ofname = args.output.unwrap_or(PathBuf::from("clusters_encoded.bin.gz"));
-            let file = File::create(&ofname)?;
+
+            let file = File::create(&output)?;
             let writer = BufWriter::new(file);
             let mut encoder = GzEncoder::new(writer, Compression::default());
-            
-            // Separate encoded diffs and positions
-            let mut all_encoded_diffs = Vec::new();
-            let mut all_positions = Vec::new();
-            
-            for (encoded, positions) in encoded_clusters {
-                all_encoded_diffs.push(encoded);
-                all_positions.extend(positions);
+            bincode::encode_into_std_write(&selected.encoded_blocks, &mut encoder, config)?;
+            bincode::encode_into_std_write(&selected.positions, &mut encoder, config)?;
+            bincode::encode_into_std_write(&selected.row_order, &mut encoder, config)?;
+            bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
+            let _ = encoder.finish()?;
+
+            let actual_gzip_bytes = std::fs::metadata(&output)?.len() as usize;
+            let total_entries = (points.len() * csr.cols()).max(1);
+            let actual_rate = (actual_gzip_bytes as f64 * 8.0) / total_entries as f64;
+
+            let mut bytes_parent = 0usize;
+            let mut bytes_root_indices = 0usize;
+            let mut bytes_root_vals = 0usize;
+            let mut bytes_indices = 0usize;
+            let mut bytes_delta_vals = 0usize;
+            let mut bytes_num_genes = 0usize;
+
+            for block in &selected.encoded_blocks {
+                let (p, ri, rv, i, dv, ng) = block.bytes_breakdown();
+                bytes_parent += p;
+                bytes_root_indices += ri;
+                bytes_root_vals += rv;
+                bytes_indices += i;
+                bytes_delta_vals += dv;
+                bytes_num_genes += ng;
             }
-            
-            bincode::encode_into_std_write(&all_encoded_diffs, &mut encoder, config)?;
-            bincode::encode_into_std_write(&all_positions, &mut encoder, config)?;
-            
-            info!("Encoded clusters saved to: {}", ofname.display());
-            info!("Total encoded blocks: {}", all_encoded_diffs.len());
-            info!("Total positions: {}", all_positions.len());
+
+            let topology_bytes = bytes_parent;
+            let value_bytes =
+                bytes_root_indices + bytes_root_vals + bytes_indices + bytes_delta_vals;
+            let mst_payload_bytes = topology_bytes + value_bytes + bytes_num_genes;
+            let gene_order_bytes = selected.gene_order.len() * std::mem::size_of::<u32>();
+            let payload_with_col_order = mst_payload_bytes + gene_order_bytes;
+
+            info!("Saved encoded payload to {}", output.display());
+            info!(
+                "Selected setting: q={} (used={}), bins={}, clusters={}",
+                selected.quantizers_requested,
+                selected.quantizers_used,
+                selected.quantizer_bins,
+                selected.cluster_sizes.len()
+            );
+            info!(
+                "Size: mst_uncompressed={} bytes, gzip_estimate={} bytes, gzip_actual={} bytes",
+                selected.total_mst_bytes, selected.gzip_bytes_estimate, actual_gzip_bytes
+            );
+            info!(
+                "Distortion: mse={:.6}, rmse={:.6}, actual_rate={:.4} bits/value",
+                selected.mse, selected.rmse, actual_rate
+            );
+            info!(
+                "MST breakdown: topology(parent_offset)={} bytes, values(root+delta)={} bytes, metadata(num_genes)={} bytes, column_order={} bytes, total={} bytes",
+                topology_bytes,
+                value_bytes,
+                bytes_num_genes,
+                gene_order_bytes,
+                payload_with_col_order
+            );
+            info!(
+                "  values breakdown: root_indices={} root_vals={} delta_indices={} delta_vals={}",
+                bytes_root_indices, bytes_root_vals, bytes_indices, bytes_delta_vals
+            );
+        }
+        Commands::RoundtripCheck(args) => {
+            let (pos_x_col, pos_y_col) =
+                resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
+
+            let (encoded_blocks, _positions, row_order, gene_order) =
+                decode_clustered_payload(&args.encoded)?;
+            info!(
+                "Loaded payload: blocks={}, mapped_rows={}, gene_order_len={}",
+                encoded_blocks.len(),
+                row_order.len(),
+                gene_order.len()
+            );
+
+            let (csr_truth, _points) = load_10x_with_positions(
+                &args.input,
+                &args.input_pos,
+                args.pos_format,
+                pos_x_col,
+                pos_y_col,
+                args.max_cells,
+            )?;
+
+            info!(
+                "Ground truth CSR: rows={}, cols={}, nnz={}",
+                csr_truth.rows(),
+                csr_truth.cols(),
+                csr_truth.nnz()
+            );
+
+            let reconstructed = reconstruct_csr_from_clustered_payload(
+                &encoded_blocks,
+                &row_order,
+                &gene_order,
+                csr_truth.rows(),
+                csr_truth.cols(),
+            )?;
+
+            info!(
+                "Reconstructed CSR: rows={}, cols={}, nnz={}",
+                reconstructed.rows(),
+                reconstructed.cols(),
+                reconstructed.nnz()
+            );
+
+            compare_csr_exact(&csr_truth, &reconstructed)?;
+            info!("Round-trip check PASSED: reconstructed CSR exactly matches input.");
         }
     }
+
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sprs::TriMatI;
 
-/* 
-// Function to explore HDF5 file structure
-fn explore_hdf5_structure<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
-    let file = Hdf5File::open(h5_path.as_ref())?;
+    #[test]
+    fn lossy_mode_respects_max_cluster_size() {
+        let n_cells = 24usize;
+        let n_genes = 12usize;
+        let max_cluster_size = 5usize;
 
-    println!("=== HDF5 File Structure ===");
-    println!("File: {}", h5_path.as_ref().display());
-
-    // Try to access common paths
-    let common_paths = [
-        "matrix/obs/name",
-        "matrix/obs/_index", 
-        "obs/name",
-        "matrix/features/name",
-        "matrix/data",
-        "matrix/indices",
-        "matrix/indptr",
-        "matrix/shape",
-    ];
-
-    for path in &common_paths {
-        if let Ok(dataset) = file.dataset(path) {
-            let shape = dataset.shape();
-            let dtype = dataset.dtype()?;
-            println!("✅ {} (shape: {:?}, dtype: {:?})", path, shape, dtype);
-        } else {
-            println!("❌ {} (not found)", path);
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            let g0 = cell % n_genes;
+            let g1 = (cell * 3 + 1) % n_genes;
+            let g2 = (cell * 5 + 2) % n_genes;
+            tri.add_triplet(cell, g0, ((cell % 7) + 1) as u16);
+            tri.add_triplet(cell, g1, ((cell % 5) + 2) as u16);
+            tri.add_triplet(cell, g2, ((cell % 3) + 1) as u16);
         }
+        let csr = tri.to_csr::<usize>();
+
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, (i % 4) as f64, i))
+            .collect();
+
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            1,
+            8,
+            true,  // lossy path
+            false, // no lossless verification
+            Some(max_cluster_size),
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            Some(1.0),
+        )
+        .expect("lossy compression should succeed");
+
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+        assert!(result.cluster_sizes.iter().all(|&s| s <= max_cluster_size));
     }
-
-    println!("=== End Structure ===");
-
-    Ok(())
 }
-
-// Simple function to demonstrate reading cell names from HDF5
-fn demonstrate_cell_names<T: AsRef<Path>>(h5_path: T) -> anyhow::Result<()> {
-    println!("\n=== Trying to read cell names from HDF5 ===");
-
-    let file = Hdf5File::open(h5_path.as_ref())?;
-
-    // Try common paths for cell names
-    let cell_name_paths = [
-        "matrix/obs/name",
-        "matrix/obs/_index", 
-        "obs/name",
-        "matrix/obs/id",
-    ];
-
-    for path in &cell_name_paths {
-        match file.dataset(path) {
-            Ok(dataset) => {
-                let shape = dataset.shape();
-                let dtype = dataset.dtype()?;
-                println!(
-                    "✅ Found cell names at '{}' (shape: {:?}, dtype: {:?})",
-                    path, shape, dtype
-                );
-
-                // Try to read a few sample cell names
-                if shape.len() == 1 && shape[0] > 0 {
-                    let num_cells = shape[0];
-                    let sample_size = std::cmp::min(5, num_cells);
-
-                    // Try to read as strings
-                    if let Ok(strings) = read_strings_as_bytes(&file, path, 23, sample_size) {
-                        println!("   Sample cell names: {:?}", strings);
-                    } else {
-                        println!("   Could not read as strings");
-                    }
-                }
-            }
-            Err(_) => {
-                println!("❌ No cell names found at '{}'", path);
-            }
-        }
-    }
-
-    println!("=== End cell names exploration ===\n");
-    Ok(())
-}
-*/
