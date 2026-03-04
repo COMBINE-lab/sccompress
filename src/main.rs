@@ -12,8 +12,8 @@ use index_stream::IndexStreamCodec;
 use matrix_io::{load_10x_with_positions, InputPosType, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
-    encode_subarray_mst_with_metric, DatalessPoint, EncodedDiffsMST, KnnDistanceMetric,
-    MstWeightMode, Point,
+    encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
+    KnnDistanceMetric, MstWeightMode, Point,
 };
 use ndarray::Array2;
 use rayon::prelude::*;
@@ -45,7 +45,7 @@ struct CompressionResult {
     mse: f64,
     rmse: f64,
     cluster_sizes: Vec<usize>,
-    encoded_blocks: Vec<EncodedDiffsMST>,
+    encoded_blocks: Vec<EncodedClusterBlock>,
     positions: Vec<DatalessPoint>,
     row_order: Vec<u32>,
     gene_order: Vec<u32>,
@@ -89,6 +89,13 @@ impl From<IndexCodecArg> for IndexStreamCodec {
 enum MstWeightArg {
     Metric,
     EncodingCost,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum ClusterEncodingArg {
+    Row,
+    Column,
+    Hybrid,
 }
 
 impl From<MstWeightArg> for MstWeightMode {
@@ -566,7 +573,7 @@ fn sparse_quantization_sse(original: &CsMat<u16>, quantized: &CsMat<u16>) -> any
 }
 
 fn estimate_gzip_payload_size(
-    encoded_blocks: &[EncodedDiffsMST],
+    encoded_blocks: &[EncodedClusterBlock],
     positions: &[DatalessPoint],
     row_order: &[u32],
     gene_order: &[u32],
@@ -594,6 +601,8 @@ fn run_clustered_compression(
     mst_weight_mode: MstWeightMode,
     index_codec: IndexStreamCodec,
     full_row_fallback_ratio: Option<f32>,
+    forest_cut_factor: Option<f32>,
+    cluster_encoding: ClusterEncodingArg,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -687,7 +696,7 @@ fn run_clustered_compression(
         anyhow::Result<
             Option<(
                 usize,
-                EncodedDiffsMST,
+                EncodedClusterBlock,
                 Vec<DatalessPoint>,
                 Vec<u32>,
                 usize,
@@ -704,27 +713,79 @@ fn run_clustered_compression(
 
             let cluster_points: Vec<Point> =
                 cluster.iter().map(|&idx| points[idx].clone()).collect();
-            let Some((encoded, dfs_order)) = encode_subarray_mst_with_metric(
-                &cluster_points,
-                &quantized_data,
-                knn_metric,
-                mst_weight_mode,
-                Some(&gene_old_to_new),
-                index_codec,
-                full_row_fallback_ratio,
-            ) else {
-                return Ok(None);
+            let mut row_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+            let mut col_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+
+            if matches!(
+                cluster_encoding,
+                ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
+            ) {
+                if let Some((row_block, dfs_order)) = encode_subarray_mst_with_metric(
+                    &cluster_points,
+                    &quantized_data,
+                    knn_metric,
+                    mst_weight_mode,
+                    Some(&gene_old_to_new),
+                    index_codec,
+                    full_row_fallback_ratio,
+                    forest_cut_factor,
+                ) {
+                    let bytes = row_block.total_bytes();
+                    row_candidate =
+                        Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
+                }
+            }
+
+            if matches!(
+                cluster_encoding,
+                ClusterEncodingArg::Column | ClusterEncodingArg::Hybrid
+            ) {
+                if let Some(col_block) = encode_subarray_column(
+                    &cluster_points,
+                    &quantized_data,
+                    Some(&gene_old_to_new),
+                    index_codec,
+                ) {
+                    let order: Vec<u32> = (0..cluster_points.len()).map(|i| i as u32).collect();
+                    let bytes = col_block.total_bytes();
+                    col_candidate = Some((EncodedClusterBlock::Column(col_block), order, bytes));
+                }
+            }
+
+            let (encoded, local_order, bytes) = match cluster_encoding {
+                ClusterEncodingArg::Row => row_candidate.ok_or_else(|| {
+                    anyhow::anyhow!("Row-MST encoding failed for cluster {}", cluster_idx)
+                })?,
+                ClusterEncodingArg::Column => col_candidate.ok_or_else(|| {
+                    anyhow::anyhow!("Column encoding failed for cluster {}", cluster_idx)
+                })?,
+                ClusterEncodingArg::Hybrid => match (row_candidate, col_candidate) {
+                    (Some(r), Some(c)) => {
+                        if r.2 <= c.2 {
+                            r
+                        } else {
+                            c
+                        }
+                    }
+                    (Some(r), None) => r,
+                    (None, Some(c)) => c,
+                    (None, None) => {
+                        return Err(anyhow::anyhow!(
+                            "Both row and column encoding failed for cluster {}",
+                            cluster_idx
+                        ))
+                    }
+                },
             };
 
-            let bytes = encoded.total_bytes();
             let mut cluster_positions = Vec::with_capacity(cluster_points.len());
             let mut cluster_row_order = Vec::with_capacity(cluster_points.len());
 
-            for &local_idx_u32 in &dfs_order {
+            for &local_idx_u32 in &local_order {
                 let local_idx = local_idx_u32 as usize;
                 let point = cluster_points
                     .get(local_idx)
-                    .ok_or_else(|| anyhow::anyhow!("Invalid DFS local index {}", local_idx))?;
+                    .ok_or_else(|| anyhow::anyhow!("Invalid local order index {}", local_idx))?;
                 cluster_positions.push(DatalessPoint::new(point.x, point.y));
                 cluster_row_order.push(point.row_index as u32);
             }
@@ -748,13 +809,24 @@ fn run_clustered_compression(
     }
     ordered.sort_unstable_by_key(|(cluster_idx, _, _, _, _, _)| *cluster_idx);
 
+    let mut row_block_count = 0usize;
+    let mut column_block_count = 0usize;
     for (_idx, encoded, cluster_positions, cluster_row_order, cluster_ncells, bytes) in ordered {
+        match &encoded {
+            EncodedClusterBlock::RowMst(_) => row_block_count += 1,
+            EncodedClusterBlock::Column(_) => column_block_count += 1,
+        }
         total_mst_bytes += bytes;
         cluster_sizes.push(cluster_ncells);
         positions.extend(cluster_positions);
         row_order.extend(cluster_row_order);
         encoded_blocks.push(encoded);
     }
+
+    info!(
+        "Cluster payload selection: row_blocks={} column_blocks={}",
+        row_block_count, column_block_count
+    );
 
     if verify_lossless && !quantize_values {
         let reconstructed = reconstruct_csr_from_clustered_payload(
@@ -798,7 +870,12 @@ fn run_clustered_compression(
 
 fn decode_clustered_payload(
     input: &Path,
-) -> anyhow::Result<(Vec<EncodedDiffsMST>, Vec<DatalessPoint>, Vec<u32>, Vec<u32>)> {
+) -> anyhow::Result<(
+    Vec<EncodedClusterBlock>,
+    Vec<DatalessPoint>,
+    Vec<u32>,
+    Vec<u32>,
+)> {
     let file = File::open(input)?;
     let mut reader = BufReader::new(file);
     let gz = GzDecoder::new(&mut reader);
@@ -807,7 +884,7 @@ fn decode_clustered_payload(
         .with_little_endian()
         .with_fixed_int_encoding();
 
-    let encoded_blocks: Vec<EncodedDiffsMST> =
+    let encoded_blocks: Vec<EncodedClusterBlock> =
         bincode::decode_from_std_read(&mut gz_reader, config)?;
     let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut gz_reader, config)?;
     let row_order: Vec<u32> = bincode::decode_from_std_read(&mut gz_reader, config)?;
@@ -816,7 +893,7 @@ fn decode_clustered_payload(
 }
 
 fn reconstruct_csr_from_clustered_payload(
-    encoded_blocks: &[EncodedDiffsMST],
+    encoded_blocks: &[EncodedClusterBlock],
     row_order: &[u32],
     gene_order: &[u32],
     nrows: usize,
@@ -826,7 +903,7 @@ fn reconstruct_csr_from_clustered_payload(
     let mut cursor = 0usize;
 
     for block in encoded_blocks {
-        for sparse_row in block.sparse_expression_iter() {
+        for sparse_row in block.decode_rows() {
             let row_idx = *row_order
                 .get(cursor)
                 .ok_or_else(|| anyhow::anyhow!("Row-order mapping shorter than decoded rows"))?
@@ -1001,6 +1078,12 @@ struct BuildCommand {
     /// Trigger full-row storage for a child when `delta_edits > ratio * child_nnz`.
     #[arg(long = "full-row-fallback-ratio", default_value_t = 1.0)]
     full_row_fallback_ratio: f32,
+    /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
+    #[arg(long = "forest-cut-factor")]
+    forest_cut_factor: Option<f32>,
+    /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
+    #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
+    cluster_encoding: ClusterEncodingArg,
 }
 
 #[derive(Debug, Args)]
@@ -1069,9 +1152,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 Some(args.full_row_fallback_ratio.max(0.0))
             };
+            let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
+            let cluster_encoding = args.cluster_encoding;
 
             info!(
-                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} full_row_fallback={:?}",
+                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?}",
                 if quantize_values { "lossy" } else { "lossless" },
                 target_quantizers,
                 quantizer_bins,
@@ -1080,7 +1165,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.knn_metric,
                 args.mst_weight,
                 args.index_codec,
-                fallback_ratio
+                fallback_ratio,
+                forest_cut_factor,
+                cluster_encoding
             );
 
             let mut metrics = Vec::new();
@@ -1099,6 +1186,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     mst_weight_mode,
                     index_codec,
                     fallback_ratio,
+                    forest_cut_factor,
+                    cluster_encoding,
                 )?;
 
                 info!(
@@ -1203,7 +1292,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 selected.mse, selected.rmse, actual_rate
             );
             info!(
-                "MST breakdown: topology(parent_offset)={} bytes, values(root+delta)={} bytes, metadata(num_genes)={} bytes, column_order={} bytes, total={} bytes",
+                "MST breakdown: topology(parent_offset)={} bytes, values(root+ops)={} bytes, metadata(num_genes)={} bytes, column_order={} bytes, total={} bytes",
                 topology_bytes,
                 value_bytes,
                 bytes_num_genes,
@@ -1211,7 +1300,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 payload_with_col_order
             );
             info!(
-                "  values breakdown: root_indices={} root_vals={} delta_indices={} delta_vals={}",
+                "  values breakdown: root_indices={} root_vals={} op_indices={} op_vals={}",
                 bytes_root_indices, bytes_root_vals, bytes_indices, bytes_delta_vals
             );
         }
@@ -1305,6 +1394,8 @@ mod tests {
             MstWeightMode::Metric,
             IndexStreamCodec::Arithmetic,
             Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
         )
         .expect("lossy compression should succeed");
 
