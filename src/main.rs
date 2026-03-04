@@ -3,6 +3,7 @@ mod delta_indices;
 mod index_stream;
 mod matrix_io;
 mod mst_codec;
+mod sorted_indices;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::read::GzDecoder;
@@ -13,11 +14,13 @@ use matrix_io::{load_10x_with_positions, InputPosType, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
     encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
-    KnnDistanceMetric, MstWeightMode, Point,
+    EncodedColumnBlock, EncodedDiffsMST, KnnDistanceMetric, MstWeightMode, Point,
 };
 use ndarray::Array2;
 use rayon::prelude::*;
+use sorted_indices::SortedIndexCodec;
 use sprs::CsMat;
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
@@ -81,6 +84,21 @@ impl From<IndexCodecArg> for IndexStreamCodec {
         match value {
             IndexCodecArg::Arithmetic => IndexStreamCodec::Arithmetic,
             IndexCodecArg::StreamVbyte => IndexStreamCodec::StreamVByte,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SortedIndexCodecArg {
+    Delta,
+    EliasFano,
+}
+
+impl From<SortedIndexCodecArg> for SortedIndexCodec {
+    fn from(value: SortedIndexCodecArg) -> Self {
+        match value {
+            SortedIndexCodecArg::Delta => SortedIndexCodec::Delta,
+            SortedIndexCodecArg::EliasFano => SortedIndexCodec::EliasFano,
         }
     }
 }
@@ -589,6 +607,621 @@ fn estimate_gzip_payload_size(
     Ok(encoder.finish()?.len())
 }
 
+#[derive(Default)]
+struct SymbolHistogram {
+    counts: HashMap<u32, u64>,
+    total: u64,
+}
+
+impl SymbolHistogram {
+    fn add_slice(&mut self, values: &[u32]) {
+        self.total += values.len() as u64;
+        for &value in values {
+            *self.counts.entry(value).or_insert(0) += 1;
+        }
+    }
+
+    fn entropy_bits(&self) -> f64 {
+        if self.total == 0 {
+            return 0.0;
+        }
+        let total = self.total as f64;
+        let mut bits = 0.0;
+        for &count in self.counts.values() {
+            let p = (count as f64) / total;
+            bits -= (count as f64) * p.log2();
+        }
+        bits
+    }
+}
+
+#[derive(Default)]
+struct IndexBoundsReport {
+    actual_bits_total: f64,
+    actual_bits_row: f64,
+    actual_bits_column: f64,
+    lower_bound_bits_total: f64,
+    lower_bound_bits_row: f64,
+    lower_bound_bits_column: f64,
+    invalid_constraints: u64,
+    symbols: SymbolHistogram,
+}
+
+#[derive(Clone, Copy)]
+enum ColumnSupportPlan {
+    Empty,
+    Raw {
+        count: usize,
+    },
+    Ref {
+        parent_idx: usize,
+        remove_count: usize,
+        add_count: usize,
+    },
+    Template {
+        template_idx: usize,
+        remove_count: usize,
+        add_count: usize,
+    },
+}
+
+fn build_log2_factorial(max_n: usize) -> Vec<f64> {
+    let mut table = vec![0.0f64; max_n + 1];
+    for i in 1..=max_n {
+        table[i] = table[i - 1] + (i as f64).log2();
+    }
+    table
+}
+
+fn log2_choose(log2_fact: &[f64], n: usize, k: usize, invalid_constraints: &mut u64) -> f64 {
+    if k > n || n >= log2_fact.len() {
+        *invalid_constraints += 1;
+        return 0.0;
+    }
+    log2_fact[n] - log2_fact[k] - log2_fact[n - k]
+}
+
+fn zigzag_decode_i64(v: u32) -> i64 {
+    ((v >> 1) as i64) ^ (-((v & 1) as i64))
+}
+
+fn resolve_column_support_size(
+    idx: usize,
+    plans: &[ColumnSupportPlan],
+    template_sizes: &[usize],
+    memo: &mut [Option<usize>],
+    visiting: &mut [bool],
+    universe: usize,
+    invalid_constraints: &mut u64,
+) -> usize {
+    if let Some(value) = memo.get(idx).and_then(|v| *v) {
+        return value;
+    }
+    if idx >= plans.len() {
+        *invalid_constraints += 1;
+        return 0;
+    }
+    if visiting[idx] {
+        *invalid_constraints += 1;
+        return 0;
+    }
+
+    visiting[idx] = true;
+    let value = match plans[idx] {
+        ColumnSupportPlan::Empty => 0,
+        ColumnSupportPlan::Raw { count } => count.min(universe),
+        ColumnSupportPlan::Ref {
+            parent_idx,
+            remove_count,
+            add_count,
+        } => {
+            let parent = if parent_idx == idx {
+                *invalid_constraints += 1;
+                0
+            } else {
+                resolve_column_support_size(
+                    parent_idx,
+                    plans,
+                    template_sizes,
+                    memo,
+                    visiting,
+                    universe,
+                    invalid_constraints,
+                )
+            };
+            let remove = remove_count.min(parent);
+            let add = add_count.min(universe.saturating_sub(parent));
+            parent.saturating_sub(remove) + add
+        }
+        ColumnSupportPlan::Template {
+            template_idx,
+            remove_count,
+            add_count,
+        } => {
+            let template_support = template_sizes
+                .get(template_idx)
+                .copied()
+                .unwrap_or_else(|| {
+                    *invalid_constraints += 1;
+                    0
+                });
+            let template_support = template_support.min(universe);
+            let remove = remove_count.min(template_support);
+            let add = add_count.min(universe.saturating_sub(template_support));
+            template_support.saturating_sub(remove) + add
+        }
+    };
+    visiting[idx] = false;
+    memo[idx] = Some(value);
+    value
+}
+
+fn analyze_row_block_index_bounds(block: &EncodedDiffsMST, report: &mut IndexBoundsReport) {
+    const ROW_MODE_PARENT: u32 = 0;
+    const ROW_MODE_FULL: u32 = 1;
+    const ROW_MODE_TEMPLATE: u32 = 2;
+
+    let (_, _, _, op_index_bytes, _, _) = block.bytes_breakdown();
+    let actual_bits = (op_index_bytes as f64) * 8.0;
+    report.actual_bits_total += actual_bits;
+    report.actual_bits_row += actual_bits;
+
+    let child_modes = block.child_modes.decode_all().unwrap_or_default();
+    let full_counts = block.child_full_counts.decode_all().unwrap_or_default();
+    let remove_counts = block.child_remove_counts.decode_all().unwrap_or_default();
+    let add_counts = block.child_add_counts.decode_all().unwrap_or_default();
+    let update_counts = block.child_update_counts.decode_all().unwrap_or_default();
+    let row_template_counts = block.row_template_counts.decode_all().unwrap_or_default();
+    let child_template_ids = block.child_template_ids.decode_all();
+
+    report.symbols.add_slice(&child_modes);
+    report.symbols.add_slice(&full_counts);
+    report.symbols.add_slice(&remove_counts);
+    report.symbols.add_slice(&add_counts);
+    report.symbols.add_slice(&update_counts);
+    report.symbols.add_slice(&row_template_counts);
+    report
+        .symbols
+        .add_slice(&block.row_template_first_genes.decode_all());
+    report
+        .symbols
+        .add_slice(&block.row_template_gene_gaps.decode_all());
+    report.symbols.add_slice(&child_template_ids);
+    report
+        .symbols
+        .add_slice(&block.child_full_first_genes.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_full_gene_gaps.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_remove_first_genes.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_remove_gene_gaps.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_add_first_genes.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_add_gene_gaps.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_update_first_genes.decode_all());
+    report
+        .symbols
+        .add_slice(&block.child_update_gene_gaps.decode_all());
+
+    let universe = block.num_genes as usize;
+    let log2_fact = build_log2_factorial(universe);
+    let parent_offsets = block.parent_offset.decode_all().unwrap_or_default();
+    if parent_offsets.is_empty() {
+        return;
+    }
+
+    let mut support_sizes = vec![0usize; parent_offsets.len()];
+    support_sizes[0] = block.root_indices.decode_all_u32().len().min(universe);
+    let template_support_sizes: Vec<usize> = row_template_counts
+        .iter()
+        .map(|&c| (c as usize).min(universe))
+        .collect();
+    let mut template_id_cursor = 0usize;
+
+    let mut lb_bits = 0.0f64;
+    for dfs_pos in 1..support_sizes.len() {
+        let parent_offset = parent_offsets.get(dfs_pos).copied().unwrap_or(0) as usize;
+        let parent_pos = dfs_pos.saturating_sub(parent_offset);
+        let parent_support = support_sizes.get(parent_pos).copied().unwrap_or(0);
+        let child_idx = dfs_pos - 1;
+        let mode = child_modes
+            .get(child_idx)
+            .copied()
+            .unwrap_or(ROW_MODE_PARENT);
+
+        if mode == ROW_MODE_FULL {
+            let full_count = full_counts.get(child_idx).copied().unwrap_or(0) as usize;
+            lb_bits += log2_choose(
+                &log2_fact,
+                universe,
+                full_count,
+                &mut report.invalid_constraints,
+            );
+            support_sizes[dfs_pos] = full_count.min(universe);
+            continue;
+        }
+
+        let remove_count = remove_counts.get(child_idx).copied().unwrap_or(0) as usize;
+        let add_count = add_counts.get(child_idx).copied().unwrap_or(0) as usize;
+        let update_count = update_counts.get(child_idx).copied().unwrap_or(0) as usize;
+        let base_support = if mode == ROW_MODE_TEMPLATE {
+            let template_idx_raw = child_template_ids
+                .get(template_id_cursor)
+                .copied()
+                .unwrap_or(0);
+            template_id_cursor += 1;
+            template_support_sizes
+                .get(template_idx_raw as usize)
+                .copied()
+                .unwrap_or_else(|| {
+                    report.invalid_constraints += 1;
+                    parent_support
+                })
+        } else {
+            parent_support
+        };
+
+        lb_bits += log2_choose(
+            &log2_fact,
+            base_support,
+            remove_count,
+            &mut report.invalid_constraints,
+        );
+        lb_bits += log2_choose(
+            &log2_fact,
+            universe.saturating_sub(parent_support),
+            add_count,
+            &mut report.invalid_constraints,
+        );
+        let common_support = base_support.saturating_sub(remove_count.min(base_support));
+        lb_bits += log2_choose(
+            &log2_fact,
+            common_support,
+            update_count,
+            &mut report.invalid_constraints,
+        );
+
+        let child_support = base_support
+            .saturating_sub(remove_count.min(base_support))
+            .saturating_add(add_count.min(universe.saturating_sub(base_support)));
+        support_sizes[dfs_pos] = child_support.min(universe);
+    }
+
+    report.lower_bound_bits_total += lb_bits;
+    report.lower_bound_bits_row += lb_bits;
+}
+
+fn analyze_column_block_index_bounds(block: &EncodedColumnBlock, report: &mut IndexBoundsReport) {
+    const MODE_RAW: u32 = 0;
+    const MODE_REF: u32 = 1;
+    const MODE_TEMPLATE: u32 = 2;
+
+    let (_, _, _, op_index_bytes, _, _) = block.bytes_breakdown();
+    let actual_bits = (op_index_bytes as f64) * 8.0;
+    report.actual_bits_total += actual_bits;
+    report.actual_bits_column += actual_bits;
+
+    let raw_firsts = block.raw_row_firsts.decode_all();
+    let raw_gaps = block.raw_row_gaps.decode_all();
+    let template_row_firsts = block.template_row_firsts.decode_all();
+    let template_row_gaps = block.template_row_gaps.decode_all();
+    let ref_parent_deltas = block.ref_parent_deltas.decode_all();
+    let ref_remove_firsts = block.ref_remove_firsts.decode_all();
+    let ref_remove_gaps = block.ref_remove_gaps.decode_all();
+    let ref_add_firsts = block.ref_add_firsts.decode_all();
+    let ref_add_gaps = block.ref_add_gaps.decode_all();
+    let template_ids = block.template_ids.decode_all();
+    let template_remove_firsts = block.template_remove_firsts.decode_all();
+    let template_remove_gaps = block.template_remove_gaps.decode_all();
+    let template_add_firsts = block.template_add_firsts.decode_all();
+    let template_add_gaps = block.template_add_gaps.decode_all();
+
+    report.symbols.add_slice(&raw_firsts);
+    report.symbols.add_slice(&raw_gaps);
+    report.symbols.add_slice(&template_row_firsts);
+    report.symbols.add_slice(&template_row_gaps);
+    report.symbols.add_slice(&ref_parent_deltas);
+    report.symbols.add_slice(&ref_remove_firsts);
+    report.symbols.add_slice(&ref_remove_gaps);
+    report.symbols.add_slice(&ref_add_firsts);
+    report.symbols.add_slice(&ref_add_gaps);
+    report.symbols.add_slice(&template_ids);
+    report.symbols.add_slice(&template_remove_firsts);
+    report.symbols.add_slice(&template_remove_gaps);
+    report.symbols.add_slice(&template_add_firsts);
+    report.symbols.add_slice(&template_add_gaps);
+
+    let num_genes = block.local_to_global.decode_all_u32().len();
+    if num_genes == 0 {
+        return;
+    }
+
+    let modes = block.posting_modes.decode_all().unwrap_or_default();
+    let counts = block.posting_counts.decode_all().unwrap_or_default();
+    let template_counts = block.template_counts.decode_all().unwrap_or_default();
+    let ref_remove_counts = block.ref_remove_counts.decode_all().unwrap_or_default();
+    let ref_add_counts = block.ref_add_counts.decode_all().unwrap_or_default();
+    let template_remove_counts = block
+        .template_remove_counts
+        .decode_all()
+        .unwrap_or_default();
+    let template_add_counts = block.template_add_counts.decode_all().unwrap_or_default();
+
+    let universe = block.num_cells as usize;
+    let template_sizes: Vec<usize> = template_counts
+        .iter()
+        .map(|&count| (count as usize).min(universe))
+        .collect();
+
+    let mut raw_first_cursor = 0usize;
+    let mut raw_gap_cursor = 0usize;
+    let mut template_row_first_cursor = 0usize;
+    let mut template_row_gap_cursor = 0usize;
+    let mut ref_parent_cursor = 0usize;
+    let mut ref_count_cursor = 0usize;
+    let mut ref_remove_first_cursor = 0usize;
+    let mut ref_remove_gap_cursor = 0usize;
+    let mut ref_add_first_cursor = 0usize;
+    let mut ref_add_gap_cursor = 0usize;
+    let mut template_ref_cursor = 0usize;
+    let mut template_ref_count_cursor = 0usize;
+    let mut template_remove_first_cursor = 0usize;
+    let mut template_remove_gap_cursor = 0usize;
+    let mut template_add_first_cursor = 0usize;
+    let mut template_add_gap_cursor = 0usize;
+
+    for &count in &template_sizes {
+        if count > 0 {
+            template_row_first_cursor = template_row_first_cursor.saturating_add(1);
+            template_row_gap_cursor = template_row_gap_cursor.saturating_add(count - 1);
+        }
+    }
+
+    let mut plans = Vec::with_capacity(num_genes);
+    for gene_pos in 0..num_genes {
+        let count = counts.get(gene_pos).copied().unwrap_or(0) as usize;
+        let mode = modes.get(gene_pos).copied().unwrap_or(MODE_RAW);
+
+        if count == 0 {
+            plans.push(ColumnSupportPlan::Empty);
+            continue;
+        }
+
+        if mode == MODE_REF {
+            let parent_delta = ref_parent_deltas
+                .get(ref_parent_cursor)
+                .copied()
+                .unwrap_or(0);
+            ref_parent_cursor += 1;
+            let parent_idx = (gene_pos as i64)
+                .checked_add(zigzag_decode_i64(parent_delta))
+                .filter(|idx| *idx >= 0 && (*idx as usize) < num_genes)
+                .map(|idx| idx as usize)
+                .unwrap_or_else(|| {
+                    report.invalid_constraints += 1;
+                    gene_pos
+                });
+            let remove_count = ref_remove_counts
+                .get(ref_count_cursor)
+                .copied()
+                .unwrap_or(0) as usize;
+            let add_count = ref_add_counts.get(ref_count_cursor).copied().unwrap_or(0) as usize;
+            ref_count_cursor += 1;
+
+            if remove_count > 0 {
+                ref_remove_first_cursor = ref_remove_first_cursor.saturating_add(1);
+                ref_remove_gap_cursor =
+                    ref_remove_gap_cursor.saturating_add(remove_count.saturating_sub(1));
+            }
+            if add_count > 0 {
+                ref_add_first_cursor = ref_add_first_cursor.saturating_add(1);
+                ref_add_gap_cursor = ref_add_gap_cursor.saturating_add(add_count.saturating_sub(1));
+            }
+
+            plans.push(ColumnSupportPlan::Ref {
+                parent_idx,
+                remove_count,
+                add_count,
+            });
+        } else if mode == MODE_TEMPLATE {
+            let template_idx_raw = template_ids.get(template_ref_cursor).copied().unwrap_or(0);
+            template_ref_cursor += 1;
+            let template_idx =
+                (template_idx_raw as usize).min(template_sizes.len().saturating_sub(1));
+            if template_sizes.is_empty() || template_idx_raw as usize >= template_sizes.len() {
+                report.invalid_constraints += 1;
+            }
+
+            let remove_count = template_remove_counts
+                .get(template_ref_count_cursor)
+                .copied()
+                .unwrap_or(0) as usize;
+            let add_count = template_add_counts
+                .get(template_ref_count_cursor)
+                .copied()
+                .unwrap_or(0) as usize;
+            template_ref_count_cursor += 1;
+
+            if remove_count > 0 {
+                template_remove_first_cursor = template_remove_first_cursor.saturating_add(1);
+                template_remove_gap_cursor =
+                    template_remove_gap_cursor.saturating_add(remove_count.saturating_sub(1));
+            }
+            if add_count > 0 {
+                template_add_first_cursor = template_add_first_cursor.saturating_add(1);
+                template_add_gap_cursor =
+                    template_add_gap_cursor.saturating_add(add_count.saturating_sub(1));
+            }
+
+            plans.push(ColumnSupportPlan::Template {
+                template_idx,
+                remove_count,
+                add_count,
+            });
+        } else {
+            if count > 0 {
+                raw_first_cursor = raw_first_cursor.saturating_add(1);
+                raw_gap_cursor = raw_gap_cursor.saturating_add(count.saturating_sub(1));
+            }
+            plans.push(ColumnSupportPlan::Raw { count });
+        }
+    }
+
+    let log2_fact = build_log2_factorial(universe);
+    let mut memo = vec![None; num_genes];
+    let mut visiting = vec![false; num_genes];
+    let mut support_sizes = vec![0usize; num_genes];
+    for gene_pos in 0..num_genes {
+        support_sizes[gene_pos] = resolve_column_support_size(
+            gene_pos,
+            &plans,
+            &template_sizes,
+            &mut memo,
+            &mut visiting,
+            universe,
+            &mut report.invalid_constraints,
+        );
+    }
+
+    let mut lb_bits = 0.0f64;
+    for gene_pos in 0..num_genes {
+        match plans[gene_pos] {
+            ColumnSupportPlan::Empty => {}
+            ColumnSupportPlan::Raw { count } => {
+                lb_bits +=
+                    log2_choose(&log2_fact, universe, count, &mut report.invalid_constraints);
+            }
+            ColumnSupportPlan::Ref {
+                parent_idx,
+                remove_count,
+                add_count,
+            } => {
+                let parent_support = support_sizes
+                    .get(parent_idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(universe);
+                lb_bits += log2_choose(
+                    &log2_fact,
+                    parent_support,
+                    remove_count,
+                    &mut report.invalid_constraints,
+                );
+                lb_bits += log2_choose(
+                    &log2_fact,
+                    universe.saturating_sub(parent_support),
+                    add_count,
+                    &mut report.invalid_constraints,
+                );
+            }
+            ColumnSupportPlan::Template {
+                template_idx,
+                remove_count,
+                add_count,
+            } => {
+                let template_support = template_sizes
+                    .get(template_idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(universe);
+                lb_bits += log2_choose(
+                    &log2_fact,
+                    template_support,
+                    remove_count,
+                    &mut report.invalid_constraints,
+                );
+                lb_bits += log2_choose(
+                    &log2_fact,
+                    universe.saturating_sub(template_support),
+                    add_count,
+                    &mut report.invalid_constraints,
+                );
+            }
+        }
+    }
+
+    report.lower_bound_bits_total += lb_bits;
+    report.lower_bound_bits_column += lb_bits;
+}
+
+fn compute_index_bounds_report(encoded_blocks: &[EncodedClusterBlock]) -> IndexBoundsReport {
+    let mut report = IndexBoundsReport::default();
+    for block in encoded_blocks {
+        match block {
+            EncodedClusterBlock::RowMst(row_block) => {
+                analyze_row_block_index_bounds(row_block, &mut report);
+            }
+            EncodedClusterBlock::Column(column_block) => {
+                analyze_column_block_index_bounds(column_block, &mut report);
+            }
+        }
+    }
+    report
+}
+
+fn log_index_bounds_report(report: &IndexBoundsReport, nnz: usize) {
+    let entropy_bits = report.symbols.entropy_bits();
+    let symbols = report.symbols.total.max(1) as f64;
+    let nnz_denom = nnz.max(1) as f64;
+
+    let actual_over_lb = if report.lower_bound_bits_total > 0.0 {
+        report.actual_bits_total / report.lower_bound_bits_total
+    } else {
+        0.0
+    };
+    let actual_over_h0 = if entropy_bits > 0.0 {
+        report.actual_bits_total / entropy_bits
+    } else {
+        0.0
+    };
+
+    info!(
+        "Index bounds report (op_indices): actual_bits={:.0} (row={:.0}, column={:.0})",
+        report.actual_bits_total, report.actual_bits_row, report.actual_bits_column
+    );
+    info!(
+        "  Support lower bound={:.0} bits (actual/lower_bound={:.3})",
+        report.lower_bound_bits_total, actual_over_lb
+    );
+    info!(
+        "  Zero-order entropy bound={:.0} bits over {} symbols ({} unique, actual/H0={:.3})",
+        entropy_bits,
+        report.symbols.total,
+        report.symbols.counts.len(),
+        actual_over_h0
+    );
+    info!(
+        "  Bits per symbol: actual={:.3}, H0={:.3}",
+        report.actual_bits_total / symbols,
+        entropy_bits / symbols
+    );
+    info!(
+        "  Bits per nnz: actual={:.3}, lower_bound={:.3}, H0={:.3}",
+        report.actual_bits_total / nnz_denom,
+        report.lower_bound_bits_total / nnz_denom,
+        entropy_bits / nnz_denom
+    );
+    info!(
+        "  Lower-bound split: row={:.0} bits, column={:.0} bits",
+        report.lower_bound_bits_row, report.lower_bound_bits_column
+    );
+    if report.invalid_constraints > 0 {
+        info!(
+            "  Note: {} bound terms had invalid constraints and were clamped/ignored",
+            report.invalid_constraints
+        );
+    }
+}
+
 fn run_clustered_compression(
     points: &[Point],
     data: &CsMat<u16>,
@@ -600,9 +1233,15 @@ fn run_clustered_compression(
     knn_metric: KnnDistanceMetric,
     mst_weight_mode: MstWeightMode,
     index_codec: IndexStreamCodec,
+    sorted_index_codec: SortedIndexCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
     cluster_encoding: ClusterEncodingArg,
+    column_template_count: usize,
+    column_template_adaptive: bool,
+    column_template_max: usize,
+    row_template_adaptive: bool,
+    row_template_max: usize,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -701,6 +1340,8 @@ fn run_clustered_compression(
                 Vec<u32>,
                 usize,
                 usize,
+                bool,
+                bool,
             )>,
         >,
     > = clusters
@@ -715,43 +1356,78 @@ fn run_clustered_compression(
                 cluster.iter().map(|&idx| points[idx].clone()).collect();
             let mut row_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
             let mut col_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+            let mut row_selected_adaptive = false;
+            let mut col_selected_adaptive = false;
 
             if matches!(
                 cluster_encoding,
                 ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
             ) {
-                if let Some((row_block, dfs_order)) = encode_subarray_mst_with_metric(
-                    &cluster_points,
-                    &quantized_data,
-                    knn_metric,
-                    mst_weight_mode,
-                    Some(&gene_old_to_new),
-                    index_codec,
-                    full_row_fallback_ratio,
-                    forest_cut_factor,
-                ) {
-                    let bytes = row_block.total_bytes();
-                    row_candidate =
-                        Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
+                let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+                let mut try_row_encode = |adaptive: bool| {
+                    if let Some((row_block, dfs_order)) = encode_subarray_mst_with_metric(
+                        &cluster_points,
+                        &quantized_data,
+                        knn_metric,
+                        mst_weight_mode,
+                        Some(&gene_old_to_new),
+                        index_codec,
+                        sorted_index_codec,
+                        full_row_fallback_ratio,
+                        forest_cut_factor,
+                        adaptive,
+                        row_template_max,
+                    ) {
+                        let bytes = row_block.total_bytes();
+                        if best_row.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
+                            best_row =
+                                Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
+                            row_selected_adaptive = adaptive;
+                        }
+                    }
+                };
+
+                try_row_encode(row_template_adaptive);
+                if row_template_adaptive {
+                    try_row_encode(false);
                 }
+                row_candidate = best_row;
             }
 
             if matches!(
                 cluster_encoding,
                 ClusterEncodingArg::Column | ClusterEncodingArg::Hybrid
             ) {
-                if let Some(col_block) = encode_subarray_column(
-                    &cluster_points,
-                    &quantized_data,
-                    Some(&gene_old_to_new),
-                    index_codec,
-                ) {
-                    let order: Vec<u32> = (0..cluster_points.len()).map(|i| i as u32).collect();
-                    let bytes = col_block.total_bytes();
-                    col_candidate = Some((EncodedClusterBlock::Column(col_block), order, bytes));
+                let mut best_col: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+                let mut try_col_encode = |adaptive: bool| {
+                    if let Some(col_block) = encode_subarray_column(
+                        &cluster_points,
+                        &quantized_data,
+                        Some(&gene_old_to_new),
+                        index_codec,
+                        sorted_index_codec,
+                        column_template_count,
+                        adaptive,
+                        column_template_max,
+                    ) {
+                        let (col_block, order) = col_block;
+                        let bytes = col_block.total_bytes();
+                        if best_col.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
+                            best_col = Some((EncodedClusterBlock::Column(col_block), order, bytes));
+                            col_selected_adaptive = adaptive;
+                        }
+                    }
+                };
+
+                try_col_encode(column_template_adaptive);
+                if column_template_adaptive {
+                    try_col_encode(false);
                 }
+                col_candidate = best_col;
             }
 
+            let row_available = row_candidate.is_some();
+            let col_available = col_candidate.is_some();
             let (encoded, local_order, bytes) = match cluster_encoding {
                 ClusterEncodingArg::Row => row_candidate.ok_or_else(|| {
                     anyhow::anyhow!("Row-MST encoding failed for cluster {}", cluster_idx)
@@ -797,6 +1473,8 @@ fn run_clustered_compression(
                 cluster_row_order,
                 cluster_points.len(),
                 bytes,
+                row_template_adaptive && row_available && !row_selected_adaptive,
+                column_template_adaptive && col_available && !col_selected_adaptive,
             )))
         })
         .collect();
@@ -807,14 +1485,41 @@ fn run_clustered_compression(
             ordered.push(v);
         }
     }
-    ordered.sort_unstable_by_key(|(cluster_idx, _, _, _, _, _)| *cluster_idx);
+    ordered.sort_unstable_by_key(|(cluster_idx, _, _, _, _, _, _, _)| *cluster_idx);
 
     let mut row_block_count = 0usize;
     let mut column_block_count = 0usize;
-    for (_idx, encoded, cluster_positions, cluster_row_order, cluster_ncells, bytes) in ordered {
+    let mut row_adaptive_fallback_wins = 0usize;
+    let mut col_adaptive_fallback_wins = 0usize;
+    let mut col_value_model_global_blocks = 0usize;
+    let mut col_value_model_per_gene_blocks = 0usize;
+    for (
+        _idx,
+        encoded,
+        cluster_positions,
+        cluster_row_order,
+        cluster_ncells,
+        bytes,
+        row_fallback_used,
+        col_fallback_used,
+    ) in ordered
+    {
+        if row_fallback_used {
+            row_adaptive_fallback_wins += 1;
+        }
+        if col_fallback_used {
+            col_adaptive_fallback_wins += 1;
+        }
         match &encoded {
             EncodedClusterBlock::RowMst(_) => row_block_count += 1,
-            EncodedClusterBlock::Column(_) => column_block_count += 1,
+            EncodedClusterBlock::Column(block) => {
+                column_block_count += 1;
+                if block.uses_per_gene_values() {
+                    col_value_model_per_gene_blocks += 1;
+                } else {
+                    col_value_model_global_blocks += 1;
+                }
+            }
         }
         total_mst_bytes += bytes;
         cluster_sizes.push(cluster_ncells);
@@ -827,6 +1532,18 @@ fn run_clustered_compression(
         "Cluster payload selection: row_blocks={} column_blocks={}",
         row_block_count, column_block_count
     );
+    if row_template_adaptive || column_template_adaptive {
+        info!(
+            "Adaptive fallback selection: row_nonadaptive_wins={} column_nonadaptive_wins={}",
+            row_adaptive_fallback_wins, col_adaptive_fallback_wins
+        );
+    }
+    if column_block_count > 0 {
+        info!(
+            "Column value model selection: global_blocks={} per_gene_blocks={}",
+            col_value_model_global_blocks, col_value_model_per_gene_blocks
+        );
+    }
 
     if verify_lossless && !quantize_values {
         let reconstructed = reconstruct_csr_from_clustered_payload(
@@ -1072,6 +1789,9 @@ struct BuildCommand {
     /// Codec used for index-like streams in MST payloads.
     #[arg(long = "index-codec", value_enum, default_value_t = IndexCodecArg::Arithmetic)]
     index_codec: IndexCodecArg,
+    /// Codec used for sorted support/index lists (root supports, column gene ids, local dictionaries).
+    #[arg(long = "sorted-index-codec", value_enum, default_value_t = SortedIndexCodecArg::Delta)]
+    sorted_index_codec: SortedIndexCodecArg,
     /// If set, disable per-child full-row fallback when edit deltas are too large.
     #[arg(long = "disable-full-row-fallback", default_value_t = false)]
     disable_full_row_fallback: bool,
@@ -1084,6 +1804,24 @@ struct BuildCommand {
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
+    /// Fixed number of prototype supports per cluster for column encoding (used when adaptive is off).
+    #[arg(long = "column-template-count", default_value_t = 0)]
+    column_template_count: usize,
+    /// Enable adaptive selection of column template count per cluster.
+    #[arg(long = "column-template-adaptive", default_value_t = false)]
+    column_template_adaptive: bool,
+    /// Maximum number of column templates to consider in adaptive mode.
+    #[arg(long = "column-template-max", default_value_t = 32)]
+    column_template_max: usize,
+    /// Enable adaptive row-template mode for row-MST payloads.
+    #[arg(long = "row-template-adaptive", default_value_t = false)]
+    row_template_adaptive: bool,
+    /// Maximum number of row templates to consider in adaptive mode.
+    #[arg(long = "row-template-max", default_value_t = 16)]
+    row_template_max: usize,
+    /// If set, emit combinatorial and entropy diagnostics for op_indices.
+    #[arg(long = "report-index-bounds", default_value_t = false)]
+    report_index_bounds: bool,
 }
 
 #[derive(Debug, Args)]
@@ -1146,6 +1884,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let quantizer_bins = args.lossy_bins.max(1);
             let sweep_counts = normalize_quantizer_counts(target_quantizers, &args.lossy_sweep);
             let index_codec = IndexStreamCodec::from(args.index_codec);
+            let sorted_index_codec = SortedIndexCodec::from(args.sorted_index_codec);
             let mst_weight_mode = MstWeightMode::from(args.mst_weight);
             let fallback_ratio = if args.disable_full_row_fallback {
                 None
@@ -1156,7 +1895,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cluster_encoding = args.cluster_encoding;
 
             info!(
-                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?}",
+                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 target_quantizers,
                 quantizer_bins,
@@ -1165,9 +1904,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.knn_metric,
                 args.mst_weight,
                 args.index_codec,
+                args.sorted_index_codec,
                 fallback_ratio,
                 forest_cut_factor,
-                cluster_encoding
+                cluster_encoding,
+                args.column_template_count,
+                args.column_template_adaptive,
+                args.column_template_max,
+                args.row_template_adaptive,
+                args.row_template_max
             );
 
             let mut metrics = Vec::new();
@@ -1185,9 +1930,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.knn_metric.into(),
                     mst_weight_mode,
                     index_codec,
+                    sorted_index_codec,
                     fallback_ratio,
                     forest_cut_factor,
                     cluster_encoding,
+                    args.column_template_count,
+                    args.column_template_adaptive,
+                    args.column_template_max,
+                    args.row_template_adaptive,
+                    args.row_template_max,
                 )?;
 
                 info!(
@@ -1303,6 +2054,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  values breakdown: root_indices={} root_vals={} op_indices={} op_vals={}",
                 bytes_root_indices, bytes_root_vals, bytes_indices, bytes_delta_vals
             );
+            if args.report_index_bounds {
+                let bounds_report = compute_index_bounds_report(&selected.encoded_blocks);
+                log_index_bounds_report(&bounds_report, csr.nnz());
+            }
         }
         Commands::RoundtripCheck(args) => {
             let (pos_x_col, pos_y_col) =
@@ -1393,9 +2148,15 @@ mod tests {
             KnnDistanceMetric::L0,
             MstWeightMode::Metric,
             IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
             Some(1.0),
             None,
             ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
         )
         .expect("lossy compression should succeed");
 
