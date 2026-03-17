@@ -10,7 +10,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use index_stream::IndexStreamCodec;
-use matrix_io::{load_10x_with_positions, InputPosType, Platform};
+use matrix_io::{load_10x_no_positions, load_10x_with_positions, InputPosType, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
     encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
@@ -1727,6 +1727,7 @@ fn resolve_position_columns(
     match platform {
         Some(Platform::Visium) => (4, 5),
         Some(Platform::Xenium) => (1, 2),
+        Some(Platform::SingleCell) => (pos_x_col.unwrap_or(0), pos_y_col.unwrap_or(1)),
         None => (pos_x_col.unwrap_or(1), pos_y_col.unwrap_or(2)),
     }
 }
@@ -1750,8 +1751,9 @@ enum Commands {
 struct BuildCommand {
     #[arg(short = 'i', long)]
     input: PathBuf,
+    /// Optional positions file (CSV or Parquet). Required unless platform is `single-cell`.
     #[arg(short = 'p', long = "input-pos")]
-    input_pos: PathBuf,
+    input_pos: Option<PathBuf>,
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
     #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
@@ -1859,17 +1861,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Build(args) => {
-            let (pos_x_col, pos_y_col) =
-                resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
-
-            let (csr, points) = load_10x_with_positions(
-                &args.input,
-                &args.input_pos,
-                args.pos_format,
-                pos_x_col,
-                pos_y_col,
-                args.max_cells,
-            )?;
+            let (csr, points) = match args.platform {
+                Some(Platform::SingleCell) => {
+                    // Single-cell mode: no positions file required; generate dummy points.
+                    load_10x_no_positions(&args.input, args.max_cells)?
+                }
+                _ => {
+                    // Spatial modes: positions file is required.
+                    let pos_path = args.input_pos.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "input-pos is required unless --platform single-cell is used"
+                        )
+                    })?;
+                    let (pos_x_col, pos_y_col) =
+                        resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
+                    load_10x_with_positions(
+                        &args.input,
+                        pos_path,
+                        args.pos_format,
+                        pos_x_col,
+                        pos_y_col,
+                        args.max_cells,
+                    )?
+                }
+            };
 
             info!(
                 "Loaded matrix rows={}, cols={}, nnz={}, points={}",
