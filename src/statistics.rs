@@ -1,6 +1,7 @@
 use ndarray::{Array1, Array2, Axis};
 use rayon::prelude::*;
 use std::fs::File;
+use std::collections::HashMap;
 use csv::ReaderBuilder;
 use rand::seq::IndexedRandom;
 use std::path::{Path, PathBuf};
@@ -289,6 +290,7 @@ fn read_strings_dynamic(file: &Hdf5File, path: &str) -> Result<Vec<String>> {
     match dsize {
         6  => if let Ok(v) = dataset.read_1d::<FixedAscii<6>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
         7  => if let Ok(v) = dataset.read_1d::<FixedAscii<7>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        10 => if let Ok(v) = dataset.read_1d::<FixedAscii<10>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
         11 => if let Ok(v) = dataset.read_1d::<FixedAscii<11>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
         15 => if let Ok(v) = dataset.read_1d::<FixedAscii<15>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
         16 => if let Ok(v) = dataset.read_1d::<FixedAscii<16>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
@@ -331,6 +333,157 @@ fn resolve_position_columns(
         Some(Platform::SingleCell) => (pos_x_col.unwrap_or(0), pos_y_col.unwrap_or(1)),
         None => (pos_x_col.unwrap_or(1), pos_y_col.unwrap_or(2)),
     }
+}
+
+fn load_positions_from_csv(
+    pos_path: &Path,
+    pos_x_col: usize,
+    pos_y_col: usize,
+) -> Result<HashMap<String, (f64, f64)>> {
+    let mut pos_map = HashMap::new();
+    let mut rdr = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_path(pos_path)?;
+    for rec in rdr.records() {
+        let rec = rec?;
+        if rec.len() <= pos_y_col {
+            continue;
+        }
+        let barcode = rec.get(0).unwrap_or_default().trim().trim_matches('"');
+        if barcode.is_empty() {
+            continue;
+        }
+        let x = match rec.get(pos_x_col).unwrap_or_default().trim().parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let y = match rec.get(pos_y_col).unwrap_or_default().trim().parse::<f64>() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        pos_map.insert(barcode.to_string(), (x, y));
+    }
+    Ok(pos_map)
+}
+
+fn load_positions_from_parquet(
+    pos_path: &Path,
+    pos_x_col: usize,
+    pos_y_col: usize,
+) -> Result<HashMap<String, (f64, f64)>> {
+    fn get_numeric_as_f64(row: &parquet::record::Row, idx: usize) -> Result<f64> {
+        if let Ok(v) = row.get_double(idx) {
+            return Ok(v);
+        }
+        if let Ok(v) = row.get_float(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_long(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_int(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_short(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_byte(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_ubyte(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_ushort(idx) {
+            return Ok(v as f64);
+        }
+        if let Ok(v) = row.get_uint(idx) {
+            return Ok(v as f64);
+        }
+        anyhow::bail!("Parquet column {} is not a numeric type convertible to f64", idx);
+    }
+
+    let pos_file = std::fs::File::open(pos_path)?;
+    let reader = SerializedFileReader::new(pos_file)?;
+    let mut iter = reader.get_row_iter(None)?;
+    let mut pos_map = HashMap::new();
+    while let Some(Ok(row)) = iter.next() {
+        let barcode = match row.get_string(0) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                // Some Xenium parquet files store `cell_id` as BLOB rather than UTF8.
+                // Decode bytes lossily to match H5 barcode strings.
+                let raw = row.get_bytes(0)?;
+                String::from_utf8_lossy(raw.data()).to_string()
+            }
+        };
+        let x = get_numeric_as_f64(&row, pos_x_col)?;
+        let y = get_numeric_as_f64(&row, pos_y_col)?;
+        pos_map.insert(barcode, (x, y));
+    }
+    Ok(pos_map)
+}
+
+/// Load 10x-style H5 with external positions file (CSV/Parquet), matching rows by barcode.
+fn load_from_h5_with_pos(
+    h5_path: &Path,
+    pos_path: &Path,
+    pos_x_col: usize,
+    pos_y_col: usize,
+) -> Result<(Array2<f64>, Array2<f64>)> {
+    let file = Hdf5File::open(h5_path)?;
+    let matrix_group = file.group("matrix")?;
+
+    let shape: Vec<usize> = matrix_group.dataset("shape")?.read_1d::<usize>()?.to_vec();
+    let num_features = shape[0];
+    let num_cells = shape[1];
+
+    let data_arr = matrix_group.dataset("data")?.read_1d::<u16>()?;
+    let indices_arr = matrix_group.dataset("indices")?.read_1d::<usize>()?;
+    let indptr_arr = matrix_group.dataset("indptr")?.read_1d::<usize>()?;
+
+    let mut dense_data = Array2::<f64>::zeros((num_cells, num_features));
+    for i in 0..num_cells {
+        let start = indptr_arr[i];
+        let end = indptr_arr[i + 1];
+        for j in start..end {
+            dense_data[[i, indices_arr[j]]] = data_arr[j] as f64;
+        }
+    }
+
+    let barcodes = read_strings_dynamic(&file, "/matrix/barcodes")?;
+    if barcodes.len() < num_cells {
+        anyhow::bail!(
+            "Not enough barcodes for selected rows: have {}, need {}",
+            barcodes.len(),
+            num_cells
+        );
+    }
+
+    let pos_map = match pos_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+    {
+        Some(ext) if ext == "csv" => load_positions_from_csv(pos_path, pos_x_col, pos_y_col)?,
+        _ => load_positions_from_parquet(pos_path, pos_x_col, pos_y_col)?,
+    };
+
+    let mut coords_vec = Vec::with_capacity(num_cells * 2);
+    for row_idx in 0..num_cells {
+        let barcode = &barcodes[row_idx];
+        let (x, y) = pos_map.get(barcode).copied().ok_or_else(|| {
+            anyhow::anyhow!(
+                "Missing position for barcode '{}' at row {}",
+                barcode,
+                row_idx
+            )
+        })?;
+        coords_vec.push(x);
+        coords_vec.push(y);
+    }
+    let coords = Array2::from_shape_vec((num_cells, 2), coords_vec)?;
+
+    Ok((dense_data, coords))
 }
 
 /// Load 10x-style H5 without a positions file (single-cell mode).
@@ -583,12 +736,18 @@ fn main() -> Result<()> {
     let test_type = args.test_type;
     let (data_raw, coords): (Array2<f64>, Array2<f64>) = match args.format {
         InputFormat::Csv => load_from_csv(&args.input, args.x_col, args.y_col, args.gene_start)?,
-        InputFormat::H5 => {
-            // DEBUG: temporarily disable H5+positions path; treat all H5 as single-cell
-            // and ignore the positions file to avoid calling the removed `load_from_h5`.
-            println!("DEBUG: Using load_from_h5_no_pos for H5 input (ignoring --pos and --platform)");
-            load_from_h5_no_pos(&args.input)?
-        }
+        InputFormat::H5 => match args.platform {
+            Some(Platform::SingleCell) => load_from_h5_no_pos(&args.input)?,
+            _ => {
+                let pos_path = args.pos.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--pos is required for H5 unless --platform single-cell is used"
+                    )
+                })?;
+                let (pos_x_col, pos_y_col) = resolve_position_columns(args.platform, None, None);
+                load_from_h5_with_pos(&args.input, pos_path, pos_x_col, pos_y_col)?
+            }
+        },
     };
 
     let n_cells = data_raw.nrows();
