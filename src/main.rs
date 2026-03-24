@@ -1756,6 +1756,9 @@ struct BuildCommand {
     input_pos: Option<PathBuf>,
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
+    /// If set, do not write compressed payload to disk.
+    #[arg(long = "no-output", default_value_t = false)]
+    no_output: bool,
     /// Optional CSV path to append compression statistics per run.
     #[arg(long = "stats-csv")]
     stats_csv: Option<PathBuf>,
@@ -2090,23 +2093,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
-            let output = args
-                .output
-                .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
             let config = bincode::config::standard()
                 .with_little_endian()
                 .with_fixed_int_encoding();
-
-            let file = File::create(&output)?;
-            let writer = BufWriter::new(file);
-            let mut encoder = GzEncoder::new(writer, Compression::default());
-            bincode::encode_into_std_write(&selected.encoded_blocks, &mut encoder, config)?;
-            bincode::encode_into_std_write(&selected.positions, &mut encoder, config)?;
-            bincode::encode_into_std_write(&selected.row_order, &mut encoder, config)?;
-            bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
-            let _ = encoder.finish()?;
-
-            let actual_gzip_bytes = std::fs::metadata(&output)?.len() as usize;
+            let actual_gzip_bytes = if args.no_output {
+                // Keep size metrics available while skipping disk writes.
+                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+                bincode::encode_into_std_write(&selected.encoded_blocks, &mut encoder, config)?;
+                bincode::encode_into_std_write(&selected.positions, &mut encoder, config)?;
+                bincode::encode_into_std_write(&selected.row_order, &mut encoder, config)?;
+                bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
+                encoder.finish()?.len()
+            } else {
+                let output = args
+                    .output
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
+                let file = File::create(&output)?;
+                let writer = BufWriter::new(file);
+                let mut encoder = GzEncoder::new(writer, Compression::default());
+                bincode::encode_into_std_write(&selected.encoded_blocks, &mut encoder, config)?;
+                bincode::encode_into_std_write(&selected.positions, &mut encoder, config)?;
+                bincode::encode_into_std_write(&selected.row_order, &mut encoder, config)?;
+                bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
+                let _ = encoder.finish()?;
+                info!("Saved encoded payload to {}", output.display());
+                std::fs::metadata(&output)?.len() as usize
+            };
             let total_entries = (points.len() * csr.cols()).max(1);
             let actual_rate = (actual_gzip_bytes as f64 * 8.0) / total_entries as f64;
 
@@ -2134,7 +2147,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let gene_order_bytes = selected.gene_order.len() * std::mem::size_of::<u32>();
             let payload_with_col_order = mst_payload_bytes + gene_order_bytes;
 
-            info!("Saved encoded payload to {}", output.display());
+            if args.no_output {
+                info!("--no-output enabled: skipped writing compressed payload file");
+            }
             info!(
                 "Selected setting: q={} (used={}), bins={}, clusters={}",
                 selected.quantizers_requested,
