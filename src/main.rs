@@ -21,7 +21,7 @@ use rayon::prelude::*;
 use sorted_indices::SortedIndexCodec;
 use sprs::CsMat;
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
 use tracing::{info, warn};
@@ -1756,6 +1756,9 @@ struct BuildCommand {
     input_pos: Option<PathBuf>,
     #[arg(short = 'o', long)]
     output: Option<PathBuf>,
+    /// Optional CSV path to append compression statistics per run.
+    #[arg(long = "stats-csv")]
+    stats_csv: Option<PathBuf>,
     #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
     #[arg(short = 'P', long = "platform", value_enum)]
@@ -1826,6 +1829,104 @@ struct BuildCommand {
     report_index_bounds: bool,
 }
 
+fn infer_stats_label(input: &Path) -> String {
+    input
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            input
+                .file_name()
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| input.display().to_string())
+}
+
+fn append_build_stats_csv(
+    csv_path: &Path,
+    stats_label: &str,
+    input_matrix_bytes: usize,
+    input_positions_bytes: usize,
+    mst_uncompressed_bytes: usize,
+    gzip_actual_bytes: usize,
+    rows_times_cols: usize,
+    nnz: usize,
+    actual_rate_bits_per_value: f64,
+    topology_parent_offset_bytes: usize,
+    values_root_plus_ops_bytes: usize,
+    metadata_num_genes_bytes: usize,
+    column_order_bytes: usize,
+    values_root_indices_bytes: usize,
+    values_root_vals_bytes: usize,
+    values_op_indices_bytes: usize,
+    values_op_vals_bytes: usize,
+) -> anyhow::Result<()> {
+    let input_bytes_sum = input_matrix_bytes + input_positions_bytes;
+    let gzip_to_input_sum_ratio = if input_bytes_sum > 0 {
+        gzip_actual_bytes as f64 / input_bytes_sum as f64
+    } else {
+        0.0
+    };
+
+    let file_exists = csv_path.exists();
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(csv_path)?;
+    let mut wtr = csv::WriterBuilder::new()
+        .has_headers(false)
+        .from_writer(file);
+
+    if !file_exists || std::fs::metadata(csv_path)?.len() == 0 {
+        wtr.write_record([
+            "stats_csv",
+            "input_matrix_bytes",
+            "input_positions_bytes",
+            "input_bytes_sum",
+            "mst_uncompressed_bytes",
+            "gzip_actual_bytes",
+            "gzip_to_input_sum_ratio",
+            "rows_times_cols",
+            "nnz",
+            "actual_rate_bits_per_value",
+            "topology_parent_offset_bytes",
+            "values_root_plus_ops_bytes",
+            "metadata_num_genes_bytes",
+            "column_order_bytes",
+            "values_root_indices_bytes",
+            "values_root_vals_bytes",
+            "values_op_indices_bytes",
+            "values_op_vals_bytes",
+        ])?;
+    }
+
+    wtr.write_record([
+        stats_label.to_string(),
+        input_matrix_bytes.to_string(),
+        input_positions_bytes.to_string(),
+        input_bytes_sum.to_string(),
+        mst_uncompressed_bytes.to_string(),
+        gzip_actual_bytes.to_string(),
+        gzip_to_input_sum_ratio.to_string(),
+        rows_times_cols.to_string(),
+        nnz.to_string(),
+        actual_rate_bits_per_value.to_string(),
+        topology_parent_offset_bytes.to_string(),
+        values_root_plus_ops_bytes.to_string(),
+        metadata_num_genes_bytes.to_string(),
+        column_order_bytes.to_string(),
+        values_root_indices_bytes.to_string(),
+        values_root_vals_bytes.to_string(),
+        values_op_indices_bytes.to_string(),
+        values_op_vals_bytes.to_string(),
+    ])?;
+    wtr.flush()?;
+    Ok(())
+}
+
 #[derive(Debug, Args)]
 struct RoundtripCheckCommand {
     #[arg(short = 'e', long = "encoded")]
@@ -1885,14 +1986,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?
                 }
             };
-
-            info!(
-                "Loaded matrix rows={}, cols={}, nnz={}, points={}",
-                csr.rows(),
-                csr.cols(),
-                csr.nnz(),
-                points.len()
-            );
 
             let quantize_values = args.lossy && !args.lossy_lossless;
             let target_quantizers = args.lossy_quantizers.max(1);
@@ -2069,6 +2162,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 "  values breakdown: root_indices={} root_vals={} op_indices={} op_vals={}",
                 bytes_root_indices, bytes_root_vals, bytes_indices, bytes_delta_vals
             );
+            if let Some(stats_path) = args.stats_csv.as_ref() {
+                let input_matrix_bytes = std::fs::metadata(&args.input)
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
+                let input_positions_bytes = args
+                    .input_pos
+                    .as_ref()
+                    .and_then(|p| std::fs::metadata(p).ok())
+                    .map(|m| m.len() as usize)
+                    .unwrap_or(0);
+                let stats_label = infer_stats_label(&args.input);
+                append_build_stats_csv(
+                    stats_path,
+                    &stats_label,
+                    input_matrix_bytes,
+                    input_positions_bytes,
+                    selected.total_mst_bytes,
+                    actual_gzip_bytes,
+                    points.len() * csr.cols(),
+                    csr.nnz(),
+                    actual_rate,
+                    topology_bytes,
+                    value_bytes,
+                    bytes_num_genes,
+                    gene_order_bytes,
+                    bytes_root_indices,
+                    bytes_root_vals,
+                    bytes_indices,
+                    bytes_delta_vals,
+                )?;
+                info!("Appended build stats CSV row to {}", stats_path.display());
+            }
             if args.report_index_bounds {
                 let bounds_report = compute_index_bounds_report(&selected.encoded_blocks);
                 log_index_bounds_report(&bounds_report, csr.nnz());
