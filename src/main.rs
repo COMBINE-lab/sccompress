@@ -33,6 +33,7 @@ use tracing_subscriber::EnvFilter;
 use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
 use linfa_clustering::KMeans;
+use nalgebra::linalg::SymmetricEigen;
 use nalgebra::DMatrix;
 
 #[global_allocator]
@@ -131,6 +132,36 @@ enum CellClusterMethodArg {
     /// bucket columns, sum `X` within each column cluster per cell, L2-normalize rows, then
     /// k-means on cells (no SVD).
     ColumnKmeans,
+    /// [SpectralCoclustering](https://scikit-learn.org/stable/modules/generated/sklearn.cluster.SpectralCoclustering.html)-style
+    /// (Dhillon 2001): `1/√(row sum)` × `1/√(col sum)` scaling, SVD, drop first factor, stack
+    /// scaled `U` and `V`, one k-means on **rows ∪ columns**; **cell labels** are the first `n` assignments.
+    SpectralCocluster,
+    /// [FABIA](https://doi.org/10.1093/bioinformatics/btq227)-style sparse factor model `X ≈ Λ Z` (Hochreiter et al., 2010):
+    /// row-standardize bucket×cell matrix, SVD warm start, ISTA with Laplace (`L1`) shrinkage on `Λ` and `Z`,
+    /// then hard assignment (argmax `|Z|` per cell, or k-means on `Z` if `k` exceeds factor rank).
+    Fabia,
+    /// **Spatial graph + expression**: kNN in \((x,y)\) and kNN in feature space, combined symmetric affinity,
+    /// normalized Laplacian embedding, then k-means (spectral clustering). Large `n` uses `[features \| scaled xy]` k-means.
+    SpatialGraph,
+}
+
+/// Parameters for [`CellClusterMethodArg::SpatialGraph`] (ignored for other methods).
+#[derive(Clone, Copy, Debug)]
+struct SpatialGraphParams {
+    spatial_knn: usize,
+    expr_knn: usize,
+    /// Weight on spatial kNN affinity (`1 - blend` on expression kNN).
+    blend: f64,
+}
+
+impl Default for SpatialGraphParams {
+    fn default() -> Self {
+        Self {
+            spatial_knn: 12,
+            expr_knn: 12,
+            blend: 0.45,
+        }
+    }
 }
 
 impl From<MstWeightArg> for MstWeightMode {
@@ -248,6 +279,36 @@ fn normalize_l1_cols_inplace(a: &mut Array2<f64>) {
     }
 }
 
+/// sklearn `_scale_normalize`: nonnegative `X`, then `An[i,j] = X[i,j] / sqrt(row_sum[i] * col_sum[j])`.
+fn scale_normalize_dhillon(x: &Array2<f64>) -> (Array2<f64>, Vec<f64>, Vec<f64>) {
+    let n = x.nrows();
+    let m = x.ncols();
+    let mut row_sum = vec![0f64; n];
+    let mut col_sum = vec![0f64; m];
+    for i in 0..n {
+        for j in 0..m {
+            let v = x[(i, j)].max(0.0);
+            row_sum[i] += v;
+            col_sum[j] += v;
+        }
+    }
+    let row_diag: Vec<f64> = row_sum
+        .iter()
+        .map(|&s| if s > 1e-18 { 1.0 / s.sqrt() } else { 0.0 })
+        .collect();
+    let col_diag: Vec<f64> = col_sum
+        .iter()
+        .map(|&s| if s > 1e-18 { 1.0 / s.sqrt() } else { 0.0 })
+        .collect();
+    let mut an = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            an[(i, j)] = row_diag[i] * x[(i, j)].max(0.0) * col_diag[j];
+        }
+    }
+    (an, row_diag, col_diag)
+}
+
 /// `G = X^T X` with `X` shape `(n, m)` — `G` is `(m, m)` (inner products between bucket columns).
 fn gram_xt_x(x: &Array2<f64>) -> Array2<f64> {
     let n = x.nrows();
@@ -292,6 +353,272 @@ fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
         if nrm > 1e-15 {
             row.mapv_inplace(|x| x / nrm);
         }
+    }
+}
+
+/// Dhillon spectral **co-clustering** (sklearn `SpectralCoclustering`): joint k-means on embeddings of
+/// row-nodes and column-nodes in the same space (`sklearn/cluster/_bicluster.py::_fit`).
+fn cluster_cells_spectral_cocluster_dhillon(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    if m == 0 {
+        anyhow::bail!("spectral cocluster: zero feature columns");
+    }
+    let k = num_clusters.max(1).min(n);
+    if k == 1 {
+        return Ok(vec![0; n]);
+    }
+
+    let x_nonneg = {
+        let mut a = Array2::<f64>::zeros((n, m));
+        for i in 0..n {
+            for j in 0..m {
+                a[(i, j)] = features[(i, j)].max(0.0);
+            }
+        }
+        a
+    };
+
+    let (an, row_diag, col_diag) = scale_normalize_dhillon(&x_nonneg);
+    let data: Vec<f64> = an.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(n, m, &data);
+    let svd = mat.svd(true, true);
+    let (u, v_t) = match (svd.u, svd.v_t) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => return cluster_cells_with_kmeans(features, k),
+    };
+
+    let r = u.ncols();
+    let n_discard = 1usize;
+    let n_sv = (1usize + (k as f64).log2().ceil() as usize)
+        .max(2)
+        .min(n.min(m));
+    let end_col = r.min(n_sv);
+    let n_keep = end_col.saturating_sub(n_discard);
+    if n_keep == 0 {
+        return cluster_cells_with_kmeans(features, k);
+    }
+
+    let mut z = Array2::<f64>::zeros((n + m, n_keep));
+    for c in 0..n_keep {
+        let sc = n_discard + c;
+        debug_assert!(sc < r);
+        for i in 0..n {
+            z[(i, c)] = row_diag[i] * u[(i, sc)];
+        }
+        for j in 0..m {
+            z[(n + j, c)] = col_diag[j] * v_t[(sc, j)];
+        }
+    }
+
+    let dataset = DatasetBase::from(z);
+    let model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("spectral cocluster joint k-means failed: {}", e))?;
+    let labels = model.predict(&dataset).to_vec();
+    Ok(labels.into_iter().take(n).collect())
+}
+
+#[inline]
+fn soft_threshold_scalar(x: f64, t: f64) -> f64 {
+    if x > t {
+        x - t
+    } else if x < -t {
+        x + t
+    } else {
+        0.0
+    }
+}
+
+/// FABIA-style: `X` is `m×n` (bucket features × cells), row-z-score, `X ≈ Λ Z` with sparse `Λ`, `Z` via ISTA.
+fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    if m == 0 {
+        anyhow::bail!("fabia: zero feature columns");
+    }
+    let k_req = num_clusters.max(1).min(n);
+    if k_req == 1 {
+        return Ok(vec![0; n]);
+    }
+
+    let mut x = Array2::<f64>::zeros((m, n));
+    for i in 0..m {
+        for j in 0..n {
+            x[(i, j)] = features[(j, i)];
+        }
+    }
+    for i in 0..m {
+        let mut mean = 0.0f64;
+        for j in 0..n {
+            mean += x[(i, j)];
+        }
+        mean /= n as f64;
+        let mut var = 0.0f64;
+        for j in 0..n {
+            let d = x[(i, j)] - mean;
+            var += d * d;
+        }
+        let sd = (var / n.max(1) as f64).max(1e-18).sqrt();
+        for j in 0..n {
+            x[(i, j)] = (x[(i, j)] - mean) / sd;
+        }
+    }
+
+    let p = k_req.min(m).min(n);
+    if p < 2 {
+        return cluster_cells_with_kmeans(features, k_req);
+    }
+
+    let data: Vec<f64> = x.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(m, n, &data);
+    let svd = mat.svd(true, true);
+    let (u, v_t) = match (svd.u, svd.v_t) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => return cluster_cells_with_kmeans(features, k_req),
+    };
+    let sigma = svd.singular_values;
+
+    let mut lambda = Array2::<f64>::zeros((m, p));
+    let mut z = Array2::<f64>::zeros((p, n));
+    for l in 0..p {
+        let s = sigma[l].max(1e-18).sqrt();
+        for i in 0..m {
+            lambda[(i, l)] = u[(i, l)] * s;
+        }
+        for j in 0..n {
+            z[(l, j)] = s * v_t[(l, j)];
+        }
+    }
+
+    let mut abs_buf: Vec<f64> = Vec::with_capacity(m * n);
+    for &v in x.iter() {
+        abs_buf.push(v.abs());
+    }
+    abs_buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let med = abs_buf[abs_buf.len() / 2].max(1e-12);
+    let lambda_l1 = 0.08 * med;
+    let z_l1 = 0.08 * med;
+
+    let max_iter = 48usize;
+    let mut residual = Array2::<f64>::zeros((m, n));
+    let mut gz = Array2::<f64>::zeros((p, n));
+    let mut gl = Array2::<f64>::zeros((m, p));
+
+    for _ in 0..max_iter {
+        // R = Λ Z - X
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f64;
+                for l in 0..p {
+                    s += lambda[(i, l)] * z[(l, j)];
+                }
+                residual[(i, j)] = s - x[(i, j)];
+            }
+        }
+
+        let tr_zzt: f64 = (0..p)
+            .map(|l| {
+                (0..n)
+                    .map(|j| z[(l, j)] * z[(l, j)])
+                    .sum::<f64>()
+            })
+            .sum();
+        let eta_l = 1.0 / tr_zzt.max(1e-18);
+
+        for i in 0..m {
+            for l in 0..p {
+                let mut s = 0.0f64;
+                for j in 0..n {
+                    s += residual[(i, j)] * z[(l, j)];
+                }
+                gl[(i, l)] = s;
+            }
+        }
+        for i in 0..m {
+            for l in 0..p {
+                let v = lambda[(i, l)] - eta_l * gl[(i, l)];
+                lambda[(i, l)] = soft_threshold_scalar(v, eta_l * lambda_l1);
+            }
+        }
+
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0f64;
+                for l in 0..p {
+                    s += lambda[(i, l)] * z[(l, j)];
+                }
+                residual[(i, j)] = s - x[(i, j)];
+            }
+        }
+
+        let mut tr_ll = 0.0f64;
+        for i in 0..m {
+            for l in 0..p {
+                tr_ll += lambda[(i, l)] * lambda[(i, l)];
+            }
+        }
+        let eta_z = 1.0 / tr_ll.max(1e-18);
+
+        for l in 0..p {
+            for j in 0..n {
+                let mut s = 0.0f64;
+                for i in 0..m {
+                    s += lambda[(i, l)] * residual[(i, j)];
+                }
+                gz[(l, j)] = s;
+            }
+        }
+        for l in 0..p {
+            for j in 0..n {
+                let v = z[(l, j)] - eta_z * gz[(l, j)];
+                z[(l, j)] = soft_threshold_scalar(v, eta_z * z_l1);
+            }
+        }
+    }
+
+    if z.iter().any(|v| !v.is_finite()) || lambda.iter().any(|v| !v.is_finite()) {
+        return cluster_cells_with_kmeans(features, k_req);
+    }
+
+    if p >= k_req {
+        let mut labels = vec![0usize; n];
+        for j in 0..n {
+            let mut best = 0usize;
+            let mut best_abs = 0.0f64;
+            for l in 0..k_req.min(p) {
+                let a = z[(l, j)].abs();
+                if a > best_abs {
+                    best_abs = a;
+                    best = l;
+                }
+            }
+            labels[j] = best;
+        }
+        Ok(labels)
+    } else {
+        let mut z_sub = Array2::<f64>::zeros((n, p));
+        for j in 0..n {
+            for l in 0..p {
+                z_sub[(j, l)] = z[(l, j)];
+            }
+        }
+        let dataset = DatasetBase::from(z_sub);
+        let model = KMeans::params(k_req)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("fabia fallback k-means failed: {}", e))?;
+        Ok(model.predict(&dataset).to_vec())
     }
 }
 
@@ -408,15 +735,244 @@ fn cluster_cells_simple_column_kmeans(
     Ok(model.predict(&dataset).to_vec())
 }
 
+fn median_f64(mut xs: Vec<f64>) -> f64 {
+    if xs.is_empty() {
+        return 1.0;
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let mid = xs.len() / 2;
+    if xs.len() % 2 == 0 {
+        (xs[mid - 1] + xs[mid]) * 0.5
+    } else {
+        xs[mid]
+    }
+}
+
+/// k-means on concatenated L2 features + weighted z-scored `(x,y)` when spectral graph is too large.
+fn cluster_cells_spatial_augmented_kmeans(
+    points: &[Point],
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    let m = features.ncols();
+    let k = num_clusters.max(1).min(n);
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if points.len() != n {
+        anyhow::bail!("spatial augmented k-means: points/features length mismatch");
+    }
+    let mut mean_x = 0.0f64;
+    let mut mean_y = 0.0f64;
+    for p in points {
+        mean_x += p.x;
+        mean_y += p.y;
+    }
+    mean_x /= n as f64;
+    mean_y /= n as f64;
+    let mut vx = 0.0f64;
+    let mut vy = 0.0f64;
+    for p in points {
+        vx += (p.x - mean_x).powi(2);
+        vy += (p.y - mean_y).powi(2);
+    }
+    let sdx = (vx / n.max(1) as f64).max(1e-18).sqrt();
+    let sdy = (vy / n.max(1) as f64).max(1e-18).sqrt();
+    let w = 0.5f64;
+    let mut aug = Array2::<f64>::zeros((n, m + 2));
+    for i in 0..n {
+        for j in 0..m {
+            aug[(i, j)] = features[(i, j)];
+        }
+        aug[(i, m)] = w * (points[i].x - mean_x) / sdx;
+        aug[(i, m + 1)] = w * (points[i].y - mean_y) / sdy;
+    }
+    cluster_cells_with_kmeans(&aug, k)
+}
+
+/// Combined spatial + expression kNN affinity, normalized Laplacian spectral embedding, k-means (`n` small);
+/// otherwise [`cluster_cells_spatial_augmented_kmeans`].
+fn cluster_cells_spatial_graph(
+    points: &[Point],
+    features: &Array2<f64>,
+    num_clusters: usize,
+    params: SpatialGraphParams,
+) -> anyhow::Result<Vec<usize>> {
+    const DENSE_SPECTRAL_MAX_N: usize = 2048;
+
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if points.len() != n {
+        anyhow::bail!("spatial graph: points/features length mismatch");
+    }
+    let k = num_clusters.max(1).min(n);
+    if k == 1 {
+        return Ok(vec![0; n]);
+    }
+    let m = features.ncols();
+
+    if n > DENSE_SPECTRAL_MAX_N {
+        warn!(
+            "spatial-graph clustering: n={} > {} — using augmented (expression + xy) k-means",
+            n, DENSE_SPECTRAL_MAX_N
+        );
+        return cluster_cells_spatial_augmented_kmeans(points, features, k);
+    }
+
+    let ks = params.spatial_knn.max(1).min(n - 1);
+    let ke = params.expr_knn.max(1).min(n - 1);
+    let blend = params.blend.clamp(0.0, 1.0);
+
+    let mut d2 = vec![0.0f64; n * n];
+    let mut sim = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            if i == j {
+                continue;
+            }
+            let dx = points[i].x - points[j].x;
+            let dy = points[i].y - points[j].y;
+            d2[i * n + j] = dx * dx + dy * dy;
+            let mut s = 0.0f64;
+            for t in 0..m {
+                s += features[(i, t)] * features[(j, t)];
+            }
+            sim[i * n + j] = s.max(0.0);
+        }
+    }
+
+    let mut spatial_d2_samples: Vec<f64> = Vec::new();
+    let mut expr_one_minus_sim: Vec<f64> = Vec::new();
+
+    for i in 0..n {
+        let mut order: Vec<usize> = (0..n).filter(|&j| j != i).collect();
+        order.sort_by(|&a, &b| {
+            d2[i * n + a]
+                .partial_cmp(&d2[i * n + b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &j in order.iter().take(ks) {
+            spatial_d2_samples.push(d2[i * n + j]);
+        }
+
+        order.sort_by(|&a, &b| {
+            sim[i * n + b]
+                .partial_cmp(&sim[i * n + a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &j in order.iter().take(ke) {
+            expr_one_minus_sim.push((1.0 - sim[i * n + j]).max(0.0));
+        }
+    }
+
+    let sigma_s_sq = median_f64(spatial_d2_samples).max(1e-18);
+    let tau_e = median_f64(expr_one_minus_sim).max(1e-6);
+
+    let mut w = vec![0.0f64; n * n];
+    for i in 0..n {
+        let mut order: Vec<usize> = (0..n).filter(|&j| j != i).collect();
+        order.sort_by(|&a, &b| {
+            d2[i * n + a]
+                .partial_cmp(&d2[i * n + b])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &j in order.iter().take(ks) {
+            let ws = (-0.5 * d2[i * n + j] / sigma_s_sq).exp();
+            w[i * n + j] += blend * ws;
+        }
+
+        order.sort_by(|&a, &b| {
+            sim[i * n + b]
+                .partial_cmp(&sim[i * n + a])
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        for &j in order.iter().take(ke) {
+            let we = (-(1.0 - sim[i * n + j]).max(0.0) / tau_e).exp();
+            w[i * n + j] += (1.0 - blend) * we;
+        }
+    }
+
+    for i in 0..n {
+        for j in 0..n {
+            if i != j {
+                let v = 0.5 * (w[i * n + j] + w[j * n + i]);
+                w[i * n + j] = v;
+                w[j * n + i] = v;
+            }
+        }
+    }
+
+    let eps = 1e-9f64;
+    for i in 0..n {
+        w[i * n + i] = eps;
+    }
+
+    let mut deg = vec![0.0f64; n];
+    for i in 0..n {
+        for j in 0..n {
+            deg[i] += w[i * n + j];
+        }
+        deg[i] = deg[i].max(1e-12);
+    }
+
+    let mut l_data = vec![0.0f64; n * n];
+    for i in 0..n {
+        let si = deg[i].sqrt();
+        for j in 0..n {
+            let sj = deg[j].sqrt();
+            let val = if i == j {
+                1.0 - w[i * n + j] / (si * sj)
+            } else {
+                -w[i * n + j] / (si * sj)
+            };
+            l_data[i * n + j] = val;
+        }
+    }
+
+    let l_sym = DMatrix::from_row_slice(n, n, &l_data);
+    let decomp = SymmetricEigen::new(l_sym);
+    let evecs = decomp.eigenvectors;
+    let n_ev = k.min(n - 1).max(1);
+    let mut embed = Array2::<f64>::zeros((n, n_ev));
+    for col in 0..n_ev {
+        let src = col + 1;
+        if src >= n {
+            break;
+        }
+        for row in 0..n {
+            embed[(row, col)] = evecs[(row, src)];
+        }
+    }
+
+    let dataset = DatasetBase::from(embed);
+    let model = KMeans::params(k)
+        .max_n_iterations(30)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("spatial-graph spectral k-means failed: {}", e))?;
+    Ok(model.predict(&dataset).to_vec())
+}
+
 fn cluster_cells(
     method: CellClusterMethodArg,
     features: &Array2<f64>,
     num_clusters: usize,
+    points: &[Point],
+    spatial: SpatialGraphParams,
 ) -> anyhow::Result<Vec<usize>> {
     match method {
         CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features, num_clusters),
         CellClusterMethodArg::Bicluster => cluster_cells_spectral_bicluster(features, num_clusters),
         CellClusterMethodArg::ColumnKmeans => cluster_cells_simple_column_kmeans(features, num_clusters),
+        CellClusterMethodArg::SpectralCocluster => {
+            cluster_cells_spectral_cocluster_dhillon(features, num_clusters)
+        }
+        CellClusterMethodArg::Fabia => cluster_cells_fabia(features, num_clusters),
+        CellClusterMethodArg::SpatialGraph => {
+            cluster_cells_spatial_graph(points, features, num_clusters, spatial)
+        }
     }
 }
 
@@ -442,10 +998,12 @@ fn slice_feature_rows(features: &Array2<f64>, row_ids: &[usize]) -> Array2<f64> 
 }
 
 fn split_oversized_clusters(
+    points: &[Point],
     initial_clusters: Vec<Vec<usize>>,
     features: &Array2<f64>,
     max_cluster_size: Option<usize>,
     cell_cluster_method: CellClusterMethodArg,
+    spatial: SpatialGraphParams,
 ) -> anyhow::Result<Vec<Vec<usize>>> {
     let Some(max_cluster_size_raw) = max_cluster_size else {
         return Ok(initial_clusters);
@@ -473,7 +1031,14 @@ fn split_oversized_clusters(
         );
 
         let subfeatures = slice_feature_rows(features, &cluster);
-        let sub_assignments = match cluster_cells(cell_cluster_method, &subfeatures, split_k) {
+        let subpoints: Vec<Point> = cluster.iter().map(|&i| points[i].clone()).collect();
+        let sub_assignments = match cluster_cells(
+            cell_cluster_method,
+            &subfeatures,
+            split_k,
+            &subpoints,
+            spatial,
+        ) {
             Ok(a) => a,
             Err(err) => {
                 warn!(
@@ -1452,6 +2017,7 @@ fn run_clustered_compression(
     row_template_adaptive: bool,
     row_template_max: usize,
     cell_cluster_method: CellClusterMethodArg,
+    spatial_graph: SpatialGraphParams,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -1459,7 +2025,13 @@ fn run_clustered_compression(
 
     let requested_clusters = quantizers_requested.max(1).min(points.len());
     let features = build_cell_features(points, data, 24)?;
-    let assignments = match cluster_cells(cell_cluster_method, &features, requested_clusters) {
+    let assignments = match cluster_cells(
+        cell_cluster_method,
+        &features,
+        requested_clusters,
+        points,
+        spatial_graph,
+    ) {
         Ok(a) => a,
         Err(err) => {
             warn!(
@@ -1482,10 +2054,12 @@ fn run_clustered_compression(
     let initial_clusters = group_points_by_cluster(&assignments, initial_quantizers_used);
     let initial_max = initial_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
     let clusters = split_oversized_clusters(
+        points,
         initial_clusters,
         &features,
         max_cluster_size,
         cell_cluster_method,
+        spatial_graph,
     )?;
     let clusters = reorder_rows_within_clusters(&clusters, &features);
     let final_max = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -2024,9 +2598,18 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
-    /// How to cluster cells (`kmeans`: rows only; `column-kmeans`: column k-means on Gram then row k-means on aggregates; `bicluster`: column k-means + SVD + row k-means).
+    /// How to cluster cells (`kmeans`, `column-kmeans`, `bicluster`, `spectral-cocluster`, `fabia`, `spatial-graph`).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
+    /// For `spatial-graph`: number of spatial \((x,y)\) nearest neighbors per cell.
+    #[arg(long = "cell-cluster-spatial-knn", default_value_t = 12)]
+    cell_cluster_spatial_knn: usize,
+    /// For `spatial-graph`: number of expression (dot-product) nearest neighbors per cell.
+    #[arg(long = "cell-cluster-expr-knn", default_value_t = 12)]
+    cell_cluster_expr_knn: usize,
+    /// For `spatial-graph`: weight in \([0,1]\) on spatial kNN affinity (`1 - blend` on expression kNN).
+    #[arg(long = "cell-cluster-spatial-blend", default_value_t = 0.45)]
+    cell_cluster_spatial_blend: f64,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -2222,6 +2805,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
             let cluster_encoding = args.cluster_encoding;
+            let spatial_graph = SpatialGraphParams {
+                spatial_knn: args.cell_cluster_spatial_knn.max(1),
+                expr_knn: args.cell_cluster_expr_knn.max(1),
+                blend: args.cell_cluster_spatial_blend.clamp(0.0, 1.0),
+            };
 
             info!(
                 "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
@@ -2270,6 +2858,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.row_template_adaptive,
                     args.row_template_max,
                     args.cell_cluster_method,
+                    spatial_graph,
                 )?;
 
                 info!(
@@ -2537,6 +3126,7 @@ mod tests {
             false,
             16,
             CellClusterMethodArg::Kmeans,
+            SpatialGraphParams::default(),
         )
         .expect("lossy compression should succeed");
 
@@ -2586,6 +3176,7 @@ mod tests {
                 false,
                 16,
                 method,
+                SpatialGraphParams::default(),
             )
             .expect("compression")
         };
@@ -2599,5 +3190,122 @@ mod tests {
             bicluster_gzip,
             kmeans_gzip
         );
+    }
+
+    #[test]
+    fn spectral_cocluster_runs_on_toy_matrix() {
+        let n_cells = 8usize;
+        let n_genes = 6usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 10u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            2,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::SpectralCocluster,
+            SpatialGraphParams::default(),
+        )
+        .expect("spectral cocluster path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn fabia_runs_on_toy_matrix() {
+        let n_cells = 8usize;
+        let n_genes = 6usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 10u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::Fabia,
+            SpatialGraphParams::default(),
+        )
+        .expect("fabia path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn spatial_graph_runs_on_toy_matrix() {
+        let n_cells = 16usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 20u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new((i % 4) as f64, (i / 4) as f64, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::SpatialGraph,
+            SpatialGraphParams::default(),
+        )
+        .expect("spatial-graph path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
     }
 }
