@@ -18,6 +18,7 @@ pub enum InputPosType {
 pub enum Platform {
     Visium,
     Xenium,
+    SingleCell,
 }
 
 fn read_strings_dynamic(file: &Hdf5File, path: &str) -> anyhow::Result<Vec<String>> {
@@ -43,6 +44,7 @@ fn read_strings_dynamic(file: &Hdf5File, path: &str) -> anyhow::Result<Vec<Strin
 
     read_fixed!(6);
     read_fixed!(7);
+    read_fixed!(10);
     read_fixed!(11);
     read_fixed!(15);
     read_fixed!(16);
@@ -114,13 +116,20 @@ fn load_positions_from_parquet(
     pos_x_col: usize,
     pos_y_col: usize,
 ) -> anyhow::Result<HashMap<String, (f64, f64)>> {
+
     let pos_file = std::fs::File::open(pos_path)?;
     let reader = SerializedFileReader::new(pos_file)?;
     let mut iter = reader.get_row_iter(None)?;
     let mut pos_map = HashMap::new();
 
     while let Some(Ok(row)) = iter.next() {
-        let barcode = row.get_string(0)?.to_string();
+        let barcode = match row.get_string(0) {
+            Ok(s) => s.to_string(),
+            Err(_) => {
+                let raw = row.get_bytes(0)?;
+                String::from_utf8_lossy(raw.data()).to_string()
+            }
+        };
         let x = row.get_double(pos_x_col)?;
         let y = row.get_double(pos_y_col)?;
         pos_map.insert(barcode, (x, y));
@@ -189,6 +198,47 @@ pub fn load_10x_with_positions(
             )
         })?;
         points.push(Point::new(x, y, row_idx));
+    }
+
+    Ok((csr, points))
+}
+
+/// Load 10x H5 matrix without any external positions.
+/// Returns CSR expression matrix and dummy coordinates (0,0) for each retained cell.
+pub fn load_10x_no_positions(
+    h5_path: &Path,
+    max_cells: Option<usize>,
+) -> anyhow::Result<(CsMat<u16>, Vec<Point>)> {
+    let file = Hdf5File::open(h5_path)?;
+    let matrix = file.group("matrix")?;
+
+    let shape = matrix.dataset("shape")?.read_1d::<usize>()?.to_vec();
+    if shape.len() != 2 {
+        anyhow::bail!("matrix/shape must be length 2, found {}", shape.len());
+    }
+
+    let num_features = shape[0];
+    let num_cells_total = shape[1];
+    let num_cells = max_cells
+        .map(|m| m.min(num_cells_total))
+        .unwrap_or(num_cells_total);
+
+    let data_all = matrix.dataset("data")?.read_1d::<u16>()?.to_vec();
+    let indices_all = matrix.dataset("indices")?.read_1d::<usize>()?.to_vec();
+    let indptr_all = matrix.dataset("indptr")?.read_1d::<usize>()?.to_vec();
+
+    let nnz_limit = *indptr_all
+        .get(num_cells)
+        .ok_or_else(|| anyhow::anyhow!("indptr missing upper bound for {} rows", num_cells))?;
+
+    let indptr = indptr_all[..=num_cells].to_vec();
+    let indices = indices_all[..nnz_limit].to_vec();
+    let values = data_all[..nnz_limit].to_vec();
+    let csr = CsMat::new((num_cells, num_features), indptr, indices, values);
+
+    let mut points = Vec::with_capacity(num_cells);
+    for row_idx in 0..num_cells {
+        points.push(Point::new(0.0, 0.0, row_idx));
     }
 
     Ok((csr, points))

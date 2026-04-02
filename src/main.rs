@@ -33,6 +33,7 @@ use tracing_subscriber::EnvFilter;
 use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
 use linfa_clustering::KMeans;
+use nalgebra::DMatrix;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -114,6 +115,22 @@ enum ClusterEncodingArg {
     Row,
     Column,
     Hybrid,
+}
+
+/// How to partition cells into encoder clusters (before row-MST / column payloads).
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum CellClusterMethodArg {
+    /// K-means on `build_cell_features` (hashed ln1p buckets, L2-normalized per cell).
+    #[default]
+    Kmeans,
+    /// Double-L1 normalized `X`, **k-means on columns** via Gram `X^T X` (bucket × bucket),
+    /// per-cell sums inside each column cluster, concatenated with truncated-SVD embedding
+    /// `U Σ^{1/2}`; final **k-means on rows** (cells).
+    Bicluster,
+    /// **Column k-means only** (same as bicluster’s column step): k-means on Gram `X^T X` to group
+    /// bucket columns, sum `X` within each column cluster per cell, L2-normalize rows, then
+    /// k-means on cells (no SVD).
+    ColumnKmeans,
 }
 
 impl From<MstWeightArg> for MstWeightMode {
@@ -212,6 +229,197 @@ fn cluster_cells_with_kmeans(
     Ok(model.predict(&dataset).to_vec())
 }
 
+fn normalize_l1_rows_inplace(a: &mut Array2<f64>) {
+    for mut row in a.rows_mut() {
+        let s: f64 = row.sum();
+        if s > 1e-15 {
+            row.mapv_inplace(|x| x / s);
+        }
+    }
+}
+
+fn normalize_l1_cols_inplace(a: &mut Array2<f64>) {
+    for j in 0..a.ncols() {
+        let s: f64 = a.column(j).sum();
+        if s > 1e-15 {
+            let mut col = a.column_mut(j);
+            col.mapv_inplace(|x| x / s);
+        }
+    }
+}
+
+/// `G = X^T X` with `X` shape `(n, m)` — `G` is `(m, m)` (inner products between bucket columns).
+fn gram_xt_x(x: &Array2<f64>) -> Array2<f64> {
+    let n = x.nrows();
+    let m = x.ncols();
+    let mut g = Array2::<f64>::zeros((m, m));
+    for p in 0..m {
+        for q in 0..=p {
+            let mut s = 0.0f64;
+            for i in 0..n {
+                s += x[(i, p)] * x[(i, q)];
+            }
+            g[(p, q)] = s;
+            g[(q, p)] = s;
+        }
+    }
+    g
+}
+
+/// Sum `X[:, j]` over bucket columns `j` that share the same column-k-means label.
+fn aggregate_rows_by_column_clusters(
+    x: &Array2<f64>,
+    col_assign: &[usize],
+    k_col: usize,
+) -> Array2<f64> {
+    let n = x.nrows();
+    let mut z = Array2::<f64>::zeros((n, k_col));
+    for i in 0..n {
+        for j in 0..x.ncols() {
+            let c = col_assign[j];
+            if c < k_col {
+                z[(i, c)] += x[(i, j)];
+            }
+        }
+    }
+    z
+}
+
+fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
+    for mut row in a.rows_mut() {
+        let norm_sq: f64 = row.iter().map(|v| v * v).sum();
+        let nrm = norm_sq.sqrt();
+        if nrm > 1e-15 {
+            row.mapv_inplace(|x| x / nrm);
+        }
+    }
+}
+
+/// Spectral co-clustering style: double L1 normalization of nonnegative `X`; **k-means on columns**
+/// (bucket × bucket Gram rows, cheap `m×m`); SVD row embedding; concatenate column-cluster
+/// aggregates per cell with the spectral embedding; final **k-means on rows** (cells).
+fn cluster_cells_spectral_bicluster(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    let k = num_clusters.max(1).min(n);
+
+    let mut a = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            a[(i, j)] = features[(i, j)].max(0.0);
+        }
+    }
+    normalize_l1_rows_inplace(&mut a);
+    normalize_l1_cols_inplace(&mut a);
+
+    // Column k-means: each bucket j is row j of G = X^T X (m points in R^m). No n-dim centroids.
+    let g = gram_xt_x(&a);
+    let k_col = k.min(m).max(1);
+    let col_assign = match cluster_cells_with_kmeans(&g, k_col) {
+        Ok(a) => a,
+        Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
+    };
+
+    let agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
+
+    let data: Vec<f64> = a.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(n, m, &data);
+    let svd = mat.svd(true, false);
+    let u = svd
+        .u
+        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
+    let sigma = svd.singular_values;
+
+    let max_rank = n.min(m);
+    let n_comp = k.min(max_rank).max(1);
+    let mut embed = Array2::<f64>::zeros((n, n_comp));
+    for i in 0..n {
+        for j in 0..n_comp {
+            let s_j = sigma[j].max(1e-18);
+            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
+        }
+    }
+
+    let n_agg = agg.ncols();
+    let mut combined = Array2::<f64>::zeros((n, n_comp + n_agg));
+    for i in 0..n {
+        for j in 0..n_comp {
+            combined[(i, j)] = embed[(i, j)];
+        }
+        for j in 0..n_agg {
+            combined[(i, n_comp + j)] = agg[(i, j)];
+        }
+    }
+    l2_normalize_rows_inplace(&mut combined);
+
+    let dataset = DatasetBase::from(combined);
+    let model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("k-means on spectral + column-cluster features failed: {}", e))?;
+
+    Ok(model.predict(&dataset).to_vec())
+}
+
+/// Double-L1 normalized `X`; k-means on columns via Gram `X^T X`; per-cell column-cluster sums;
+/// L2-normalize rows; k-means on cells only (no spectral term).
+fn cluster_cells_simple_column_kmeans(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    let k = num_clusters.max(1).min(n);
+
+    let mut a = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            a[(i, j)] = features[(i, j)].max(0.0);
+        }
+    }
+    normalize_l1_rows_inplace(&mut a);
+    normalize_l1_cols_inplace(&mut a);
+
+    let g = gram_xt_x(&a);
+    let k_col = k.min(m).max(1);
+    let col_assign = match cluster_cells_with_kmeans(&g, k_col) {
+        Ok(a) => a,
+        Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
+    };
+
+    let mut agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
+    l2_normalize_rows_inplace(&mut agg);
+
+    let dataset = DatasetBase::from(agg);
+    let model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("k-means on column-cluster aggregates failed: {}", e))?;
+
+    Ok(model.predict(&dataset).to_vec())
+}
+
+fn cluster_cells(
+    method: CellClusterMethodArg,
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    match method {
+        CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features, num_clusters),
+        CellClusterMethodArg::Bicluster => cluster_cells_spectral_bicluster(features, num_clusters),
+        CellClusterMethodArg::ColumnKmeans => cluster_cells_simple_column_kmeans(features, num_clusters),
+    }
+}
+
 fn group_points_by_cluster(assignments: &[usize], num_clusters: usize) -> Vec<Vec<usize>> {
     let mut clusters = vec![Vec::new(); num_clusters];
     for (point_idx, &cluster_id) in assignments.iter().enumerate() {
@@ -237,6 +445,7 @@ fn split_oversized_clusters(
     initial_clusters: Vec<Vec<usize>>,
     features: &Array2<f64>,
     max_cluster_size: Option<usize>,
+    cell_cluster_method: CellClusterMethodArg,
 ) -> anyhow::Result<Vec<Vec<usize>>> {
     let Some(max_cluster_size_raw) = max_cluster_size else {
         return Ok(initial_clusters);
@@ -264,7 +473,7 @@ fn split_oversized_clusters(
         );
 
         let subfeatures = slice_feature_rows(features, &cluster);
-        let sub_assignments = match cluster_cells_with_kmeans(&subfeatures, split_k) {
+        let sub_assignments = match cluster_cells(cell_cluster_method, &subfeatures, split_k) {
             Ok(a) => a,
             Err(err) => {
                 warn!(
@@ -1242,6 +1451,7 @@ fn run_clustered_compression(
     column_template_max: usize,
     row_template_adaptive: bool,
     row_template_max: usize,
+    cell_cluster_method: CellClusterMethodArg,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -1249,7 +1459,7 @@ fn run_clustered_compression(
 
     let requested_clusters = quantizers_requested.max(1).min(points.len());
     let features = build_cell_features(points, data, 24)?;
-    let assignments = match cluster_cells_with_kmeans(&features, requested_clusters) {
+    let assignments = match cluster_cells(cell_cluster_method, &features, requested_clusters) {
         Ok(a) => a,
         Err(err) => {
             warn!(
@@ -1271,7 +1481,12 @@ fn run_clustered_compression(
 
     let initial_clusters = group_points_by_cluster(&assignments, initial_quantizers_used);
     let initial_max = initial_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
-    let clusters = split_oversized_clusters(initial_clusters, &features, max_cluster_size)?;
+    let clusters = split_oversized_clusters(
+        initial_clusters,
+        &features,
+        max_cluster_size,
+        cell_cluster_method,
+    )?;
     let clusters = reorder_rows_within_clusters(&clusters, &features);
     let final_max = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
 
@@ -1809,6 +2024,9 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
+    /// How to cluster cells (`kmeans`: rows only; `column-kmeans`: column k-means on Gram then row k-means on aggregates; `bicluster`: column k-means + SVD + row k-means).
+    #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
+    cell_cluster_method: CellClusterMethodArg,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -2006,12 +2224,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let cluster_encoding = args.cluster_encoding;
 
             info!(
-                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 target_quantizers,
                 quantizer_bins,
                 sweep_counts,
                 args.max_cluster_size,
+                args.cell_cluster_method,
                 args.knn_metric,
                 args.mst_weight,
                 args.index_codec,
@@ -2050,6 +2269,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     args.column_template_max,
                     args.row_template_adaptive,
                     args.row_template_max,
+                    args.cell_cluster_method,
                 )?;
 
                 info!(
@@ -2187,7 +2407,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .and_then(|p| std::fs::metadata(p).ok())
                     .map(|m| m.len() as usize)
                     .unwrap_or(0);
-                let stats_label = infer_stats_label(&args.input);
+                let stats_label = stats_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| infer_stats_label(&args.input));
                 append_build_stats_csv(
                     stats_path,
                     &stats_label,
@@ -2312,10 +2536,68 @@ mod tests {
             32,
             false,
             16,
+            CellClusterMethodArg::Kmeans,
         )
         .expect("lossy compression should succeed");
 
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
         assert!(result.cluster_sizes.iter().all(|&s| s <= max_cluster_size));
+    }
+
+    /// Disjoint nonzero patterns across `gene % 24` buckets: four blocks of cells use genes
+    /// `[0..6]`, `[6..12]`, `[12..18]`, `[18..24]` only. Spectral biclustering should recover
+    /// cleaner blocks than raw k-means on this toy, yielding a lower gzip-size proxy.
+    #[test]
+    fn spectral_bicluster_beats_kmeans_on_disjoint_bucket_blocks() {
+        let n_cells = 32usize;
+        let n_genes = 24usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            let block = cell / 8;
+            let g0 = block * 6;
+            for k in 0..6 {
+                tri.add_triplet(cell, g0 + k, 80u16);
+            }
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+
+        let run = |method: CellClusterMethodArg| {
+            run_clustered_compression(
+                &points,
+                &csr,
+                4,
+                16,
+                false,
+                true,
+                None,
+                KnnDistanceMetric::L0,
+                MstWeightMode::Metric,
+                IndexStreamCodec::Arithmetic,
+                SortedIndexCodec::EliasFano,
+                Some(1.0),
+                None,
+                ClusterEncodingArg::Hybrid,
+                0,
+                false,
+                32,
+                false,
+                16,
+                method,
+            )
+            .expect("compression")
+        };
+
+        let kmeans_gzip = run(CellClusterMethodArg::Kmeans).gzip_bytes_estimate;
+        let bicluster_gzip = run(CellClusterMethodArg::Bicluster).gzip_bytes_estimate;
+
+        assert!(
+            bicluster_gzip <= kmeans_gzip,
+            "expected bicluster gzip {} <= k-means gzip {} on disjoint-bucket toy data",
+            bicluster_gzip,
+            kmeans_gzip
+        );
     }
 }

@@ -6,7 +6,7 @@ use csv::ReaderBuilder;
 use rand::seq::IndexedRandom;
 use std::path::{Path, PathBuf};
 use clap::{ArgAction, Parser, ValueEnum};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use hdf5::File as Hdf5File;
 use hdf5::types::FixedAscii;
 use parquet::file::reader::{FileReader, SerializedFileReader};
@@ -80,6 +80,10 @@ struct Args {
     /// Optional platform (Visium, Xenium, or single-cell). In single-cell mode, positions file is not required.
     #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
+
+    /// After building neighbors, print cell 0's first N neighbors: matrix index, xy L2, expression L0 (omit to skip)
+    #[arg(long, value_name = "N")]
+    neighbor_preview: Option<usize>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, Debug)]
@@ -144,6 +148,42 @@ fn compute_distances(anchor: &[f64], matrix: &Array2<f64>, metric: Metric) -> Ve
             }
         }
     }).collect()
+}
+
+/// Print neighbor indices for `anchor`, up to `max_show`, with spatial xy L2 and raw expression L0 vs anchor.
+fn print_neighbor_preview(
+    anchor: usize,
+    max_show: usize,
+    coords: &Array2<f64>,
+    data_raw: &Array2<f64>,
+    neighbors: &[Vec<usize>],
+) {
+    if anchor >= neighbors.len() {
+        println!("neighbor-preview: anchor {} has no neighbor row", anchor);
+        return;
+    }
+    let nbrs = &neighbors[anchor];
+    if nbrs.is_empty() {
+        println!("neighbor-preview: cell {} has zero neighbors", anchor);
+        return;
+    }
+    let take = max_show.min(nbrs.len());
+    let anchor_c = coords.row(anchor).to_vec();
+    let anchor_e = data_raw.row(anchor).to_vec();
+    println!(
+        "neighbor-preview: cell {} — first {} of {} neighbor indices | xy_L2 = Euclidean on coords, expr_L0 = binary mismatch count",
+        anchor,
+        take,
+        nbrs.len()
+    );
+    println!("{:<8} {:>14} {:>18}", "nbr_idx", "xy_L2", "expr_L0");
+    for &nid in nbrs.iter().take(take) {
+        let cmat = coords.select(Axis(0), &[nid]);
+        let xy_l2 = compute_distances(&anchor_c, &cmat, Metric::L2)[0];
+        let emat = data_raw.select(Axis(0), &[nid]);
+        let l0 = compute_distances(&anchor_e, &emat, Metric::L0)[0];
+        println!("{:<8} {:>14.6} {:>18.0}", nid, xy_l2, l0);
+    }
 }
 
 /// For a given anchor cell, compute distances to its neighbors and to k random non-neighbor cells.
@@ -592,6 +632,28 @@ fn find_neighbors(data: &Array2<f64>, k: usize, metric: Metric) -> Vec<Vec<usize
     }
 }
 
+fn build_neighbors_for_mode(
+    neighbor_by: NeighborBy,
+    coords: &Array2<f64>,
+    data_raw: &Array2<f64>,
+    k: usize,
+) -> Vec<Vec<usize>> {
+    match neighbor_by {
+        NeighborBy::Spatial | NeighborBy::SpatialL0 => {
+            info!("Finding spatial neighbors (L2 on XY coords, k={})...", k);
+            find_neighbors(coords, k, Metric::L2)
+        }
+        NeighborBy::Expression => {
+            info!("Finding expression neighbors (L2 on raw, k={})...", k);
+            find_neighbors(data_raw, k, Metric::L2)
+        }
+        NeighborBy::ExpressionL0 => {
+            info!("Finding expression neighbors (L0 on raw, k={})...", k);
+            find_neighbors(data_raw, k, Metric::L0)
+        }
+    }
+}
+
 /// Truncated PCA via power-iteration SVD.
 /// Takes ownership of the input matrix to avoid cloning (~halves peak memory).
 /// Input: centered+scaled matrix (n_cells × n_features).
@@ -756,20 +818,13 @@ fn main() -> Result<()> {
     println!("Mode: --neighbor-by {:?}", args.neighbor_by);
 
     // ── Step 1: Find neighbors ──────────────────────────────────────
-    let neighbors: Vec<Vec<usize>> = match args.neighbor_by {
-        NeighborBy::Spatial | NeighborBy::SpatialL0 => {
-            info!("Finding spatial neighbors (L2 on XY coords, k={})...", args.k);
-            find_neighbors(&coords, args.k, Metric::L2)
+    let neighbors: Vec<Vec<usize>> =
+        build_neighbors_for_mode(args.neighbor_by, &coords, &data_raw, args.k);
+    if let Some(n) = args.neighbor_preview {
+        if n > 0 {
+            print_neighbor_preview(0, n, &coords, &data_raw, &neighbors);
         }
-        NeighborBy::Expression => {
-            info!("Finding expression neighbors (L2 on raw, k={})...", args.k);
-            find_neighbors(&data_raw, args.k, Metric::L2)
-        }
-        NeighborBy::ExpressionL0 => {
-            info!("Finding expression neighbors (L0 on raw, k={})...", args.k);
-            find_neighbors(&data_raw, args.k, Metric::L0)
-        }
-    };
+    }
     let nbr_label = if args.pca_dims > 0 && args.pca {
         match args.neighbor_by {
             NeighborBy::Spatial => match args.test_type {
@@ -1163,4 +1218,64 @@ fn main() -> Result<()> {
     }
     Ok(())
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parquet::file::reader::FileReader;
+
+    #[test]
+    fn xenium_cells_parquet_schema_matches_resolve_position_columns() {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
+            "test_data/Xenium_V1_FFPE_Human_Brain_Healthy_With_Addon_outs/cells.parquet",
+        );
+        if !path.exists() {
+            eprintln!("skip xenium_cells_parquet_schema_matches_resolve_position_columns: missing {}", path.display());
+            return;
+        }
+        let f = File::open(&path).expect("open cells.parquet");
+        let reader = SerializedFileReader::new(f).expect("parquet reader");
+        let descr = reader.metadata().file_metadata().schema_descr();
+        assert_eq!(descr.column(0).name(), "cell_id");
+        assert_eq!(descr.column(1).name(), "x_centroid");
+        assert_eq!(descr.column(2).name(), "y_centroid");
+
+        let (x_col, y_col) = resolve_position_columns(Some(Platform::Xenium), None, None);
+        assert_eq!((x_col, y_col), (1, 2), "Xenium preset must index x_centroid/y_centroid");
+    }
+
+    #[test]
+    fn xenium_spatial_l0_uses_spatial_neighbors_and_xenium_cols() {
+        let (x_col, y_col) = resolve_position_columns(Some(Platform::Xenium), None, None);
+        assert_eq!((x_col, y_col), (1, 2));
+
+        // Coords: cell 0 is closest to cell 2 in XY.
+        let coords = Array2::from_shape_vec(
+            (3, 2),
+            vec![
+                0.0, 0.0, // cell 0
+                9.0, 0.0, // cell 1
+                1.0, 0.0, // cell 2
+            ],
+        )
+        .expect("valid coords");
+
+        // Expression matrix intentionally makes cell 1 closest in expression space.
+        // If SpatialL0 uses spatial KNN, neighbor for cell 0 should still be cell 2.
+        let data_raw = Array2::from_shape_vec(
+            (3, 2),
+            vec![
+                1.0, 1.0, // cell 0
+                1.0, 1.0, // cell 1 (expr-identical to cell 0)
+                0.0, 0.0, // cell 2
+            ],
+        )
+        .expect("valid expression matrix");
+
+        // Ask HNSW for 2 so that after self-filtering we still keep one neighbor.
+        let neighbors = build_neighbors_for_mode(NeighborBy::SpatialL0, &coords, &data_raw, 2);
+        assert_eq!(neighbors.len(), 3);
+        assert_eq!(neighbors[0][0], 2);
+    }
 }
