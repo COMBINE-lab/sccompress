@@ -124,10 +124,23 @@ enum CellClusterMethodArg {
     /// K-means on `build_cell_features` (hashed ln1p buckets, L2-normalized per cell).
     #[default]
     Kmeans,
+    /// Binary-threshold `build_cell_features` (`>0` => 1), then Lloyd-style clustering with L0/Hamming
+    /// assignment and per-cluster majority-vote centers (k-modes-like on binary vectors).
+    BinaryL0Kmeans,
     /// Double-L1 normalized `X`, **k-means on columns** via Gram `X^T X` (bucket × bucket),
     /// per-cell sums inside each column cluster, concatenated with truncated-SVD embedding
     /// `U Σ^{1/2}`; final **k-means on rows** (cells).
     Bicluster,
+    /// Spectral bicluster variant with **L0/Hamming** clustering: binarize features (`>0`), double-L1 normalize,
+    /// column grouping by binary L0 Lloyd on bucket patterns across cells, SVD row embedding, concatenate,
+    /// binarize combined features and final binary L0 Lloyd on cells.
+    BiclusterL0,
+    /// Like `bicluster`, but **row k-means first** on `A`, then column k-means on Gram of **cell-cluster means** `R`,
+    /// aggregates, SVD, concat **`[agg ∥ embed]`**, final row k-means (see `cluster_cells_spectral_bicluster_row_col_swapped`).
+    BiclusterSwapped,
+    /// Same preprocessing and SVD row embedding as `bicluster` (**double L1** on nonnegative `X`, then `U Σ^{1/2}`),
+    /// but **no** Gram / column k-means / aggregates — final **k-means** only on the embedding.
+    SvdKmeans,
     /// **Column k-means only** (same as bicluster’s column step): k-means on Gram `X^T X` to group
     /// bucket columns, sum `X` within each column cluster per cell, L2-normalize rows, then
     /// k-means on cells (no SVD).
@@ -143,6 +156,9 @@ enum CellClusterMethodArg {
     /// **Spatial graph + expression**: kNN in \((x,y)\) and kNN in feature space, combined symmetric affinity,
     /// normalized Laplacian embedding, then k-means (spectral clustering). Large `n` uses `[features \| scaled xy]` k-means.
     SpatialGraph,
+    /// **Slide discretization** (grid or hex bins), then k-means on `[expression buckets \| tile embedding]`.
+    /// Links cells to spatial tiles (tensor-style *bucket×cell×tile* linkage via tile assignment + features).
+    TensorGrid,
 }
 
 /// Parameters for [`CellClusterMethodArg::SpatialGraph`] (ignored for other methods).
@@ -160,6 +176,40 @@ impl Default for SpatialGraphParams {
             spatial_knn: 12,
             expr_knn: 12,
             blend: 0.45,
+        }
+    }
+}
+
+/// How to bin \((x,y)\) into tiles for [`CellClusterMethodArg::TensorGrid`].
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum TensorGridDisc {
+    /// Axis-aligned grid of `nx × ny` tiles.
+    #[default]
+    Rect,
+    /// Pointy-top hex bins (axial coordinates); `nx`,`ny` control approximate resolution via hex size.
+    Hex,
+}
+
+/// Tile binning for [`CellClusterMethodArg::TensorGrid`].
+#[derive(Clone, Copy, Debug)]
+struct TensorGridParams {
+    nx: usize,
+    ny: usize,
+    /// Scale for tile coordinates / one-hot vs expression features.
+    tile_weight: f64,
+    disc: TensorGridDisc,
+    /// Use one-hot over tiles when the number of distinct tiles ≤ this; otherwise append 2D normalized tile centers.
+    onehot_max_tiles: usize,
+}
+
+impl Default for TensorGridParams {
+    fn default() -> Self {
+        Self {
+            nx: 8,
+            ny: 8,
+            tile_weight: 0.55,
+            disc: TensorGridDisc::Rect,
+            onehot_max_tiles: 64,
         }
     }
 }
@@ -258,6 +308,101 @@ fn cluster_cells_with_kmeans(
         .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?;
 
     Ok(model.predict(&dataset).to_vec())
+}
+
+fn cluster_cells_binary_l0_kmeans(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    if m == 0 {
+        anyhow::bail!("binary-l0-kmeans: zero feature columns");
+    }
+    let k = num_clusters.max(1).min(n);
+    if k == 1 {
+        return Ok(vec![0usize; n]);
+    }
+
+    let mut x = vec![0u8; n * m];
+    for i in 0..n {
+        for j in 0..m {
+            x[i * m + j] = if features[(i, j)] > 0.0 { 1 } else { 0 };
+        }
+    }
+
+    Ok(binary_l0_lloyd_assign(&x, n, m, k, 30))
+}
+
+fn binary_l0_lloyd_assign(x: &[u8], n: usize, m: usize, k: usize, max_iter: usize) -> Vec<usize> {
+    let mut centers = vec![0u8; k * m];
+    for c in 0..k {
+        let src = c * n / k;
+        for j in 0..m {
+            centers[c * m + j] = x[src * m + j];
+        }
+    }
+
+    let mut assignments = vec![0usize; n];
+    let mut changed_any = true;
+
+    for _ in 0..max_iter {
+        if !changed_any {
+            break;
+        }
+        changed_any = false;
+
+        for i in 0..n {
+            let mut best_c = 0usize;
+            let mut best_d = usize::MAX;
+            for c in 0..k {
+                let mut d = 0usize;
+                for j in 0..m {
+                    if x[i * m + j] != centers[c * m + j] {
+                        d += 1;
+                    }
+                }
+                if d < best_d {
+                    best_d = d;
+                    best_c = c;
+                }
+            }
+            if assignments[i] != best_c {
+                assignments[i] = best_c;
+                changed_any = true;
+            }
+        }
+
+        let mut cluster_sizes = vec![0usize; k];
+        let mut sums = vec![0usize; k * m];
+        for i in 0..n {
+            let c = assignments[i];
+            cluster_sizes[c] += 1;
+            for j in 0..m {
+                sums[c * m + j] += x[i * m + j] as usize;
+            }
+        }
+
+        for c in 0..k {
+            if cluster_sizes[c] == 0 {
+                let src = c * n / k;
+                for j in 0..m {
+                    centers[c * m + j] = x[src * m + j];
+                }
+                continue;
+            }
+            for j in 0..m {
+                let ones = sums[c * m + j];
+                let zeros = cluster_sizes[c] - ones;
+                centers[c * m + j] = if ones >= zeros { 1 } else { 0 };
+            }
+        }
+    }
+
+    assignments
 }
 
 fn normalize_l1_rows_inplace(a: &mut Array2<f64>) {
@@ -694,6 +839,223 @@ fn cluster_cells_spectral_bicluster(
     Ok(model.predict(&dataset).to_vec())
 }
 
+fn cluster_cells_spectral_bicluster_l0(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    if m == 0 {
+        anyhow::bail!("bicluster-l0: zero feature columns");
+    }
+    let k = num_clusters.max(1).min(n);
+    if k == 1 {
+        return Ok(vec![0usize; n]);
+    }
+
+    let mut b = vec![0u8; n * m];
+    let mut a = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            let bit = if features[(i, j)] > 0.0 { 1u8 } else { 0u8 };
+            b[i * m + j] = bit;
+            a[(i, j)] = bit as f64;
+        }
+    }
+    normalize_l1_rows_inplace(&mut a);
+    normalize_l1_cols_inplace(&mut a);
+
+    let k_col = k.min(m).max(1);
+    let mut x_col = vec![0u8; m * n];
+    for j in 0..m {
+        for i in 0..n {
+            x_col[j * n + i] = b[i * m + j];
+        }
+    }
+    let col_assign = binary_l0_lloyd_assign(&x_col, m, n, k_col, 30);
+    let agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
+
+    let data: Vec<f64> = a.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(n, m, &data);
+    let svd = mat.svd(true, false);
+    let u = svd
+        .u
+        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
+    let sigma = svd.singular_values;
+    let max_rank = n.min(m);
+    let n_comp = k.min(max_rank).max(1);
+
+    let mut embed = Array2::<f64>::zeros((n, n_comp));
+    for i in 0..n {
+        for j in 0..n_comp {
+            let s_j = sigma[j].max(1e-18);
+            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
+        }
+    }
+
+    let d = n_comp + k_col;
+    let mut bin_combined = vec![0u8; n * d];
+    for i in 0..n {
+        for j in 0..n_comp {
+            bin_combined[i * d + j] = if embed[(i, j)] > 0.0 { 1 } else { 0 };
+        }
+        for j in 0..k_col {
+            bin_combined[i * d + n_comp + j] = if agg[(i, j)] > 0.0 { 1 } else { 0 };
+        }
+    }
+
+    Ok(binary_l0_lloyd_assign(&bin_combined, n, d, k, 30))
+}
+
+/// **Swapped** vs `bicluster`: **row k-means first** on double-L1 `A` (cells in bucket space), build cluster-mean
+/// matrix `R` (`k×m`), **column k-means** on `G2=R^T R` (not `A^T A`), aggregates on full `A`, **SVD** on full `A`,
+/// then concat **`[agg ∥ embed]`** (aggregates before singular vectors) and final **row k-means**.
+fn cluster_cells_spectral_bicluster_row_col_swapped(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    let k = num_clusters.max(1).min(n);
+
+    let mut a = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            a[(i, j)] = features[(i, j)].max(0.0);
+        }
+    }
+    normalize_l1_rows_inplace(&mut a);
+    normalize_l1_cols_inplace(&mut a);
+
+    let dataset_rows = DatasetBase::from(a.clone());
+    let row_model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset_rows)
+        .map_err(|e| anyhow::anyhow!("swapped bicluster: initial row k-means failed: {}", e))?;
+    let cell_preassign = row_model.predict(&dataset_rows).to_vec();
+
+    let mut counts = vec![0usize; k];
+    let mut r_sum = Array2::<f64>::zeros((k, m));
+    for i in 0..n {
+        let c = cell_preassign[i];
+        if c < k {
+            counts[c] += 1;
+            for j in 0..m {
+                r_sum[(c, j)] += a[(i, j)];
+            }
+        }
+    }
+    let mut r = Array2::<f64>::zeros((k, m));
+    for c in 0..k {
+        let cnt = counts[c].max(1) as f64;
+        for j in 0..m {
+            r[(c, j)] = r_sum[(c, j)] / cnt;
+        }
+    }
+
+    let g2 = gram_xt_x(&r);
+    let k_col = k.min(m).max(1);
+    let col_assign = match cluster_cells_with_kmeans(&g2, k_col) {
+        Ok(assign) => assign,
+        Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
+    };
+
+    let agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
+
+    let data: Vec<f64> = a.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(n, m, &data);
+    let svd = mat.svd(true, false);
+    let u = svd
+        .u
+        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
+    let sigma = svd.singular_values;
+
+    let max_rank = n.min(m);
+    let n_comp = k.min(max_rank).max(1);
+    let mut embed = Array2::<f64>::zeros((n, n_comp));
+    for i in 0..n {
+        for j in 0..n_comp {
+            let s_j = sigma[j].max(1e-18);
+            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
+        }
+    }
+
+    let n_agg = agg.ncols();
+    let mut combined = Array2::<f64>::zeros((n, n_comp + n_agg));
+    for i in 0..n {
+        for j in 0..n_agg {
+            combined[(i, j)] = agg[(i, j)];
+        }
+        for j in 0..n_comp {
+            combined[(i, n_agg + j)] = embed[(i, j)];
+        }
+    }
+    l2_normalize_rows_inplace(&mut combined);
+
+    let dataset = DatasetBase::from(combined);
+    let model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("swapped bicluster: final row k-means failed: {}", e))?;
+
+    Ok(model.predict(&dataset).to_vec())
+}
+
+/// Double-L1 normalized nonnegative `X`, truncated SVD row embedding `U Σ^{1/2}`, L2-normalize rows, k-means only.
+fn cluster_cells_svd_kmeans_only(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    let k = num_clusters.max(1).min(n);
+
+    let mut a = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            a[(i, j)] = features[(i, j)].max(0.0);
+        }
+    }
+    normalize_l1_rows_inplace(&mut a);
+    normalize_l1_cols_inplace(&mut a);
+
+    let data: Vec<f64> = a.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(n, m, &data);
+    let svd = mat.svd(true, false);
+    let u = svd
+        .u
+        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
+    let sigma = svd.singular_values;
+
+    let max_rank = n.min(m);
+    let n_comp = k.min(max_rank).max(1);
+    let mut embed = Array2::<f64>::zeros((n, n_comp));
+    for i in 0..n {
+        for j in 0..n_comp {
+            let s_j = sigma[j].max(1e-18);
+            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
+        }
+    }
+    l2_normalize_rows_inplace(&mut embed);
+
+    let dataset = DatasetBase::from(embed);
+    let model = KMeans::params(k)
+        .max_n_iterations(20)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("k-means on SVD embedding failed: {}", e))?;
+
+    Ok(model.predict(&dataset).to_vec())
+}
+
 /// Double-L1 normalized `X`; k-means on columns via Gram `X^T X`; per-cell column-cluster sums;
 /// L2-normalize rows; k-means on cells only (no spectral term).
 fn cluster_cells_simple_column_kmeans(
@@ -955,23 +1317,203 @@ fn cluster_cells_spatial_graph(
     Ok(model.predict(&dataset).to_vec())
 }
 
+fn bounds_xy(points: &[Point]) -> (f64, f64, f64, f64) {
+    let mut xmin = f64::INFINITY;
+    let mut xmax = f64::NEG_INFINITY;
+    let mut ymin = f64::INFINITY;
+    let mut ymax = f64::NEG_INFINITY;
+    for p in points {
+        xmin = xmin.min(p.x);
+        xmax = xmax.max(p.x);
+        ymin = ymin.min(p.y);
+        ymax = ymax.max(p.y);
+    }
+    if !xmin.is_finite() || !xmax.is_finite() {
+        (0.0, 1.0, 0.0, 1.0)
+    } else {
+        (xmin, xmax, ymin, ymax)
+    }
+}
+
+/// Fractional axial coords, then cube rounding → integer axial (q, r).
+fn axial_hex_round(q: f64, r: f64) -> (i32, i32) {
+    let x = q;
+    let y = r;
+    let z = -q - r;
+    let mut rx = x.round() as i32;
+    let mut ry = y.round() as i32;
+    let mut rz = z.round() as i32;
+    let x_diff = (rx as f64 - x).abs();
+    let y_diff = (ry as f64 - y).abs();
+    let z_diff = (rz as f64 - z).abs();
+    if x_diff > y_diff && x_diff > z_diff {
+        rx = -ry - rz;
+    } else if y_diff > z_diff {
+        ry = -rx - rz;
+    } else {
+        let new_z = -rx - ry;
+        rz = new_z;
+    }
+    debug_assert_eq!(rx + ry + rz, 0);
+    let _ = rz;
+    (rx, ry)
+}
+
+/// Pointy-top hex: pixel (x,y) relative to origin → fractional axial (q,r).
+fn pixel_to_axial_hex(x: f64, y: f64, hex_size: f64) -> (f64, f64) {
+    let s = hex_size.max(1e-18);
+    let q = (3f64.sqrt() / 3.0 * x - 1.0 / 3.0 * y) / s;
+    let r = (2.0 / 3.0 * y) / s;
+    (q, r)
+}
+
+/// Pointy-top hex center (pixel space) for integer axial (q, r).
+fn axial_hex_center_xy(q: i32, r: i32, hex_size: f64) -> (f64, f64) {
+    let s = hex_size.max(1e-18);
+    let q = q as f64;
+    let r = r as f64;
+    let x = s * (3f64.sqrt() * q + 3f64.sqrt() / 2.0 * r);
+    let y = s * (3.0 / 2.0 * r);
+    (x, y)
+}
+
+/// Discretize the slide into tiles, then k-means on `[per-cell buckets \| tile embedding]`.
+fn cluster_cells_tensor_grid(
+    points: &[Point],
+    features: &Array2<f64>,
+    num_clusters: usize,
+    params: TensorGridParams,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    if points.len() != n {
+        anyhow::bail!("tensor-grid: points/features length mismatch");
+    }
+    let k = num_clusters.max(1).min(n);
+    let m = features.ncols();
+    let nx = params.nx.max(1);
+    let ny = params.ny.max(1);
+    let w_t = params.tile_weight.max(0.0);
+
+    let (xmin, xmax, ymin, ymax) = bounds_xy(points);
+    let span_x = (xmax - xmin).max(1e-18);
+    let span_y = (ymax - ymin).max(1e-18);
+
+    let mut tile_id: Vec<usize> = Vec::with_capacity(n);
+    let mut center_tx: Vec<f64> = Vec::with_capacity(n);
+    let mut center_ty: Vec<f64> = Vec::with_capacity(n);
+
+    match params.disc {
+        TensorGridDisc::Rect => {
+            for i in 0..n {
+                let x = points[i].x;
+                let y = points[i].y;
+                let fx = ((x - xmin) / span_x * nx as f64).floor() as i64;
+                let fy = ((y - ymin) / span_y * ny as f64).floor() as i64;
+                let ix = fx.clamp(0, nx as i64 - 1) as usize;
+                let iy = fy.clamp(0, ny as i64 - 1) as usize;
+                let tid = ix + iy * nx;
+                tile_id.push(tid);
+                center_tx.push((ix as f64 + 0.5) / nx as f64);
+                center_ty.push((iy as f64 + 0.5) / ny as f64);
+            }
+        }
+        TensorGridDisc::Hex => {
+            let hex_size = (span_x / (nx as f64 * 1.25 + 0.25))
+                .max(span_y / (ny as f64 * 1.25 + 0.25))
+                .max(1e-18);
+            let mut axial: Vec<(i32, i32)> = Vec::with_capacity(n);
+            for i in 0..n {
+                let x = points[i].x - xmin;
+                let y = points[i].y - ymin;
+                let (fq, fr) = pixel_to_axial_hex(x, y, hex_size);
+                axial.push(axial_hex_round(fq, fr));
+            }
+            let min_q = axial.iter().map(|(q, _)| *q).min().unwrap_or(0);
+            let min_r = axial.iter().map(|(_, r)| *r).min().unwrap_or(0);
+            let max_r = axial.iter().map(|(_, r)| *r).max().unwrap_or(0);
+            let nr = (max_r - min_r + 1).max(1) as usize;
+            for i in 0..n {
+                let (iq, ir) = axial[i];
+                let tid = (iq - min_q) as usize * nr + (ir - min_r) as usize;
+                tile_id.push(tid);
+                let (cx, cy) = axial_hex_center_xy(iq, ir, hex_size);
+                center_tx.push((cx / span_x).clamp(0.0, 1.0));
+                center_ty.push((cy / span_y).clamp(0.0, 1.0));
+            }
+        }
+    }
+
+    let num_tiles = tile_id.iter().copied().max().unwrap_or(0) + 1;
+    let use_onehot = num_tiles <= params.onehot_max_tiles.max(1) && num_tiles <= 4096;
+
+    if use_onehot {
+        let mut aug = Array2::<f64>::zeros((n, m + num_tiles));
+        for i in 0..n {
+            for j in 0..m {
+                aug[(i, j)] = features[(i, j)];
+            }
+            aug[(i, m + tile_id[i])] = w_t;
+        }
+        cluster_cells_with_kmeans(&aug, k)
+    } else {
+        let mut aug = Array2::<f64>::zeros((n, m + 2));
+        for i in 0..n {
+            for j in 0..m {
+                aug[(i, j)] = features[(i, j)];
+            }
+            aug[(i, m)] = w_t * center_tx[i];
+            aug[(i, m + 1)] = w_t * center_ty[i];
+        }
+        cluster_cells_with_kmeans(&aug, k)
+    }
+}
+
 fn cluster_cells(
     method: CellClusterMethodArg,
     features: &Array2<f64>,
     num_clusters: usize,
     points: &[Point],
     spatial: SpatialGraphParams,
+    tensor_grid: TensorGridParams,
 ) -> anyhow::Result<Vec<usize>> {
+    // NOTE: binary-all clustering policy is disabled for reproducibility testing.
+    // To re-enable, replace `features_src = features` with the commented block below.
+    // let mut features_bin = Array2::<f64>::zeros(features.raw_dim());
+    // for i in 0..features.nrows() {
+    //     for j in 0..features.ncols() {
+    //         features_bin[(i, j)] = if features[(i, j)] > 0.0 { 1.0 } else { 0.0 };
+    //     }
+    // }
+    let features_src = features;
+
     match method {
-        CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features, num_clusters),
-        CellClusterMethodArg::Bicluster => cluster_cells_spectral_bicluster(features, num_clusters),
-        CellClusterMethodArg::ColumnKmeans => cluster_cells_simple_column_kmeans(features, num_clusters),
-        CellClusterMethodArg::SpectralCocluster => {
-            cluster_cells_spectral_cocluster_dhillon(features, num_clusters)
+        CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features_src, num_clusters),
+        CellClusterMethodArg::BinaryL0Kmeans => {
+            cluster_cells_binary_l0_kmeans(features_src, num_clusters)
         }
-        CellClusterMethodArg::Fabia => cluster_cells_fabia(features, num_clusters),
+        CellClusterMethodArg::Bicluster => cluster_cells_spectral_bicluster(features_src, num_clusters),
+        CellClusterMethodArg::BiclusterL0 => {
+            cluster_cells_spectral_bicluster_l0(features_src, num_clusters)
+        }
+        CellClusterMethodArg::BiclusterSwapped => {
+            cluster_cells_spectral_bicluster_row_col_swapped(features_src, num_clusters)
+        }
+        CellClusterMethodArg::SvdKmeans => cluster_cells_svd_kmeans_only(features_src, num_clusters),
+        CellClusterMethodArg::ColumnKmeans => {
+            cluster_cells_simple_column_kmeans(features_src, num_clusters)
+        }
+        CellClusterMethodArg::SpectralCocluster => {
+            cluster_cells_spectral_cocluster_dhillon(features_src, num_clusters)
+        }
+        CellClusterMethodArg::Fabia => cluster_cells_fabia(features_src, num_clusters),
         CellClusterMethodArg::SpatialGraph => {
-            cluster_cells_spatial_graph(points, features, num_clusters, spatial)
+            cluster_cells_spatial_graph(points, features_src, num_clusters, spatial)
+        }
+        CellClusterMethodArg::TensorGrid => {
+            cluster_cells_tensor_grid(points, features_src, num_clusters, tensor_grid)
         }
     }
 }
@@ -1004,6 +1546,7 @@ fn split_oversized_clusters(
     max_cluster_size: Option<usize>,
     cell_cluster_method: CellClusterMethodArg,
     spatial: SpatialGraphParams,
+    tensor_grid: TensorGridParams,
 ) -> anyhow::Result<Vec<Vec<usize>>> {
     let Some(max_cluster_size_raw) = max_cluster_size else {
         return Ok(initial_clusters);
@@ -1038,6 +1581,7 @@ fn split_oversized_clusters(
             split_k,
             &subpoints,
             spatial,
+            tensor_grid,
         ) {
             Ok(a) => a,
             Err(err) => {
@@ -2018,6 +2562,7 @@ fn run_clustered_compression(
     row_template_max: usize,
     cell_cluster_method: CellClusterMethodArg,
     spatial_graph: SpatialGraphParams,
+    tensor_grid: TensorGridParams,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -2031,6 +2576,7 @@ fn run_clustered_compression(
         requested_clusters,
         points,
         spatial_graph,
+        tensor_grid,
     ) {
         Ok(a) => a,
         Err(err) => {
@@ -2060,6 +2606,7 @@ fn run_clustered_compression(
         max_cluster_size,
         cell_cluster_method,
         spatial_graph,
+        tensor_grid,
     )?;
     let clusters = reorder_rows_within_clusters(&clusters, &features);
     let final_max = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -2598,9 +3145,12 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
-    /// How to cluster cells (`kmeans`, `column-kmeans`, `bicluster`, `spectral-cocluster`, `fabia`, `spatial-graph`).
+    /// How to cluster cells (`kmeans`, `bicluster`, `bicluster-swapped`, `svd-kmeans`, …).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
+    /// If set, run all cell-cluster methods and append one stats row per method.
+    #[arg(long = "cell-cluster-method-sweep-all", default_value_t = false)]
+    cell_cluster_method_sweep_all: bool,
     /// For `spatial-graph`: number of spatial \((x,y)\) nearest neighbors per cell.
     #[arg(long = "cell-cluster-spatial-knn", default_value_t = 12)]
     cell_cluster_spatial_knn: usize,
@@ -2610,6 +3160,21 @@ struct BuildCommand {
     /// For `spatial-graph`: weight in \([0,1]\) on spatial kNN affinity (`1 - blend` on expression kNN).
     #[arg(long = "cell-cluster-spatial-blend", default_value_t = 0.45)]
     cell_cluster_spatial_blend: f64,
+    /// For `tensor-grid`: number of bins along x (rect) or hex resolution hint.
+    #[arg(long = "cell-cluster-grid-nx", default_value_t = 8)]
+    cell_cluster_grid_nx: usize,
+    /// For `tensor-grid`: number of bins along y (rect) or hex resolution hint.
+    #[arg(long = "cell-cluster-grid-ny", default_value_t = 8)]
+    cell_cluster_grid_ny: usize,
+    /// For `tensor-grid`: scale of tile coordinates / one-hot vs bucket features.
+    #[arg(long = "cell-cluster-grid-tile-weight", default_value_t = 0.55)]
+    cell_cluster_grid_tile_weight: f64,
+    /// For `tensor-grid`: `rect` = axis-aligned grid; `hex` = pointy-top hex bins.
+    #[arg(long = "cell-cluster-grid-disc", value_enum, default_value_t = TensorGridDisc::Rect)]
+    cell_cluster_grid_disc: TensorGridDisc,
+    /// For `tensor-grid`: use one-hot tile dims when number of tiles ≤ this (else 2D tile centers).
+    #[arg(long = "cell-cluster-grid-onehot-max", default_value_t = 64)]
+    cell_cluster_grid_onehot_max: usize,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -2649,9 +3214,36 @@ fn infer_stats_label(input: &Path) -> String {
         .unwrap_or_else(|| input.display().to_string())
 }
 
+fn cell_cluster_method_name(method: CellClusterMethodArg) -> String {
+    method
+        .to_possible_value()
+        .map(|v| v.get_name().to_string())
+        .unwrap_or_else(|| format!("{:?}", method).to_lowercase())
+}
+
+fn output_path_with_method_suffix(base: &Path, method: CellClusterMethodArg) -> PathBuf {
+    let method_name = cell_cluster_method_name(method);
+    let file_name = base
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("output.bin.gz");
+    let parent = base.parent().unwrap_or_else(|| Path::new(""));
+
+    if file_name.ends_with(".bin.gz") {
+        let stem = file_name.trim_end_matches(".bin.gz");
+        parent.join(format!("{}_{}.bin.gz", stem, method_name))
+    } else if let Some(dot) = file_name.rfind('.') {
+        let (stem, ext) = file_name.split_at(dot);
+        parent.join(format!("{}_{}{}", stem, method_name, ext))
+    } else {
+        parent.join(format!("{}_{}", file_name, method_name))
+    }
+}
+
 fn append_build_stats_csv(
     csv_path: &Path,
     stats_label: &str,
+    cell_cluster_method: &str,
     input_matrix_bytes: usize,
     input_positions_bytes: usize,
     mst_uncompressed_bytes: usize,
@@ -2687,6 +3279,7 @@ fn append_build_stats_csv(
     if !file_exists || std::fs::metadata(csv_path)?.len() == 0 {
         wtr.write_record([
             "stats_csv",
+            "cell_cluster_method",
             "input_matrix_bytes",
             "input_positions_bytes",
             "input_bytes_sum",
@@ -2709,6 +3302,7 @@ fn append_build_stats_csv(
 
     wtr.write_record([
         stats_label.to_string(),
+        cell_cluster_method.to_string(),
         input_matrix_bytes.to_string(),
         input_positions_bytes.to_string(),
         input_bytes_sum.to_string(),
@@ -2810,6 +3404,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 expr_knn: args.cell_cluster_expr_knn.max(1),
                 blend: args.cell_cluster_spatial_blend.clamp(0.0, 1.0),
             };
+            let tensor_grid = TensorGridParams {
+                nx: args.cell_cluster_grid_nx.max(1),
+                ny: args.cell_cluster_grid_ny.max(1),
+                tile_weight: args.cell_cluster_grid_tile_weight.max(0.0),
+                disc: args.cell_cluster_grid_disc,
+                onehot_max_tiles: args.cell_cluster_grid_onehot_max.max(1),
+            };
 
             info!(
                 "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
@@ -2833,61 +3434,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.row_template_max
             );
 
-            let mut metrics = Vec::new();
-            let mut selected: Option<CompressionResult> = None;
+            let method_sweep: Vec<CellClusterMethodArg> = if args.cell_cluster_method_sweep_all {
+                CellClusterMethodArg::value_variants().to_vec()
+            } else {
+                vec![args.cell_cluster_method]
+            };
 
-            for &quantizer_count in &sweep_counts {
-                let result = run_clustered_compression(
-                    &points,
-                    &csr,
-                    quantizer_count,
-                    quantizer_bins,
-                    quantize_values,
-                    args.lossy_verify_lossless,
-                    args.max_cluster_size,
-                    args.knn_metric.into(),
-                    mst_weight_mode,
-                    index_codec,
-                    sorted_index_codec,
-                    fallback_ratio,
-                    forest_cut_factor,
-                    cluster_encoding,
-                    args.column_template_count,
-                    args.column_template_adaptive,
-                    args.column_template_max,
-                    args.row_template_adaptive,
-                    args.row_template_max,
-                    args.cell_cluster_method,
-                    spatial_graph,
-                )?;
-
+            for &cell_cluster_method in &method_sweep {
                 info!(
-                    "q={} (used={}): gzip≈{} bytes, rate={:.4} bits/value, mse={:.6}, rmse={:.6}",
-                    result.quantizers_requested,
-                    result.quantizers_used,
-                    result.gzip_bytes_estimate,
-                    result.rate_bits_per_value,
-                    result.mse,
-                    result.rmse
+                    "Running build for cell_cluster_method={}",
+                    cell_cluster_method_name(cell_cluster_method)
                 );
+                let mut metrics = Vec::new();
+                let mut selected: Option<CompressionResult> = None;
 
-                metrics.push(SweepMetric {
-                    quantizers_requested: result.quantizers_requested,
-                    quantizers_used: result.quantizers_used,
-                    gzip_bytes_estimate: result.gzip_bytes_estimate,
-                    rate_bits_per_value: result.rate_bits_per_value,
-                    mse: result.mse,
-                    rmse: result.rmse,
-                });
+                for &quantizer_count in &sweep_counts {
+                    let result = run_clustered_compression(
+                        &points,
+                        &csr,
+                        quantizer_count,
+                        quantizer_bins,
+                        quantize_values,
+                        args.lossy_verify_lossless,
+                        args.max_cluster_size,
+                        args.knn_metric.into(),
+                        mst_weight_mode,
+                        index_codec,
+                        sorted_index_codec,
+                        fallback_ratio,
+                        forest_cut_factor,
+                        cluster_encoding,
+                        args.column_template_count,
+                        args.column_template_adaptive,
+                        args.column_template_max,
+                        args.row_template_adaptive,
+                        args.row_template_max,
+                        cell_cluster_method,
+                        spatial_graph,
+                        tensor_grid,
+                    )?;
 
-                if quantizer_count == target_quantizers {
-                    selected = Some(result);
+                    info!(
+                        "q={} (used={}): gzip≈{} bytes, rate={:.4} bits/value, mse={:.6}, rmse={:.6}",
+                        result.quantizers_requested,
+                        result.quantizers_used,
+                        result.gzip_bytes_estimate,
+                        result.rate_bits_per_value,
+                        result.mse,
+                        result.rmse
+                    );
+
+                    metrics.push(SweepMetric {
+                        quantizers_requested: result.quantizers_requested,
+                        quantizers_used: result.quantizers_used,
+                        gzip_bytes_estimate: result.gzip_bytes_estimate,
+                        rate_bits_per_value: result.rate_bits_per_value,
+                        mse: result.mse,
+                        rmse: result.rmse,
+                    });
+
+                    if quantizer_count == target_quantizers {
+                        selected = Some(result);
+                    }
                 }
-            }
 
-            let selected = selected.ok_or_else(|| {
-                anyhow::anyhow!("Failed to build selected setting q={}", target_quantizers)
-            })?;
+                let selected = selected.ok_or_else(|| {
+                    anyhow::anyhow!("Failed to build selected setting q={}", target_quantizers)
+                })?;
 
             info!("Rate-distortion sweep summary:");
             for metric in &metrics {
@@ -2914,10 +3527,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
                 encoder.finish()?.len()
             } else {
-                let output = args
+                let mut output = args
                     .output
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
+                if method_sweep.len() > 1 {
+                    output = output_path_with_method_suffix(&output, cell_cluster_method);
+                }
                 let file = File::create(&output)?;
                 let writer = BufWriter::new(file);
                 let mut encoder = GzEncoder::new(writer, Compression::default());
@@ -3004,6 +3620,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 append_build_stats_csv(
                     stats_path,
                     &stats_label,
+                    &cell_cluster_method_name(cell_cluster_method),
                     input_matrix_bytes,
                     input_positions_bytes,
                     selected.total_mst_bytes,
@@ -3025,6 +3642,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if args.report_index_bounds {
                 let bounds_report = compute_index_bounds_report(&selected.encoded_blocks);
                 log_index_bounds_report(&bounds_report, csr.nnz());
+            }
             }
         }
         Commands::RoundtripCheck(args) => {
@@ -3127,6 +3745,7 @@ mod tests {
             16,
             CellClusterMethodArg::Kmeans,
             SpatialGraphParams::default(),
+            TensorGridParams::default(),
         )
         .expect("lossy compression should succeed");
 
@@ -3177,6 +3796,7 @@ mod tests {
                 16,
                 method,
                 SpatialGraphParams::default(),
+                TensorGridParams::default(),
             )
             .expect("compression")
         };
@@ -3226,8 +3846,169 @@ mod tests {
             16,
             CellClusterMethodArg::SpectralCocluster,
             SpatialGraphParams::default(),
+            TensorGridParams::default(),
         )
         .expect("spectral cocluster path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn svd_kmeans_runs_on_toy_matrix() {
+        let n_cells = 12usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 12u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::SvdKmeans,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+        )
+        .expect("svd-kmeans path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn binary_l0_kmeans_runs_on_toy_matrix() {
+        let n_cells = 12usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 9u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::BinaryL0Kmeans,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+        )
+        .expect("binary-l0-kmeans path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn bicluster_swapped_runs_on_toy_matrix() {
+        let n_cells = 14usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 11u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::BiclusterSwapped,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+        )
+        .expect("bicluster-swapped path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn bicluster_l0_runs_on_toy_matrix() {
+        let n_cells = 14usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 7u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, 0.0, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::BiclusterL0,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+        )
+        .expect("bicluster-l0 path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
     }
 
@@ -3265,6 +4046,7 @@ mod tests {
             16,
             CellClusterMethodArg::Fabia,
             SpatialGraphParams::default(),
+            TensorGridParams::default(),
         )
         .expect("fabia path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -3304,8 +4086,66 @@ mod tests {
             16,
             CellClusterMethodArg::SpatialGraph,
             SpatialGraphParams::default(),
+            TensorGridParams::default(),
         )
         .expect("spatial-graph path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn tensor_grid_rect_and_hex_run_on_toy_matrix() {
+        let n_cells = 20usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, 15u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new((i % 5) as f64 * 10.0, (i / 5) as f64 * 10.0, i))
+            .collect();
+
+        for (disc, label) in [
+            (TensorGridDisc::Rect, "rect"),
+            (TensorGridDisc::Hex, "hex"),
+        ] {
+            let result = run_clustered_compression(
+                &points,
+                &csr,
+                3,
+                8,
+                false,
+                false,
+                None,
+                KnnDistanceMetric::L0,
+                MstWeightMode::Metric,
+                IndexStreamCodec::Arithmetic,
+                SortedIndexCodec::EliasFano,
+                Some(1.0),
+                None,
+                ClusterEncodingArg::Hybrid,
+                0,
+                false,
+                32,
+                false,
+                16,
+                CellClusterMethodArg::TensorGrid,
+                SpatialGraphParams::default(),
+                TensorGridParams {
+                    nx: 4,
+                    ny: 4,
+                    tile_weight: 0.5,
+                    disc,
+                    onehot_max_tiles: 64,
+                },
+            )
+            .unwrap_or_else(|e| panic!("tensor-grid {}: {}", label, e));
+            assert_eq!(
+                result.cluster_sizes.iter().sum::<usize>(),
+                n_cells,
+                "tensor-grid {}",
+                label
+            );
+        }
     }
 }
