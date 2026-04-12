@@ -35,6 +35,8 @@ use linfa::DatasetBase;
 use linfa_clustering::KMeans;
 use nalgebra::linalg::SymmetricEigen;
 use nalgebra::DMatrix;
+use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::Xoshiro256Plus;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -294,6 +296,7 @@ fn build_cell_features(
 fn cluster_cells_with_kmeans(
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let nrows = features.nrows();
     if nrows == 0 {
@@ -302,10 +305,17 @@ fn cluster_cells_with_kmeans(
 
     let k = num_clusters.max(1).min(nrows);
     let dataset = DatasetBase::from(features.clone());
-    let model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed))
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?
+    };
 
     Ok(model.predict(&dataset).to_vec())
 }
@@ -506,6 +516,7 @@ fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
 fn cluster_cells_spectral_cocluster_dhillon(
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
@@ -536,7 +547,7 @@ fn cluster_cells_spectral_cocluster_dhillon(
     let svd = mat.svd(true, true);
     let (u, v_t) = match (svd.u, svd.v_t) {
         (Some(u), Some(vt)) => (u, vt),
-        _ => return cluster_cells_with_kmeans(features, k),
+        _ => return cluster_cells_with_kmeans(features, k, cluster_seed),
     };
 
     let r = u.ncols();
@@ -547,7 +558,7 @@ fn cluster_cells_spectral_cocluster_dhillon(
     let end_col = r.min(n_sv);
     let n_keep = end_col.saturating_sub(n_discard);
     if n_keep == 0 {
-        return cluster_cells_with_kmeans(features, k);
+        return cluster_cells_with_kmeans(features, k, cluster_seed);
     }
 
     let mut z = Array2::<f64>::zeros((n + m, n_keep));
@@ -563,10 +574,17 @@ fn cluster_cells_spectral_cocluster_dhillon(
     }
 
     let dataset = DatasetBase::from(z);
-    let model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("spectral cocluster joint k-means failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(1001)))
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("spectral cocluster joint k-means failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("spectral cocluster joint k-means failed: {}", e))?
+    };
     let labels = model.predict(&dataset).to_vec();
     Ok(labels.into_iter().take(n).collect())
 }
@@ -583,7 +601,11 @@ fn soft_threshold_scalar(x: f64, t: f64) -> f64 {
 }
 
 /// FABIA-style: `X` is `m×n` (bucket features × cells), row-z-score, `X ≈ Λ Z` with sparse `Λ`, `Z` via ISTA.
-fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::Result<Vec<usize>> {
+fn cluster_cells_fabia(
+    features: &Array2<f64>,
+    num_clusters: usize,
+    cluster_seed: Option<u64>,
+) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
         return Ok(Vec::new());
@@ -622,7 +644,7 @@ fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::R
 
     let p = k_req.min(m).min(n);
     if p < 2 {
-        return cluster_cells_with_kmeans(features, k_req);
+        return cluster_cells_with_kmeans(features, k_req, cluster_seed);
     }
 
     let data: Vec<f64> = x.iter().copied().collect();
@@ -630,7 +652,7 @@ fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::R
     let svd = mat.svd(true, true);
     let (u, v_t) = match (svd.u, svd.v_t) {
         (Some(u), Some(vt)) => (u, vt),
-        _ => return cluster_cells_with_kmeans(features, k_req),
+        _ => return cluster_cells_with_kmeans(features, k_req, cluster_seed),
     };
     let sigma = svd.singular_values;
 
@@ -733,7 +755,7 @@ fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::R
     }
 
     if z.iter().any(|v| !v.is_finite()) || lambda.iter().any(|v| !v.is_finite()) {
-        return cluster_cells_with_kmeans(features, k_req);
+        return cluster_cells_with_kmeans(features, k_req, cluster_seed);
     }
 
     if p >= k_req {
@@ -759,10 +781,17 @@ fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::R
             }
         }
         let dataset = DatasetBase::from(z_sub);
-        let model = KMeans::params(k_req)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("fabia fallback k-means failed: {}", e))?;
+        let model = if let Some(seed) = cluster_seed {
+            KMeans::params_with_rng(k_req, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(2001)))
+                .max_n_iterations(20)
+                .fit(&dataset)
+                .map_err(|e| anyhow::anyhow!("fabia fallback k-means failed: {}", e))?
+        } else {
+            KMeans::params(k_req)
+                .max_n_iterations(20)
+                .fit(&dataset)
+                .map_err(|e| anyhow::anyhow!("fabia fallback k-means failed: {}", e))?
+        };
         Ok(model.predict(&dataset).to_vec())
     }
 }
@@ -773,6 +802,7 @@ fn cluster_cells_fabia(features: &Array2<f64>, num_clusters: usize) -> anyhow::R
 fn cluster_cells_spectral_bicluster(
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
@@ -793,7 +823,11 @@ fn cluster_cells_spectral_bicluster(
     // Column k-means: each bucket j is row j of G = X^T X (m points in R^m). No n-dim centroids.
     let g = gram_xt_x(&a);
     let k_col = k.min(m).max(1);
-    let col_assign = match cluster_cells_with_kmeans(&g, k_col) {
+    let col_assign = match cluster_cells_with_kmeans(
+        &g,
+        k_col,
+        cluster_seed.map(|s| s.wrapping_add(3001)),
+    ) {
         Ok(a) => a,
         Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
     };
@@ -831,10 +865,17 @@ fn cluster_cells_spectral_bicluster(
     l2_normalize_rows_inplace(&mut combined);
 
     let dataset = DatasetBase::from(combined);
-    let model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("k-means on spectral + column-cluster features failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(3002)))
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means on spectral + column-cluster features failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means on spectral + column-cluster features failed: {}", e))?
+    };
 
     Ok(model.predict(&dataset).to_vec())
 }
@@ -916,6 +957,7 @@ fn cluster_cells_spectral_bicluster_l0(
 fn cluster_cells_spectral_bicluster_row_col_swapped(
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
@@ -934,10 +976,17 @@ fn cluster_cells_spectral_bicluster_row_col_swapped(
     normalize_l1_cols_inplace(&mut a);
 
     let dataset_rows = DatasetBase::from(a.clone());
-    let row_model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset_rows)
-        .map_err(|e| anyhow::anyhow!("swapped bicluster: initial row k-means failed: {}", e))?;
+    let row_model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(4001)))
+            .max_n_iterations(20)
+            .fit(&dataset_rows)
+            .map_err(|e| anyhow::anyhow!("swapped bicluster: initial row k-means failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset_rows)
+            .map_err(|e| anyhow::anyhow!("swapped bicluster: initial row k-means failed: {}", e))?
+    };
     let cell_preassign = row_model.predict(&dataset_rows).to_vec();
 
     let mut counts = vec![0usize; k];
@@ -961,7 +1010,11 @@ fn cluster_cells_spectral_bicluster_row_col_swapped(
 
     let g2 = gram_xt_x(&r);
     let k_col = k.min(m).max(1);
-    let col_assign = match cluster_cells_with_kmeans(&g2, k_col) {
+    let col_assign = match cluster_cells_with_kmeans(
+        &g2,
+        k_col,
+        cluster_seed.map(|s| s.wrapping_add(4002)),
+    ) {
         Ok(assign) => assign,
         Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
     };
@@ -999,10 +1052,17 @@ fn cluster_cells_spectral_bicluster_row_col_swapped(
     l2_normalize_rows_inplace(&mut combined);
 
     let dataset = DatasetBase::from(combined);
-    let model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("swapped bicluster: final row k-means failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(4003)))
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("swapped bicluster: final row k-means failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("swapped bicluster: final row k-means failed: {}", e))?
+    };
 
     Ok(model.predict(&dataset).to_vec())
 }
@@ -1011,6 +1071,7 @@ fn cluster_cells_spectral_bicluster_row_col_swapped(
 fn cluster_cells_svd_kmeans_only(
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
@@ -1048,10 +1109,17 @@ fn cluster_cells_svd_kmeans_only(
     l2_normalize_rows_inplace(&mut embed);
 
     let dataset = DatasetBase::from(embed);
-    let model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("k-means on SVD embedding failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(5001)))
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means on SVD embedding failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means on SVD embedding failed: {}", e))?
+    };
 
     Ok(model.predict(&dataset).to_vec())
 }
@@ -1061,6 +1129,7 @@ fn cluster_cells_svd_kmeans_only(
 fn cluster_cells_simple_column_kmeans(
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
@@ -1080,7 +1149,11 @@ fn cluster_cells_simple_column_kmeans(
 
     let g = gram_xt_x(&a);
     let k_col = k.min(m).max(1);
-    let col_assign = match cluster_cells_with_kmeans(&g, k_col) {
+    let col_assign = match cluster_cells_with_kmeans(
+        &g,
+        k_col,
+        cluster_seed.map(|s| s.wrapping_add(6001)),
+    ) {
         Ok(a) => a,
         Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
     };
@@ -1089,10 +1162,17 @@ fn cluster_cells_simple_column_kmeans(
     l2_normalize_rows_inplace(&mut agg);
 
     let dataset = DatasetBase::from(agg);
-    let model = KMeans::params(k)
-        .max_n_iterations(20)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("k-means on column-cluster aggregates failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(6002)))
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means on column-cluster aggregates failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(20)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("k-means on column-cluster aggregates failed: {}", e))?
+    };
 
     Ok(model.predict(&dataset).to_vec())
 }
@@ -1115,6 +1195,7 @@ fn cluster_cells_spatial_augmented_kmeans(
     points: &[Point],
     features: &Array2<f64>,
     num_clusters: usize,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     let m = features.ncols();
@@ -1150,7 +1231,7 @@ fn cluster_cells_spatial_augmented_kmeans(
         aug[(i, m)] = w * (points[i].x - mean_x) / sdx;
         aug[(i, m + 1)] = w * (points[i].y - mean_y) / sdy;
     }
-    cluster_cells_with_kmeans(&aug, k)
+    cluster_cells_with_kmeans(&aug, k, cluster_seed)
 }
 
 /// Combined spatial + expression kNN affinity, normalized Laplacian spectral embedding, k-means (`n` small);
@@ -1160,6 +1241,7 @@ fn cluster_cells_spatial_graph(
     features: &Array2<f64>,
     num_clusters: usize,
     params: SpatialGraphParams,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     const DENSE_SPECTRAL_MAX_N: usize = 2048;
 
@@ -1181,7 +1263,7 @@ fn cluster_cells_spatial_graph(
             "spatial-graph clustering: n={} > {} — using augmented (expression + xy) k-means",
             n, DENSE_SPECTRAL_MAX_N
         );
-        return cluster_cells_spatial_augmented_kmeans(points, features, k);
+        return cluster_cells_spatial_augmented_kmeans(points, features, k, cluster_seed);
     }
 
     let ks = params.spatial_knn.max(1).min(n - 1);
@@ -1310,10 +1392,17 @@ fn cluster_cells_spatial_graph(
     }
 
     let dataset = DatasetBase::from(embed);
-    let model = KMeans::params(k)
-        .max_n_iterations(30)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("spatial-graph spectral k-means failed: {}", e))?;
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(7001)))
+            .max_n_iterations(30)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("spatial-graph spectral k-means failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(30)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("spatial-graph spectral k-means failed: {}", e))?
+    };
     Ok(model.predict(&dataset).to_vec())
 }
 
@@ -1383,6 +1472,7 @@ fn cluster_cells_tensor_grid(
     features: &Array2<f64>,
     num_clusters: usize,
     params: TensorGridParams,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
     let n = features.nrows();
     if n == 0 {
@@ -1457,7 +1547,7 @@ fn cluster_cells_tensor_grid(
             }
             aug[(i, m + tile_id[i])] = w_t;
         }
-        cluster_cells_with_kmeans(&aug, k)
+        cluster_cells_with_kmeans(&aug, k, cluster_seed)
     } else {
         let mut aug = Array2::<f64>::zeros((n, m + 2));
         for i in 0..n {
@@ -1467,7 +1557,7 @@ fn cluster_cells_tensor_grid(
             aug[(i, m)] = w_t * center_tx[i];
             aug[(i, m + 1)] = w_t * center_ty[i];
         }
-        cluster_cells_with_kmeans(&aug, k)
+        cluster_cells_with_kmeans(&aug, k, cluster_seed)
     }
 }
 
@@ -1478,42 +1568,49 @@ fn cluster_cells(
     points: &[Point],
     spatial: SpatialGraphParams,
     tensor_grid: TensorGridParams,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<usize>> {
-    // NOTE: binary-all clustering policy is disabled for reproducibility testing.
-    // To re-enable, replace `features_src = features` with the commented block below.
-    // let mut features_bin = Array2::<f64>::zeros(features.raw_dim());
-    // for i in 0..features.nrows() {
-    //     for j in 0..features.ncols() {
-    //         features_bin[(i, j)] = if features[(i, j)] > 0.0 { 1.0 } else { 0.0 };
-    //     }
-    // }
+    // Keep default behavior for most methods on continuous features, but preserve the
+    // binary-feature variant for `spatial-graph` (requested for A/B testing).
+    let mut features_bin = Array2::<f64>::zeros(features.raw_dim());
+    for i in 0..features.nrows() {
+        for j in 0..features.ncols() {
+            features_bin[(i, j)] = if features[(i, j)] > 0.0 { 1.0 } else { 0.0 };
+        }
+    }
     let features_src = features;
 
     match method {
-        CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features_src, num_clusters),
+        CellClusterMethodArg::Kmeans => {
+            cluster_cells_with_kmeans(features_src, num_clusters, cluster_seed)
+        }
         CellClusterMethodArg::BinaryL0Kmeans => {
             cluster_cells_binary_l0_kmeans(features_src, num_clusters)
         }
-        CellClusterMethodArg::Bicluster => cluster_cells_spectral_bicluster(features_src, num_clusters),
+        CellClusterMethodArg::Bicluster => {
+            cluster_cells_spectral_bicluster(features_src, num_clusters, cluster_seed)
+        }
         CellClusterMethodArg::BiclusterL0 => {
             cluster_cells_spectral_bicluster_l0(features_src, num_clusters)
         }
         CellClusterMethodArg::BiclusterSwapped => {
-            cluster_cells_spectral_bicluster_row_col_swapped(features_src, num_clusters)
+            cluster_cells_spectral_bicluster_row_col_swapped(features_src, num_clusters, cluster_seed)
         }
-        CellClusterMethodArg::SvdKmeans => cluster_cells_svd_kmeans_only(features_src, num_clusters),
+        CellClusterMethodArg::SvdKmeans => {
+            cluster_cells_svd_kmeans_only(features_src, num_clusters, cluster_seed)
+        }
         CellClusterMethodArg::ColumnKmeans => {
-            cluster_cells_simple_column_kmeans(features_src, num_clusters)
+            cluster_cells_simple_column_kmeans(features_src, num_clusters, cluster_seed)
         }
         CellClusterMethodArg::SpectralCocluster => {
-            cluster_cells_spectral_cocluster_dhillon(features_src, num_clusters)
+            cluster_cells_spectral_cocluster_dhillon(features_src, num_clusters, cluster_seed)
         }
-        CellClusterMethodArg::Fabia => cluster_cells_fabia(features_src, num_clusters),
+        CellClusterMethodArg::Fabia => cluster_cells_fabia(features_src, num_clusters, cluster_seed),
         CellClusterMethodArg::SpatialGraph => {
-            cluster_cells_spatial_graph(points, features_src, num_clusters, spatial)
+            cluster_cells_spatial_graph(points, &features_bin, num_clusters, spatial, cluster_seed)
         }
         CellClusterMethodArg::TensorGrid => {
-            cluster_cells_tensor_grid(points, features_src, num_clusters, tensor_grid)
+            cluster_cells_tensor_grid(points, features_src, num_clusters, tensor_grid, cluster_seed)
         }
     }
 }
@@ -1547,6 +1644,7 @@ fn split_oversized_clusters(
     cell_cluster_method: CellClusterMethodArg,
     spatial: SpatialGraphParams,
     tensor_grid: TensorGridParams,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<Vec<Vec<usize>>> {
     let Some(max_cluster_size_raw) = max_cluster_size else {
         return Ok(initial_clusters);
@@ -1582,6 +1680,7 @@ fn split_oversized_clusters(
             &subpoints,
             spatial,
             tensor_grid,
+            cluster_seed.map(|s| s.wrapping_add(cluster.len() as u64)),
         ) {
             Ok(a) => a,
             Err(err) => {
@@ -2563,6 +2662,7 @@ fn run_clustered_compression(
     cell_cluster_method: CellClusterMethodArg,
     spatial_graph: SpatialGraphParams,
     tensor_grid: TensorGridParams,
+    cluster_seed: Option<u64>,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -2577,6 +2677,7 @@ fn run_clustered_compression(
         points,
         spatial_graph,
         tensor_grid,
+        cluster_seed,
     ) {
         Ok(a) => a,
         Err(err) => {
@@ -2607,6 +2708,7 @@ fn run_clustered_compression(
         cell_cluster_method,
         spatial_graph,
         tensor_grid,
+        cluster_seed,
     )?;
     let clusters = reorder_rows_within_clusters(&clusters, &features);
     let final_max = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
@@ -3148,6 +3250,9 @@ struct BuildCommand {
     /// How to cluster cells (`kmeans`, `bicluster`, `bicluster-swapped`, `svd-kmeans`, …).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
+    /// Optional RNG seed for k-means-based clustering stages. Same seed => reproducible clustering.
+    #[arg(long = "cluster-seed")]
+    cluster_seed: Option<u64>,
     /// If set, run all cell-cluster methods and append one stats row per method.
     #[arg(long = "cell-cluster-method-sweep-all", default_value_t = false)]
     cell_cluster_method_sweep_all: bool,
@@ -3472,6 +3577,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         cell_cluster_method,
                         spatial_graph,
                         tensor_grid,
+                        args.cluster_seed,
                     )?;
 
                     info!(
@@ -3746,6 +3852,7 @@ mod tests {
             CellClusterMethodArg::Kmeans,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("lossy compression should succeed");
 
@@ -3797,6 +3904,7 @@ mod tests {
                 method,
                 SpatialGraphParams::default(),
                 TensorGridParams::default(),
+                None,
             )
             .expect("compression")
         };
@@ -3847,6 +3955,7 @@ mod tests {
             CellClusterMethodArg::SpectralCocluster,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("spectral cocluster path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -3887,6 +3996,7 @@ mod tests {
             CellClusterMethodArg::SvdKmeans,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("svd-kmeans path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -3927,6 +4037,7 @@ mod tests {
             CellClusterMethodArg::BinaryL0Kmeans,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("binary-l0-kmeans path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -3967,6 +4078,7 @@ mod tests {
             CellClusterMethodArg::BiclusterSwapped,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("bicluster-swapped path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4007,6 +4119,7 @@ mod tests {
             CellClusterMethodArg::BiclusterL0,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("bicluster-l0 path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4047,6 +4160,7 @@ mod tests {
             CellClusterMethodArg::Fabia,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("fabia path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4087,6 +4201,7 @@ mod tests {
             CellClusterMethodArg::SpatialGraph,
             SpatialGraphParams::default(),
             TensorGridParams::default(),
+            None,
         )
         .expect("spatial-graph path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4138,6 +4253,7 @@ mod tests {
                     disc,
                     onehot_max_tiles: 64,
                 },
+                None,
             )
             .unwrap_or_else(|e| panic!("tensor-grid {}: {}", label, e));
             assert_eq!(
