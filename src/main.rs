@@ -426,36 +426,6 @@ fn normalize_l1_cols_inplace(a: &mut Array2<f64>) {
     }
 }
 
-/// sklearn `_scale_normalize`: nonnegative `X`, then `An[i,j] = X[i,j] / sqrt(row_sum[i] * col_sum[j])`.
-fn scale_normalize_dhillon(x: &Array2<f64>) -> (Array2<f64>, Vec<f64>, Vec<f64>) {
-    let n = x.nrows();
-    let m = x.ncols();
-    let mut row_sum = vec![0f64; n];
-    let mut col_sum = vec![0f64; m];
-    for i in 0..n {
-        for j in 0..m {
-            let v = x[(i, j)].max(0.0);
-            row_sum[i] += v;
-            col_sum[j] += v;
-        }
-    }
-    let row_diag: Vec<f64> = row_sum
-        .iter()
-        .map(|&s| if s > 1e-18 { 1.0 / s.sqrt() } else { 0.0 })
-        .collect();
-    let col_diag: Vec<f64> = col_sum
-        .iter()
-        .map(|&s| if s > 1e-18 { 1.0 / s.sqrt() } else { 0.0 })
-        .collect();
-    let mut an = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            an[(i, j)] = row_diag[i] * x[(i, j)].max(0.0) * col_diag[j];
-        }
-    }
-    (an, row_diag, col_diag)
-}
-
 /// `G = X^T X` with `X` shape `(n, m)` — `G` is `(m, m)` (inner products between bucket columns).
 fn gram_xt_x(x: &Array2<f64>) -> Array2<f64> {
     let n = x.nrows();
@@ -501,84 +471,6 @@ fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
             row.mapv_inplace(|x| x / nrm);
         }
     }
-}
-
-/// Dhillon spectral **co-clustering** (sklearn `SpectralCoclustering`): joint k-means on embeddings of
-/// row-nodes and column-nodes in the same space (`sklearn/cluster/_bicluster.py::_fit`).
-fn cluster_cells_spectral_cocluster_dhillon(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    if m == 0 {
-        anyhow::bail!("spectral cocluster: zero feature columns");
-    }
-    let k = num_clusters.max(1).min(n);
-    if k == 1 {
-        return Ok(vec![0; n]);
-    }
-
-    let x_nonneg = {
-        let mut a = Array2::<f64>::zeros((n, m));
-        for i in 0..n {
-            for j in 0..m {
-                a[(i, j)] = features[(i, j)].max(0.0);
-            }
-        }
-        a
-    };
-
-    let (an, row_diag, col_diag) = scale_normalize_dhillon(&x_nonneg);
-    let data: Vec<f64> = an.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(n, m, &data);
-    let svd = mat.svd(true, true);
-    let (u, v_t) = match (svd.u, svd.v_t) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => return cluster_cells_with_kmeans(features, k, cluster_seed),
-    };
-
-    let r = u.ncols();
-    let n_discard = 1usize;
-    let n_sv = (1usize + (k as f64).log2().ceil() as usize)
-        .max(2)
-        .min(n.min(m));
-    let end_col = r.min(n_sv);
-    let n_keep = end_col.saturating_sub(n_discard);
-    if n_keep == 0 {
-        return cluster_cells_with_kmeans(features, k, cluster_seed);
-    }
-
-    let mut z = Array2::<f64>::zeros((n + m, n_keep));
-    for c in 0..n_keep {
-        let sc = n_discard + c;
-        debug_assert!(sc < r);
-        for i in 0..n {
-            z[(i, c)] = row_diag[i] * u[(i, sc)];
-        }
-        for j in 0..m {
-            z[(n + j, c)] = col_diag[j] * v_t[(sc, j)];
-        }
-    }
-
-    let dataset = DatasetBase::from(z);
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(1001)))
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("spectral cocluster joint k-means failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("spectral cocluster joint k-means failed: {}", e))?
-    };
-    let labels = model.predict(&dataset).to_vec();
-    Ok(labels.into_iter().take(n).collect())
 }
 
 #[inline]
@@ -786,277 +678,6 @@ fn cluster_cells_fabia(
         };
         Ok(model.predict(&dataset).to_vec())
     }
-}
-
-/// Spectral co-clustering style: double L1 normalization of nonnegative `X`; **k-means on columns**
-/// (bucket × bucket Gram rows, cheap `m×m`); SVD row embedding; concatenate column-cluster
-/// aggregates per cell with the spectral embedding; final **k-means on rows** (cells).
-fn cluster_cells_spectral_bicluster(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    let k = num_clusters.max(1).min(n);
-
-    let mut a = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            a[(i, j)] = features[(i, j)].max(0.0);
-        }
-    }
-    normalize_l1_rows_inplace(&mut a);
-    normalize_l1_cols_inplace(&mut a);
-
-    // Column k-means: each bucket j is row j of G = X^T X (m points in R^m). No n-dim centroids.
-    let g = gram_xt_x(&a);
-    let k_col = k.min(m).max(1);
-    let col_assign = match cluster_cells_with_kmeans(
-        &g,
-        k_col,
-        cluster_seed.map(|s| s.wrapping_add(3001)),
-    ) {
-        Ok(a) => a,
-        Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
-    };
-
-    let agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
-
-    let data: Vec<f64> = a.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(n, m, &data);
-    let svd = mat.svd(true, false);
-    let u = svd
-        .u
-        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
-    let sigma = svd.singular_values;
-
-    let max_rank = n.min(m);
-    let n_comp = k.min(max_rank).max(1);
-    let mut embed = Array2::<f64>::zeros((n, n_comp));
-    for i in 0..n {
-        for j in 0..n_comp {
-            let s_j = sigma[j].max(1e-18);
-            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
-        }
-    }
-
-    let n_agg = agg.ncols();
-    let mut combined = Array2::<f64>::zeros((n, n_comp + n_agg));
-    for i in 0..n {
-        for j in 0..n_comp {
-            combined[(i, j)] = embed[(i, j)];
-        }
-        for j in 0..n_agg {
-            combined[(i, n_comp + j)] = agg[(i, j)];
-        }
-    }
-    l2_normalize_rows_inplace(&mut combined);
-
-    let dataset = DatasetBase::from(combined);
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(3002)))
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means on spectral + column-cluster features failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means on spectral + column-cluster features failed: {}", e))?
-    };
-
-    Ok(model.predict(&dataset).to_vec())
-}
-
-fn cluster_cells_spectral_bicluster_l0(
-    features: &Array2<f64>,
-    num_clusters: usize,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    if m == 0 {
-        anyhow::bail!("bicluster-l0: zero feature columns");
-    }
-    let k = num_clusters.max(1).min(n);
-    if k == 1 {
-        return Ok(vec![0usize; n]);
-    }
-
-    let mut b = vec![0u8; n * m];
-    let mut a = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            let bit = if features[(i, j)] > 0.0 { 1u8 } else { 0u8 };
-            b[i * m + j] = bit;
-            a[(i, j)] = bit as f64;
-        }
-    }
-    normalize_l1_rows_inplace(&mut a);
-    normalize_l1_cols_inplace(&mut a);
-
-    let k_col = k.min(m).max(1);
-    let mut x_col = vec![0u8; m * n];
-    for j in 0..m {
-        for i in 0..n {
-            x_col[j * n + i] = b[i * m + j];
-        }
-    }
-    let col_assign = binary_l0_lloyd_assign(&x_col, m, n, k_col, 30);
-    let agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
-
-    let data: Vec<f64> = a.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(n, m, &data);
-    let svd = mat.svd(true, false);
-    let u = svd
-        .u
-        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
-    let sigma = svd.singular_values;
-    let max_rank = n.min(m);
-    let n_comp = k.min(max_rank).max(1);
-
-    let mut embed = Array2::<f64>::zeros((n, n_comp));
-    for i in 0..n {
-        for j in 0..n_comp {
-            let s_j = sigma[j].max(1e-18);
-            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
-        }
-    }
-
-    let d = n_comp + k_col;
-    let mut bin_combined = vec![0u8; n * d];
-    for i in 0..n {
-        for j in 0..n_comp {
-            bin_combined[i * d + j] = if embed[(i, j)] > 0.0 { 1 } else { 0 };
-        }
-        for j in 0..k_col {
-            bin_combined[i * d + n_comp + j] = if agg[(i, j)] > 0.0 { 1 } else { 0 };
-        }
-    }
-
-    Ok(binary_l0_lloyd_assign(&bin_combined, n, d, k, 30))
-}
-
-/// **Swapped** vs `bicluster`: **row k-means first** on double-L1 `A` (cells in bucket space), build cluster-mean
-/// matrix `R` (`k×m`), **column k-means** on `G2=R^T R` (not `A^T A`), aggregates on full `A`, **SVD** on full `A`,
-/// then concat **`[agg ∥ embed]`** (aggregates before singular vectors) and final **row k-means**.
-fn cluster_cells_spectral_bicluster_row_col_swapped(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    let k = num_clusters.max(1).min(n);
-
-    let mut a = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            a[(i, j)] = features[(i, j)].max(0.0);
-        }
-    }
-    normalize_l1_rows_inplace(&mut a);
-    normalize_l1_cols_inplace(&mut a);
-
-    let dataset_rows = DatasetBase::from(a.clone());
-    let row_model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(4001)))
-            .max_n_iterations(20)
-            .fit(&dataset_rows)
-            .map_err(|e| anyhow::anyhow!("swapped bicluster: initial row k-means failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset_rows)
-            .map_err(|e| anyhow::anyhow!("swapped bicluster: initial row k-means failed: {}", e))?
-    };
-    let cell_preassign = row_model.predict(&dataset_rows).to_vec();
-
-    let mut counts = vec![0usize; k];
-    let mut r_sum = Array2::<f64>::zeros((k, m));
-    for i in 0..n {
-        let c = cell_preassign[i];
-        if c < k {
-            counts[c] += 1;
-            for j in 0..m {
-                r_sum[(c, j)] += a[(i, j)];
-            }
-        }
-    }
-    let mut r = Array2::<f64>::zeros((k, m));
-    for c in 0..k {
-        let cnt = counts[c].max(1) as f64;
-        for j in 0..m {
-            r[(c, j)] = r_sum[(c, j)] / cnt;
-        }
-    }
-
-    let g2 = gram_xt_x(&r);
-    let k_col = k.min(m).max(1);
-    let col_assign = match cluster_cells_with_kmeans(
-        &g2,
-        k_col,
-        cluster_seed.map(|s| s.wrapping_add(4002)),
-    ) {
-        Ok(assign) => assign,
-        Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
-    };
-
-    let agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
-
-    let data: Vec<f64> = a.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(n, m, &data);
-    let svd = mat.svd(true, false);
-    let u = svd
-        .u
-        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
-    let sigma = svd.singular_values;
-
-    let max_rank = n.min(m);
-    let n_comp = k.min(max_rank).max(1);
-    let mut embed = Array2::<f64>::zeros((n, n_comp));
-    for i in 0..n {
-        for j in 0..n_comp {
-            let s_j = sigma[j].max(1e-18);
-            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
-        }
-    }
-
-    let n_agg = agg.ncols();
-    let mut combined = Array2::<f64>::zeros((n, n_comp + n_agg));
-    for i in 0..n {
-        for j in 0..n_agg {
-            combined[(i, j)] = agg[(i, j)];
-        }
-        for j in 0..n_comp {
-            combined[(i, n_agg + j)] = embed[(i, j)];
-        }
-    }
-    l2_normalize_rows_inplace(&mut combined);
-
-    let dataset = DatasetBase::from(combined);
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(4003)))
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("swapped bicluster: final row k-means failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("swapped bicluster: final row k-means failed: {}", e))?
-    };
-
-    Ok(model.predict(&dataset).to_vec())
 }
 
 /// Double-L1 normalized nonnegative `X`, truncated SVD row embedding `U Σ^{1/2}`, L2-normalize rows, k-means only.
@@ -2220,16 +1841,10 @@ fn compute_gene_permutation_kmeans(
     Ok((new_to_old, old_to_new))
 }
 
-/// True joint biclustering: one SVD on the full sparse cell×gene matrix produces
-/// **both** cell cluster assignments (from left singular vectors) **and** a gene
-/// permutation (from right singular vectors).
-///
-/// Uses TF-IDF normalization on binary support, same as [`compute_gene_permutation_svd`],
-/// and sorts cells into `k` contiguous blocks via seriation on left singular vectors,
-/// same spirit as [`cluster_cells_svd_seriation`].
-///
-/// Returns `(cell_assignments, gene_new_to_old, gene_old_to_new)`.
-fn joint_bicluster_svd(
+/// Joint SVD seriation: one SVD on TF-IDF-normalized cell×gene matrix, then pure sorting
+/// on both axes — cells sorted by left singular vectors into `k` contiguous blocks,
+/// genes sorted by right singular vectors.  No k-means anywhere.
+fn joint_svd_seriation(
     points: &[Point],
     data: &CsMat<u16>,
     num_clusters: usize,
@@ -2244,188 +1859,6 @@ fn joint_bicluster_svd(
 
     let k = num_clusters.max(1).min(n_cells);
 
-    // --- Build binary support triplets ---
-    let mut col_nnz = vec![0u64; n_genes];
-    let mut triplets: Vec<(usize, usize)> = Vec::new();
-    for (ci, point) in points.iter().enumerate() {
-        if let Some(row) = data.outer_view(point.row_index) {
-            for (gene_idx, &value) in row.iter() {
-                if value != 0 {
-                    col_nnz[gene_idx] += 1;
-                    triplets.push((ci, gene_idx));
-                }
-            }
-        }
-    }
-
-    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
-    if active_genes.len() <= 2 {
-        return Ok((
-            (0..n_cells).map(|i| i % k).collect(),
-            (0..n_genes as u32).collect(),
-            (0..n_genes as u32).collect(),
-        ));
-    }
-
-    // --- Subsample for dense SVD tractability ---
-    let max_svd_rows = 4000usize;
-    let max_svd_cols = 2000usize;
-
-    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
-        let step = n_cells as f64 / max_svd_rows as f64;
-        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
-    } else {
-        (0..n_cells).collect()
-    };
-
-    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
-        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
-        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        by_freq.truncate(max_svd_cols);
-        by_freq.sort_unstable_by_key(|&(g, _)| g);
-        by_freq.iter().map(|&(g, _)| g).collect()
-    } else {
-        active_genes.clone()
-    };
-
-    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
-    for (local, &global) in active_cols.iter().enumerate() {
-        col_local.insert(global, local);
-    }
-
-    let nr = sampled_rows.len();
-    let nc = active_cols.len();
-
-    // --- Build dense matrix with TF-IDF normalization ---
-    let mut dense = vec![0.0f64; nr * nc];
-    let sampled_set: HashMap<usize, usize> =
-        sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-
-    for &(ci, gene_idx) in &triplets {
-        if let Some(&local_row) = sampled_set.get(&ci) {
-            if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
-            }
-        }
-    }
-
-    // --- SVD: need both U and V^T ---
-    let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let svd = mat.svd(true, true);
-    let (u, v_t) = match (svd.u, svd.v_t) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => {
-            return Ok((
-                (0..n_cells).map(|i| i % k).collect(),
-                (0..n_genes as u32).collect(),
-                (0..n_genes as u32).collect(),
-            ));
-        }
-    };
-
-    // --- CELL SIDE: embed all cells via left singular vectors, then k-means ---
-    let n_comp_cell = k.min(u.ncols()).max(1);
-
-    // Sampled cells: direct from U
-    let mut cell_embed = Array2::<f64>::zeros((n_cells, n_comp_cell));
-    for (local_row, &ci) in sampled_rows.iter().enumerate() {
-        for j in 0..n_comp_cell {
-            cell_embed[(ci, j)] = u[(local_row, j)];
-        }
-    }
-
-    // Unsampled cells: project via V^T (Nyström)
-    let sigma = &svd.singular_values;
-    for ci in 0..n_cells {
-        if sampled_set.contains_key(&ci) {
-            continue;
-        }
-        let point = &points[ci];
-        if let Some(row) = data.outer_view(point.row_index) {
-            for j in 0..n_comp_cell {
-                let sig_inv = if sigma[j] > 1e-12 { 1.0 / sigma[j] } else { 0.0 };
-                let mut dot = 0.0f64;
-                for (g, &v) in row.iter() {
-                    if v != 0 {
-                        if let Some(&lc) = col_local.get(&g) {
-                            let tfidf = 1.0 / (col_nnz[g] as f64).sqrt().max(1e-12);
-                            dot += tfidf * v_t[(j, lc)];
-                        }
-                    }
-                }
-                cell_embed[(ci, j)] = dot * sig_inv;
-            }
-        }
-    }
-
-    l2_normalize_rows_inplace(&mut cell_embed);
-
-    let dataset_cells = DatasetBase::from(cell_embed);
-    let cell_model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(7001)))
-            .max_n_iterations(30)
-            .fit(&dataset_cells)
-            .map_err(|e| anyhow::anyhow!("joint bicluster cell k-means failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(30)
-            .fit(&dataset_cells)
-            .map_err(|e| anyhow::anyhow!("joint bicluster cell k-means failed: {}", e))?
-    };
-    let cell_labels: Vec<usize> = cell_model.predict(&dataset_cells).to_vec();
-
-    // --- GENE SIDE: sort genes by (v₁, v₂) from the same SVD ---
-    let n_sv = v_t.nrows().min(2);
-    let mut scores: Vec<(usize, f64, f64)> = Vec::with_capacity(n_genes);
-    for &global_gene in &active_cols {
-        let local_col = col_local[&global_gene];
-        let s1 = if n_sv >= 1 { v_t[(0, local_col)] } else { 0.0 };
-        let s2 = if n_sv >= 2 { v_t[(1, local_col)] } else { 0.0 };
-        scores.push((global_gene, s1, s2));
-    }
-    for g in 0..n_genes {
-        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
-            scores.push((g, f64::INFINITY, g as f64));
-        }
-    }
-    scores.sort_unstable_by(|a, b| {
-        a.1.total_cmp(&b.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut gene_old_to_new = vec![0u32; n_genes];
-    let mut gene_new_to_old = Vec::with_capacity(n_genes);
-    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
-        gene_old_to_new[old_idx] = new_idx as u32;
-        gene_new_to_old.push(old_idx as u32);
-    }
-
-    info!(
-        "Joint bicluster SVD: {} cells -> {} clusters, {} genes reordered ({} active in SVD)",
-        n_cells, k, n_genes, nc
-    );
-
-    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
-}
-
-/// Joint SVD seriation: one SVD on TF-IDF-normalized cell×gene matrix, then pure sorting
-/// on both axes — cells sorted by left singular vectors into `k` contiguous blocks,
-/// genes sorted by right singular vectors.  No k-means anywhere.
-fn joint_svd_seriation(
-    points: &[Point],
-    data: &CsMat<u16>,
-    num_clusters: usize,
-) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
-    let n_cells = points.len();
-    let n_genes = data.cols();
-
-    if n_cells == 0 {
-        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
-    }
-
-    let k = num_clusters.max(1).min(n_cells);
-
     let mut col_nnz = vec![0u64; n_genes];
     let mut triplets: Vec<(usize, usize)> = Vec::new();
     for (ci, point) in points.iter().enumerate() {
@@ -2452,8 +1885,30 @@ fn joint_svd_seriation(
     let max_svd_cols = 2000usize;
 
     let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
-        let step = n_cells as f64 / max_svd_rows as f64;
-        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+        if let Some(seed) = cluster_seed {
+            let mut ranked_rows: Vec<(u64, usize)> = (0..n_cells)
+                .map(|row| {
+                    let mut x = (row as u64) ^ seed ^ 0x9E37_79B9_7F4A_7C15;
+                    x ^= x >> 30;
+                    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                    x ^= x >> 27;
+                    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+                    x ^= x >> 31;
+                    (x, row)
+                })
+                .collect();
+            ranked_rows.sort_unstable();
+            let mut sample: Vec<usize> = ranked_rows
+                .into_iter()
+                .take(max_svd_rows)
+                .map(|(_, row)| row)
+                .collect();
+            sample.sort_unstable();
+            sample
+        } else {
+            let step = n_cells as f64 / max_svd_rows as f64;
+            (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+        }
     } else {
         (0..n_cells).collect()
     };
@@ -2587,381 +2042,6 @@ fn joint_svd_seriation(
     info!(
         "Joint SVD seriation: {} cells -> {} contiguous blocks, {} genes reordered ({} active in SVD)",
         n_cells, k, n_genes, nc
-    );
-
-    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
-}
-
-/// Generic post-hoc gene permutation derived from cell cluster assignments.
-///
-/// Given cell cluster labels (from any clustering method), build a `k × n_genes` centroid
-/// matrix (mean `ln(1+count)` per cluster), SVD it, and sort genes by `(v₁, v₂)`.
-/// This couples gene ordering to cell structure without requiring a method-specific joint
-/// algorithm.
-fn derive_gene_permutation_from_cell_clusters(
-    points: &[Point],
-    data: &CsMat<u16>,
-    cell_labels: &[usize],
-    num_clusters: usize,
-) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
-    let n_genes = data.cols();
-    let k = num_clusters.max(1);
-
-    let mut centroids = vec![0.0f64; k * n_genes];
-    let mut cluster_sizes = vec![0u64; k];
-
-    for (ci, point) in points.iter().enumerate() {
-        let label = cell_labels[ci];
-        if label >= k {
-            continue;
-        }
-        cluster_sizes[label] += 1;
-        if let Some(row) = data.outer_view(point.row_index) {
-            for (gene_idx, &value) in row.iter() {
-                if value != 0 {
-                    centroids[label * n_genes + gene_idx] += (1.0 + value as f64).ln();
-                }
-            }
-        }
-    }
-
-    for c in 0..k {
-        let sz = cluster_sizes[c].max(1) as f64;
-        for g in 0..n_genes {
-            centroids[c * n_genes + g] /= sz;
-        }
-    }
-
-    let mat = DMatrix::from_row_slice(k, n_genes, &centroids);
-    let svd = mat.svd(false, true);
-    let v_t = match svd.v_t {
-        Some(vt) => vt,
-        None => {
-            return Ok(((0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
-        }
-    };
-
-    let n_sv = v_t.nrows().min(2);
-    let mut scores: Vec<(usize, f64, f64)> = (0..n_genes)
-        .map(|g| {
-            let s1 = if n_sv >= 1 { v_t[(0, g)] } else { 0.0 };
-            let s2 = if n_sv >= 2 { v_t[(1, g)] } else { 0.0 };
-            (g, s1, s2)
-        })
-        .collect();
-
-    scores.sort_unstable_by(|a, b| {
-        a.1.total_cmp(&b.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut gene_old_to_new = vec![0u32; n_genes];
-    let mut gene_new_to_old = Vec::with_capacity(n_genes);
-    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
-        gene_old_to_new[old_idx] = new_idx as u32;
-        gene_new_to_old.push(old_idx as u32);
-    }
-
-    info!(
-        "Derived gene permutation from {} cell clusters, {} genes",
-        k, n_genes
-    );
-
-    Ok((gene_new_to_old, gene_old_to_new))
-}
-
-/// Kluger (2003) spectral biclustering, as used in
-/// [cell-squeeze](https://github.com/maharshi95/cell-squeeze).
-///
-/// 1. Bistochastic-normalize the sparse cell×gene matrix (iterative scale-normalize).
-/// 2. SVD → U, V (first `n_components` singular vectors, discard DC).
-/// 3. For each singular vector, fit 1-D k-means to find its best piecewise-constant
-///    approximation; keep the `n_best` vectors with smallest residual.
-/// 4. Row labels: project `X @ V_best`, k-means → `n_row_clusters`.
-/// 5. Col labels: project `X^T @ U_best`, k-means → `n_col_clusters`.
-/// 6. Gene permutation: `argsort(column_labels)`.
-///
-/// Returns `(cell_assignments, gene_new_to_old, gene_old_to_new)`.
-fn joint_bicluster_kluger(
-    points: &[Point],
-    data: &CsMat<u16>,
-    num_row_clusters: usize,
-    num_col_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
-    let n_cells = points.len();
-    let n_genes = data.cols();
-
-    if n_cells == 0 {
-        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
-    }
-
-    let kr = num_row_clusters.max(1).min(n_cells);
-    let kc = num_col_clusters.max(1).min(n_genes);
-
-    // --- Subsample ---
-    let max_rows = 4000usize;
-    let max_cols = 2000usize;
-
-    let mut col_nnz = vec![0u64; n_genes];
-    let mut triplets: Vec<(usize, usize, f64)> = Vec::new();
-    for (ci, point) in points.iter().enumerate() {
-        if let Some(row) = data.outer_view(point.row_index) {
-            for (gene_idx, &value) in row.iter() {
-                if value != 0 {
-                    col_nnz[gene_idx] += 1;
-                    triplets.push((ci, gene_idx, (1.0 + value as f64).ln()));
-                }
-            }
-        }
-    }
-
-    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
-    if active_genes.len() <= 2 || n_cells <= 2 {
-        return Ok((
-            (0..n_cells).map(|i| i % kr).collect(),
-            (0..n_genes as u32).collect(),
-            (0..n_genes as u32).collect(),
-        ));
-    }
-
-    let sampled_rows: Vec<usize> = if n_cells > max_rows {
-        let step = n_cells as f64 / max_rows as f64;
-        (0..max_rows).map(|i| (i as f64 * step) as usize).collect()
-    } else {
-        (0..n_cells).collect()
-    };
-
-    let active_cols: Vec<usize> = if active_genes.len() > max_cols {
-        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
-        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        by_freq.truncate(max_cols);
-        by_freq.sort_unstable_by_key(|&(g, _)| g);
-        by_freq.iter().map(|&(g, _)| g).collect()
-    } else {
-        active_genes.clone()
-    };
-
-    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
-    for (local, &global) in active_cols.iter().enumerate() {
-        col_local.insert(global, local);
-    }
-
-    let nr = sampled_rows.len();
-    let nc = active_cols.len();
-    let sampled_set: HashMap<usize, usize> =
-        sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-
-    // --- Build dense matrix with ln(1+count) ---
-    let mut dense = vec![0.0f64; nr * nc];
-    for &(ci, gene_idx, val) in &triplets {
-        if let Some(&local_row) = sampled_set.get(&ci) {
-            if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] = val;
-            }
-        }
-    }
-
-    // --- Bistochastic normalization (iterative scale-normalize) ---
-    for _ in 0..100 {
-        // Row normalize: each row sums to constant
-        for i in 0..nr {
-            let rsum: f64 = (0..nc).map(|j| dense[i * nc + j]).sum();
-            if rsum > 1e-18 {
-                let s = 1.0 / rsum.sqrt();
-                for j in 0..nc { dense[i * nc + j] *= s; }
-            }
-        }
-        // Column normalize: each column sums to constant
-        for j in 0..nc {
-            let csum: f64 = (0..nr).map(|i| dense[i * nc + j]).sum();
-            if csum > 1e-18 {
-                let s = 1.0 / csum.sqrt();
-                for i in 0..nr { dense[i * nc + j] *= s; }
-            }
-        }
-    }
-
-    // --- SVD ---
-    let n_components = 6usize.min(nr.min(nc).saturating_sub(1)).max(1);
-    let n_best = 3usize.min(n_components);
-    let n_discard = 1usize;
-    let n_sv = n_components + n_discard;
-
-    let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let svd_result = mat.svd(true, true);
-    let (u_full, v_t_full) = match (svd_result.u, svd_result.v_t) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => {
-            return Ok((
-                (0..n_cells).map(|i| i % kr).collect(),
-                (0..n_genes as u32).collect(),
-                (0..n_genes as u32).collect(),
-            ));
-        }
-    };
-
-    let r = u_full.ncols();
-    let n_keep = n_sv.min(r).saturating_sub(n_discard);
-    if n_keep == 0 {
-        return Ok((
-            (0..n_cells).map(|i| i % kr).collect(),
-            (0..n_genes as u32).collect(),
-            (0..n_genes as u32).collect(),
-        ));
-    }
-
-    // Extract U[:,1..n_sv] and V[:,1..n_sv] (transposed from V^T)
-    let mut ut_vecs = Vec::with_capacity(n_keep); // each is a row = one singular vector across cells
-    let mut vt_vecs = Vec::with_capacity(n_keep); // each is a row = one singular vector across genes
-    for k in 0..n_keep {
-        let sc = n_discard + k;
-        let u_vec: Vec<f64> = (0..nr).map(|i| u_full[(i, sc)]).collect();
-        let v_vec: Vec<f64> = (0..nc).map(|j| v_t_full[(sc, j)]).collect();
-        ut_vecs.push(u_vec);
-        vt_vecs.push(v_vec);
-    }
-
-    // --- Find n_best vectors: for each, fit 1-D k-means, measure piecewise residual ---
-    fn piecewise_residual(vec: &[f64], n_clusters: usize, seed: u64) -> f64 {
-        let n = vec.len();
-        if n == 0 { return 0.0; }
-        let k = n_clusters.min(n).max(1);
-        let mut embed = Array2::<f64>::zeros((n, 1));
-        for i in 0..n { embed[(i, 0)] = vec[i]; }
-        let dataset = DatasetBase::from(embed);
-        let model = KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed))
-            .max_n_iterations(20)
-            .fit(&dataset);
-        match model {
-            Ok(m) => {
-                let labels = m.predict(&dataset);
-                let centroids = m.centroids();
-                labels.iter().enumerate()
-                    .map(|(i, &l)| {
-                        let diff = vec[i] - centroids[(l, 0)];
-                        diff * diff
-                    })
-                    .sum::<f64>()
-                    .sqrt()
-            }
-            Err(_) => f64::INFINITY,
-        }
-    }
-
-    let seed_base = cluster_seed.unwrap_or(42);
-
-    // Score u-vectors for row selection
-    let mut u_scores: Vec<(usize, f64)> = (0..n_keep)
-        .map(|k| (k, piecewise_residual(&ut_vecs[k], kr, seed_base.wrapping_add(k as u64))))
-        .collect();
-    u_scores.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-    let best_u_indices: Vec<usize> = u_scores.iter().take(n_best).map(|&(i, _)| i).collect();
-
-    // Score v-vectors for column selection
-    let mut v_scores: Vec<(usize, f64)> = (0..n_keep)
-        .map(|k| (k, piecewise_residual(&vt_vecs[k], kc, seed_base.wrapping_add(100 + k as u64))))
-        .collect();
-    v_scores.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
-    let best_v_indices: Vec<usize> = v_scores.iter().take(n_best).map(|&(i, _)| i).collect();
-
-    // --- Row labels: project X @ V_best, k-means ---
-    // For sampled cells, use dense matrix; for unsampled, project from sparse
-    let n_proj_cols = best_v_indices.len();
-    let mut row_projected = Array2::<f64>::zeros((n_cells, n_proj_cols));
-
-    for ci in 0..n_cells {
-        let point = &points[ci];
-        if let Some(row) = data.outer_view(point.row_index) {
-            for (g, &v) in row.iter() {
-                if v != 0 {
-                    if let Some(&lc) = col_local.get(&g) {
-                        let val = (1.0 + v as f64).ln();
-                        for (pi, &vi) in best_v_indices.iter().enumerate() {
-                            row_projected[(ci, pi)] += val * vt_vecs[vi][lc];
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    let row_dataset = DatasetBase::from(row_projected);
-    let row_model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(kr, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(2001)))
-            .max_n_iterations(30)
-            .fit(&row_dataset)
-            .map_err(|e| anyhow::anyhow!("Kluger row k-means failed: {}", e))?
-    } else {
-        KMeans::params(kr)
-            .max_n_iterations(30)
-            .fit(&row_dataset)
-            .map_err(|e| anyhow::anyhow!("Kluger row k-means failed: {}", e))?
-    };
-    let cell_labels: Vec<usize> = row_model.predict(&row_dataset).to_vec();
-
-    // --- Column labels: project X^T @ U_best, k-means ---
-    // Build U_best matrix (nr × n_best_u), then X^T @ U_best gives (n_genes × n_best_u)
-    let n_proj_rows = best_u_indices.len();
-    let mut col_projected = Array2::<f64>::zeros((n_genes, n_proj_rows));
-
-    // For active genes in the SVD, compute the projection directly from the dense submatrix
-    for &global_gene in &active_cols {
-        let lc = col_local[&global_gene];
-        for (pi, &ui) in best_u_indices.iter().enumerate() {
-            let mut dot = 0.0f64;
-            for lr in 0..nr {
-                dot += dense[lr * nc + lc] * ut_vecs[ui][lr];
-            }
-            col_projected[(global_gene, pi)] = dot;
-        }
-    }
-
-    let col_dataset = DatasetBase::from(col_projected);
-    let col_model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(kc, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(3001)))
-            .max_n_iterations(30)
-            .fit(&col_dataset)
-            .map_err(|e| anyhow::anyhow!("Kluger col k-means failed: {}", e))?
-    } else {
-        KMeans::params(kc)
-            .max_n_iterations(30)
-            .fit(&col_dataset)
-            .map_err(|e| anyhow::anyhow!("Kluger col k-means failed: {}", e))?
-    };
-    let gene_cluster_labels: Vec<usize> = col_model.predict(&col_dataset).to_vec();
-
-    // --- Gene permutation: sort by (cluster_label, first projection coordinate) ---
-    let mut gene_scores: Vec<(usize, usize, f64)> = (0..n_genes)
-        .map(|g| {
-            let label = gene_cluster_labels[g];
-            let proj0 = if !best_v_indices.is_empty() && col_local.contains_key(&g) {
-                let lc = col_local[&g];
-                vt_vecs[best_v_indices[0]][lc]
-            } else {
-                f64::INFINITY
-            };
-            (g, label, proj0)
-        })
-        .collect();
-
-    gene_scores.sort_unstable_by(|a, b| {
-        a.1.cmp(&b.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut gene_old_to_new = vec![0u32; n_genes];
-    let mut gene_new_to_old = Vec::with_capacity(n_genes);
-    for (new_idx, &(old_idx, _, _)) in gene_scores.iter().enumerate() {
-        gene_old_to_new[old_idx] = new_idx as u32;
-        gene_new_to_old.push(old_idx as u32);
-    }
-
-    info!(
-        "Kluger SpectralBiclustering: {} cells -> {} row clusters, {} genes -> {} col clusters ({} active in SVD, n_best={})",
-        n_cells, kr, n_genes, kc, nc, n_best
     );
 
     Ok((cell_labels, gene_new_to_old, gene_old_to_new))
@@ -3749,7 +2829,7 @@ fn log_index_bounds_report(report: &IndexBoundsReport, nnz: usize) {
 fn run_clustered_compression(
     points: &[Point],
     data: &CsMat<u16>,
-    quantizers_requested: usize,
+    cell_blocks_requested: usize,
     quantizer_bins: usize,
     quantize_values: bool,
     verify_lossless: bool,
@@ -3771,55 +2851,21 @@ fn run_clustered_compression(
     tensor_grid: TensorGridParams,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
-    bicluster_joint: bool,
     gene_blocks: usize,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
     }
 
-    let requested_clusters = quantizers_requested.max(1).min(points.len());
+    let requested_clusters = cell_blocks_requested.max(1).min(points.len());
     let features = build_cell_features(points, data, 24)?;
 
-    // --- Joint bicluster path: one operation produces both cell assignments and gene ordering ---
+    // Joint path: one operation produces both cell assignments and gene ordering.
     let joint_result = if cell_cluster_method == CellClusterMethodArg::SvdJoint {
-        match joint_svd_seriation(points, data, requested_clusters) {
+        match joint_svd_seriation(points, data, requested_clusters, cluster_seed) {
             Ok(result) => Some(result),
             Err(e) => {
                 warn!("Joint SVD seriation failed ({}), falling back to separate cell+gene", e);
-                None
-            }
-        }
-    } else if bicluster_joint && cell_cluster_method == CellClusterMethodArg::Kmeans {
-        match joint_bicluster_svd(points, data, requested_clusters, cluster_seed) {
-            Ok(result) => Some(result),
-            Err(e) => {
-                warn!("Joint bicluster SVD failed ({}), falling back to separate cell+gene", e);
-                None
-            }
-        }
-    } else if bicluster_joint {
-        // Generic bicluster: cluster cells with the specified method, then derive gene
-        // ordering from the cell cluster centroids via SVD.
-        let cell_assignments = match cluster_cells(
-            cell_cluster_method,
-            &features,
-            requested_clusters,
-            points,
-            spatial_graph,
-            tensor_grid,
-            cluster_seed,
-        ) {
-            Ok(a) => a,
-            Err(e) => {
-                warn!("Cell clustering for bicluster failed ({}), using round-robin", e);
-                (0..points.len()).map(|i| i % requested_clusters).collect()
-            }
-        };
-        match derive_gene_permutation_from_cell_clusters(points, data, &cell_assignments, requested_clusters) {
-            Ok((n2o, o2n)) => Some((cell_assignments, n2o, o2n)),
-            Err(e) => {
-                warn!("Gene permutation from clusters failed ({}), falling back to independent", e);
                 None
             }
         }
@@ -3876,7 +2922,7 @@ fn run_clustered_compression(
 
     info!(
         "Cluster layout: requested={} initial={} final={} largest_initial={} largest_final={} max_cluster_size={:?}",
-        quantizers_requested,
+        cell_blocks_requested,
         initial_quantizers_used,
         clusters.len(),
         initial_max,
@@ -3919,7 +2965,7 @@ fn run_clustered_compression(
     }
 
     let (gene_order, gene_old_to_new) = if let Some((_, ref new_to_old, ref old_to_new)) = joint_result {
-        info!("Using gene ordering from joint bicluster SVD");
+        info!("Using gene ordering from joint SVD seriation");
         (new_to_old.clone(), old_to_new.clone())
     } else {
         match gene_reorder_method {
@@ -4268,7 +3314,7 @@ fn run_clustered_compression(
     let rate_bits_per_value = (gzip_bytes_estimate as f64 * 8.0) / total_entries as f64;
 
     Ok(CompressionResult {
-        quantizers_requested,
+        quantizers_requested: cell_blocks_requested,
         quantizers_used: clusters.len(),
         quantizer_bins,
         total_mst_bytes,
@@ -4479,6 +3525,9 @@ struct BuildCommand {
     lossy_verify_lossless: bool,
     #[arg(long = "lossy-quantizers", default_value_t = 8)]
     lossy_quantizers: usize,
+    /// Number of cell clusters (blocks) used by the cell clustering stage.
+    #[arg(long = "cell-blocks", default_value_t = 8)]
+    cell_blocks: usize,
     #[arg(long = "lossy-bins", default_value_t = 16)]
     lossy_bins: usize,
     #[arg(long = "lossy-sweep", value_delimiter = ',')]
@@ -4508,10 +3557,10 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
-    /// How to cluster cells (`kmeans`, `bicluster`, `bicluster-swapped`, `svd-kmeans`, …).
+    /// How to cluster cells (`kmeans` or `svd-joint`).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
-    /// Optional RNG seed for k-means-based clustering stages. Same seed => reproducible clustering.
+    /// Optional RNG seed for cell clustering stages, including `svd-joint` row sampling.
     #[arg(long = "cluster-seed")]
     cluster_seed: Option<u64>,
     /// If set, run all cell-cluster methods and append one stats row per method.
@@ -4545,11 +3594,6 @@ struct BuildCommand {
     /// or `svd` (truncated SVD on the sparse matrix, uses right singular vectors).
     #[arg(long = "gene-reorder-method", value_enum, default_value_t = GeneReorderMethod::Projection)]
     gene_reorder_method: GeneReorderMethod,
-    /// True joint biclustering: one SVD on the full sparse cell×gene matrix produces
-    /// both cell cluster assignments and gene ordering simultaneously.  Overrides
-    /// `--cell-cluster-method` and `--gene-reorder-method` when set.
-    #[arg(long = "bicluster", default_value_t = false)]
-    bicluster_joint: bool,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -4768,6 +3812,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let quantize_values = args.lossy && !args.lossy_lossless;
             let target_quantizers = args.lossy_quantizers.max(1);
+            let target_cell_blocks = args.cell_blocks.max(1);
             let quantizer_bins = args.lossy_bins.max(1);
             let sweep_counts = normalize_quantizer_counts(target_quantizers, &args.lossy_sweep);
             let index_codec = IndexStreamCodec::from(args.index_codec);
@@ -4794,9 +3839,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | quantizers={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 target_quantizers,
+                target_cell_blocks,
                 quantizer_bins,
                 sweep_counts,
                 args.max_cluster_size,
@@ -4815,30 +3861,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.row_template_max
             );
 
-            // Each sweep config: (cell_method, gene_method, bicluster_joint, label)
-            let mut sweep_configs: Vec<(CellClusterMethodArg, GeneReorderMethod, bool, String)> = Vec::new();
+            // Each sweep config: (cell_method, gene_method, label)
+            let mut sweep_configs: Vec<(CellClusterMethodArg, GeneReorderMethod, String)> = Vec::new();
 
             if args.cell_cluster_method_sweep_all {
                 for &cm in CellClusterMethodArg::value_variants() {
                     let label = cell_cluster_method_name(cm);
-                    sweep_configs.push((cm, args.gene_reorder_method, false, label));
+                    sweep_configs.push((cm, args.gene_reorder_method, label));
                 }
-            } else if args.bicluster_joint {
-                let label = format!("{}-bicluster", cell_cluster_method_name(args.cell_cluster_method));
-                sweep_configs.push((
-                    args.cell_cluster_method,
-                    args.gene_reorder_method,
-                    true,
-                    label,
-                ));
             } else {
                 let label = cell_cluster_method_name(args.cell_cluster_method);
-                sweep_configs.push((args.cell_cluster_method, args.gene_reorder_method, false, label));
+                sweep_configs.push((args.cell_cluster_method, args.gene_reorder_method, label));
             }
 
-            for (cell_cluster_method, gene_reorder_method, bicluster_joint, config_label) in &sweep_configs {
-                let is_joint = *bicluster_joint
-                    || *cell_cluster_method == CellClusterMethodArg::SvdJoint;
+            for (cell_cluster_method, gene_reorder_method, config_label) in &sweep_configs {
+                let is_joint = *cell_cluster_method == CellClusterMethodArg::SvdJoint;
                 let gene_method_label = if is_joint {
                     config_label.clone()
                 } else {
@@ -4848,8 +3885,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| format!("{:?}", gene_reorder_method).to_lowercase())
                 };
                 info!(
-                    "Running build: cell={}, gene={}, bicluster={}",
-                    config_label, gene_method_label, bicluster_joint
+                    "Running build: cell={}, gene={}",
+                    config_label, gene_method_label
                 );
                 let mut metrics = Vec::new();
                 let mut selected: Option<CompressionResult> = None;
@@ -4858,7 +3895,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let result = run_clustered_compression(
                         &points,
                         &csr,
-                        quantizer_count,
+                        target_cell_blocks,
                         quantizer_bins,
                         quantize_values,
                         args.lossy_verify_lossless,
@@ -4880,7 +3917,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tensor_grid,
                         args.cluster_seed,
                         *gene_reorder_method,
-                        *bicluster_joint,
                         args.gene_blocks,
                     )?;
 
@@ -5159,58 +4195,12 @@ mod tests {
             TensorGridParams::default(),
             None,
             GeneReorderMethod::Projection,
-            false,
             1,
         )
         .expect("lossy compression should succeed");
 
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
         assert!(result.cluster_sizes.iter().all(|&s| s <= max_cluster_size));
-    }
-
-    #[test]
-    fn bicluster_joint_runs_on_toy_matrix() {
-        let n_cells = 12usize;
-        let n_genes = 8usize;
-        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
-        for cell in 0..n_cells {
-            tri.add_triplet(cell, cell % n_genes, (cell as u16 + 1) * 3);
-            tri.add_triplet(cell, (cell + 1) % n_genes, 5u16);
-        }
-        let csr = tri.to_csr::<usize>();
-        let points: Vec<Point> = (0..n_cells)
-            .map(|i| Point::new(i as f64, (i % 3) as f64, i))
-            .collect();
-        let result = run_clustered_compression(
-            &points,
-            &csr,
-            3,
-            8,
-            false,
-            false,
-            None,
-            KnnDistanceMetric::L0,
-            MstWeightMode::Metric,
-            IndexStreamCodec::Arithmetic,
-            SortedIndexCodec::EliasFano,
-            Some(1.0),
-            None,
-            ClusterEncodingArg::Hybrid,
-            0,
-            false,
-            32,
-            false,
-            16,
-            CellClusterMethodArg::Kmeans,
-            SpatialGraphParams::default(),
-            TensorGridParams::default(),
-            Some(42),
-            GeneReorderMethod::Projection,
-            true,
-                    1,
-        )
-        .expect("bicluster-joint path");
-        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
     }
 
     #[test]
@@ -5251,8 +4241,7 @@ mod tests {
             TensorGridParams::default(),
             Some(42),
             GeneReorderMethod::Projection,
-            false,
-                    1,
+            1,
         )
         .expect("svd-joint seriation path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
