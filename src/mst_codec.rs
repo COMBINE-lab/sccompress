@@ -672,12 +672,18 @@ fn compute_sparse_expression(
     let mut expression = Vec::new();
     if let Some(row) = data.outer_view(point.row_index) {
         for (gene_idx, &value) in row.iter() {
-            if value != 0 {
-                let mapped_gene = gene_old_to_new
-                    .and_then(|mapping| mapping.get(gene_idx).copied())
-                    .unwrap_or(gene_idx as u32);
-                expression.push((mapped_gene, value));
+            if value == 0 {
+                continue;
             }
+            let mapped_gene = gene_old_to_new
+                .and_then(|mapping| mapping.get(gene_idx).copied())
+                .unwrap_or(gene_idx as u32);
+            // In gene-block mode, u32::MAX marks genes outside the active block.
+            // Skip them so each tile only encodes its own columns.
+            if mapped_gene == u32::MAX {
+                continue;
+            }
+            expression.push((mapped_gene, value));
         }
     }
     if gene_old_to_new.is_some() {
@@ -2960,4 +2966,22 @@ mod tests {
             assert_eq!(actual, expected);
         }
     }
+
+    #[test]
+    fn test_compute_sparse_expression_skips_genes_outside_block() {
+        let mut tri = TriMatI::<u16, usize>::new((1, 4));
+        tri.add_triplet(0, 0, 3);
+        tri.add_triplet(0, 1, 5);
+        tri.add_triplet(0, 2, 7);
+        tri.add_triplet(0, 3, 11);
+        let csr = tri.to_csr::<usize>();
+        let point = Point::new(0.0, 0.0, 0);
+
+        // Keep genes 1 and 3 in this block; genes 0 and 2 are outside.
+        let block_map = vec![u32::MAX, 0, u32::MAX, 1];
+        let sparse = compute_sparse_expression(&point, &csr, Some(&block_map));
+
+        assert_eq!(sparse, vec![(0, 5), (1, 11)]);
+    }
+
 }
