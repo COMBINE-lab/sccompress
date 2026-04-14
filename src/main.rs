@@ -120,8 +120,30 @@ enum ClusterEncodingArg {
     Hybrid,
 }
 
-/// How to partition cells into encoder clusters (before row-MST / column payloads).
+/// How to compute the gene (column) permutation that maps original gene indices
+/// to their serialized order.  A good gene ordering places genes with similar
+/// cell support patterns adjacent, shrinking gap-coded posting-list costs and
+/// MST ref-chain edit sizes.
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum GeneReorderMethod {
+    /// Hash-projection seriation (current default): for each gene, accumulate
+    /// deterministic hash-based random-projection scores weighted by the row
+    /// stream order, then sort genes lexicographically by those scores.
+    #[default]
+    Projection,
+    /// SVD-based dual seriation: build a truncated SVD of the (optionally
+    /// normalized) sparse cell×gene matrix, then sort genes by their first
+    /// right singular vector coordinate (`v₁`), breaking ties with `v₂`.
+    Svd,
+    /// K-means on SVD right-singular-vector embeddings: cluster genes into groups with similar
+    /// cell-support patterns, then sort within each cluster by `v₁`.  Genes sharing a cluster
+    /// are placed contiguously, so posting-list deltas and MST edit chains benefit from block
+    /// structure that pure seriation may miss when the manifold is not 1-D.
+    Kmeans,
+}
+
+/// How to partition cells into encoder clusters (before row-MST / column payloads).
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
 enum CellClusterMethodArg {
     /// K-means on `build_cell_features` (hashed ln1p buckets, L2-normalized per cell).
     #[default]
@@ -143,6 +165,10 @@ enum CellClusterMethodArg {
     /// Same preprocessing and SVD row embedding as `bicluster` (**double L1** on nonnegative `X`, then `U Σ^{1/2}`),
     /// but **no** Gram / column k-means / aggregates — final **k-means** only on the embedding.
     SvdKmeans,
+    /// SVD seriation: same double-L1 preprocessing and SVD as `svd-kmeans`, but instead of
+    /// k-means, **sort** cells by their left-singular-vector coordinates `(u₁, u₂, …)` and cut
+    /// the sorted order into `k` contiguous blocks.  Guarantees cluster-contiguous cell ordering.
+    SvdSeriation,
     /// **Column k-means only** (same as bicluster’s column step): k-means on Gram `X^T X` to group
     /// bucket columns, sum `X` within each column cluster per cell, L2-normalize rows, then
     /// k-means on cells (no SVD).
@@ -161,6 +187,16 @@ enum CellClusterMethodArg {
     /// **Slide discretization** (grid or hex bins), then k-means on `[expression buckets \| tile embedding]`.
     /// Links cells to spatial tiles (tensor-style *bucket×cell×tile* linkage via tile assignment + features).
     TensorGrid,
+    /// [cell-squeeze](https://github.com/maharshi95/cell-squeeze)-style Kluger (2003) SpectralBiclustering:
+    /// bistochastic normalization, SVD, pick `n_best` singular vectors by piecewise-constant fit,
+    /// project X @ V_best → row k-means, X^T @ U_best → column k-means.  Joint biclustering that
+    /// simultaneously clusters cells **and** reorders genes.
+    CellSqueeze,
+    /// Joint SVD seriation: one TF-IDF-normalized SVD on the full sparse cell×gene matrix,
+    /// **sort** cells by `(u₁, u₂, …)` into `k` contiguous blocks (like `svd-seriation`),
+    /// **sort** genes by `(v₁, v₂)` (like `--gene-reorder-method svd`).  Pure permutation on
+    /// both axes from the same decomposition — no k-means anywhere.
+    SvdJoint,
 }
 
 /// Parameters for [`CellClusterMethodArg::SpatialGraph`] (ignored for other methods).
@@ -1124,6 +1160,80 @@ fn cluster_cells_svd_kmeans_only(
     Ok(model.predict(&dataset).to_vec())
 }
 
+/// SVD seriation: double-L1 normalize nonneg `X`, truncated SVD to get left singular vectors,
+/// sort cells by `(u₁, u₂, …)` coordinates, then cut the sorted order into `k` contiguous blocks.
+/// Cells within each block are expression-neighbours in the SVD embedding, and the block
+/// boundaries respect the continuous ordering — unlike k-means, which can assign spatially
+/// interleaved labels.
+fn cluster_cells_svd_seriation(
+    features: &Array2<f64>,
+    num_clusters: usize,
+) -> anyhow::Result<Vec<usize>> {
+    let n = features.nrows();
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let m = features.ncols();
+    let k = num_clusters.max(1).min(n);
+    if k <= 1 {
+        return Ok(vec![0; n]);
+    }
+
+    let mut a = Array2::<f64>::zeros((n, m));
+    for i in 0..n {
+        for j in 0..m {
+            a[(i, j)] = features[(i, j)].max(0.0);
+        }
+    }
+    normalize_l1_rows_inplace(&mut a);
+    normalize_l1_cols_inplace(&mut a);
+
+    let data: Vec<f64> = a.iter().copied().collect();
+    let mat = DMatrix::from_row_slice(n, m, &data);
+    let svd = mat.svd(true, false);
+    let u = match svd.u {
+        Some(u) => u,
+        None => return Ok((0..n).map(|i| i % k).collect()),
+    };
+
+    let max_rank = n.min(m);
+    let n_comp = k.min(max_rank).max(1).min(u.ncols());
+
+    // Build sortable key per cell: (u₁, u₂, …, original_index)
+    let mut cell_keys: Vec<(usize, Vec<f64>)> = (0..n)
+        .map(|i| {
+            let scores: Vec<f64> = (0..n_comp).map(|j| u[(i, j)]).collect();
+            (i, scores)
+        })
+        .collect();
+
+    cell_keys.sort_unstable_by(|a, b| {
+        for (va, vb) in a.1.iter().zip(b.1.iter()) {
+            match va.total_cmp(vb) {
+                std::cmp::Ordering::Equal => continue,
+                other => return other,
+            }
+        }
+        a.0.cmp(&b.0)
+    });
+
+    // Cut the sorted order into k contiguous blocks
+    let mut labels = vec![0usize; n];
+    let block_size = n / k;
+    let remainder = n % k;
+    let mut cursor = 0usize;
+    for cluster_id in 0..k {
+        let sz = block_size + if cluster_id < remainder { 1 } else { 0 };
+        for offset in 0..sz {
+            let original_idx = cell_keys[cursor + offset].0;
+            labels[original_idx] = cluster_id;
+        }
+        cursor += sz;
+    }
+
+    Ok(labels)
+}
+
 /// Double-L1 normalized `X`; k-means on columns via Gram `X^T X`; per-cell column-cluster sums;
 /// L2-normalize rows; k-means on cells only (no spectral term).
 fn cluster_cells_simple_column_kmeans(
@@ -1599,6 +1709,9 @@ fn cluster_cells(
         CellClusterMethodArg::SvdKmeans => {
             cluster_cells_svd_kmeans_only(features_src, num_clusters, cluster_seed)
         }
+        CellClusterMethodArg::SvdSeriation => {
+            cluster_cells_svd_seriation(features_src, num_clusters)
+        }
         CellClusterMethodArg::ColumnKmeans => {
             cluster_cells_simple_column_kmeans(features_src, num_clusters, cluster_seed)
         }
@@ -1611,6 +1724,11 @@ fn cluster_cells(
         }
         CellClusterMethodArg::TensorGrid => {
             cluster_cells_tensor_grid(points, features_src, num_clusters, tensor_grid, cluster_seed)
+        }
+        CellClusterMethodArg::CellSqueeze | CellClusterMethodArg::SvdJoint => {
+            // Normally handled by joint_bicluster_kluger / joint_svd_seriation in
+            // run_clustered_compression; this branch is only reached as a fallback.
+            cluster_cells_with_kmeans(features_src, num_clusters, cluster_seed)
         }
     }
 }
@@ -1858,6 +1976,1079 @@ fn compute_gene_permutation_from_row_stream(
         new_to_old.into_iter().map(|g| g as u32).collect(),
         old_to_new,
     ))
+}
+
+/// SVD-based gene reordering: build a sparse cell×gene matrix from the cluster
+/// row stream, compute a truncated SVD, and sort genes by their coordinates in
+/// the first two right singular vectors (v₁, v₂).  Genes with similar cell
+/// support patterns end up adjacent, which improves gap-coded posting-list
+/// compression and gene-level MST ref-chain costs.
+fn compute_gene_permutation_svd(
+    points: &[Point],
+    data: &CsMat<u16>,
+    row_stream_point_indices: &[usize],
+) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
+    let ncols = data.cols();
+    if ncols == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let n_cells = row_stream_point_indices.len();
+    if n_cells == 0 {
+        let identity: Vec<u32> = (0..ncols as u32).collect();
+        return Ok((identity.clone(), identity));
+    }
+
+    // Collect per-gene occurrence counts and the set of cells that express each gene.
+    // We work on the binary support (presence/absence) to keep the SVD focused on
+    // co-occurrence structure rather than magnitude.
+    let mut col_nnz = vec![0u64; ncols];
+    let mut row_nnz = vec![0u64; n_cells];
+    let mut triplets: Vec<(usize, usize, f64)> = Vec::new();
+
+    for (stream_pos, &point_idx) in row_stream_point_indices.iter().enumerate() {
+        let point = &points[point_idx];
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value != 0 {
+                    col_nnz[gene_idx] += 1;
+                    row_nnz[stream_pos] += 1;
+                    triplets.push((stream_pos, gene_idx, 1.0));
+                }
+            }
+        }
+    }
+
+    // Find genes that actually appear; genes with zero support keep their original index
+    let active_genes: Vec<usize> = (0..ncols).filter(|&g| col_nnz[g] > 0).collect();
+    if active_genes.len() <= 2 {
+        let identity: Vec<u32> = (0..ncols as u32).collect();
+        return Ok((identity.clone(), identity));
+    }
+
+    // Cap the dense matrix size: if (n_cells × active_genes) would be huge, subsample
+    // rows to keep the dense SVD tractable.
+    let max_svd_rows = 4000usize;
+    let max_svd_cols = 2000usize;
+
+    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
+        let step = n_cells as f64 / max_svd_rows as f64;
+        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+    } else {
+        (0..n_cells).collect()
+    };
+
+    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
+        // Keep the most frequent genes
+        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_freq.truncate(max_svd_cols);
+        by_freq.sort_unstable_by_key(|&(g, _)| g);
+        by_freq.iter().map(|&(g, _)| g).collect()
+    } else {
+        active_genes.clone()
+    };
+
+    // Build a column index map for the subsetted genes
+    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
+    for (local, &global) in active_cols.iter().enumerate() {
+        col_local.insert(global, local);
+    }
+
+    let nr = sampled_rows.len();
+    let nc = active_cols.len();
+
+    // Build dense matrix with TF-IDF-like normalization:
+    //   value = (1 if gene present) / sqrt(col_nnz[gene])
+    // This down-weights ubiquitous genes and emphasizes discriminative ones.
+    let mut dense = vec![0.0f64; nr * nc];
+    let sampled_set: HashMap<usize, usize> = sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+    for &(stream_pos, gene_idx, _) in &triplets {
+        if let Some(&local_row) = sampled_set.get(&stream_pos) {
+            if let Some(&local_col) = col_local.get(&gene_idx) {
+                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+            }
+        }
+    }
+
+    let mat = DMatrix::from_row_slice(nr, nc, &dense);
+    let svd = mat.svd(false, true);
+    let v_t = match svd.v_t {
+        Some(vt) => vt,
+        None => {
+            info!("SVD gene reorder: V^T not available, falling back to projection method");
+            return compute_gene_permutation_from_row_stream(points, data, row_stream_point_indices);
+        }
+    };
+
+    // Extract the first two right singular vector coordinates for each active column
+    let n_sv = v_t.nrows().min(2);
+    let mut scores: Vec<(usize, f64, f64)> = Vec::with_capacity(ncols);
+    for &global_gene in &active_cols {
+        let local_col = col_local[&global_gene];
+        let s1 = if n_sv >= 1 { v_t[(0, local_col)] } else { 0.0 };
+        let s2 = if n_sv >= 2 { v_t[(1, local_col)] } else { 0.0 };
+        scores.push((global_gene, s1, s2));
+    }
+    // Inactive genes (not in SVD subset) get a deterministic tiebreak score
+    for g in 0..ncols {
+        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
+            scores.push((g, f64::INFINITY, g as f64));
+        }
+    }
+
+    scores.sort_unstable_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut old_to_new = vec![0u32; ncols];
+    let mut new_to_old = Vec::with_capacity(ncols);
+    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
+        old_to_new[old_idx] = new_idx as u32;
+        new_to_old.push(old_idx as u32);
+    }
+
+    info!(
+        "SVD gene reorder: {} genes reordered ({} active in SVD, {} total)",
+        active_cols.len(),
+        nc,
+        ncols
+    );
+
+    Ok((new_to_old, old_to_new))
+}
+
+/// K-means on right-singular-vector gene embeddings, then sort within each cluster by v₁.
+///
+/// Builds the same TF-IDF-normalized sparse matrix and SVD as [`compute_gene_permutation_svd`],
+/// but instead of a global 1-D sort by `(v₁,v₂)`, it:
+///   1. Embeds each gene in `ℝ^{n_comp}` via the right singular vectors.
+///   2. Runs k-means on genes to find groups with similar cell-support patterns.
+///   3. Sorts clusters by their centroid's v₁, and genes within each cluster by v₁.
+///
+/// This captures block structure (gene modules) that a pure 1-D seriation can miss.
+fn compute_gene_permutation_kmeans(
+    points: &[Point],
+    data: &CsMat<u16>,
+    row_stream_point_indices: &[usize],
+    cluster_seed: Option<u64>,
+) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
+    let ncols = data.cols();
+    if ncols == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    let n_cells = row_stream_point_indices.len();
+    if n_cells == 0 {
+        let identity: Vec<u32> = (0..ncols as u32).collect();
+        return Ok((identity.clone(), identity));
+    }
+
+    let mut col_nnz = vec![0u64; ncols];
+    let mut triplets: Vec<(usize, usize)> = Vec::new();
+
+    for (stream_pos, &point_idx) in row_stream_point_indices.iter().enumerate() {
+        let point = &points[point_idx];
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value != 0 {
+                    col_nnz[gene_idx] += 1;
+                    triplets.push((stream_pos, gene_idx));
+                }
+            }
+        }
+    }
+
+    let active_genes: Vec<usize> = (0..ncols).filter(|&g| col_nnz[g] > 0).collect();
+    if active_genes.len() <= 2 {
+        let identity: Vec<u32> = (0..ncols as u32).collect();
+        return Ok((identity.clone(), identity));
+    }
+
+    let max_svd_rows = 4000usize;
+    let max_svd_cols = 2000usize;
+
+    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
+        let step = n_cells as f64 / max_svd_rows as f64;
+        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+    } else {
+        (0..n_cells).collect()
+    };
+
+    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
+        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_freq.truncate(max_svd_cols);
+        by_freq.sort_unstable_by_key(|&(g, _)| g);
+        by_freq.iter().map(|&(g, _)| g).collect()
+    } else {
+        active_genes.clone()
+    };
+
+    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
+    for (local, &global) in active_cols.iter().enumerate() {
+        col_local.insert(global, local);
+    }
+
+    let nr = sampled_rows.len();
+    let nc = active_cols.len();
+
+    let mut dense = vec![0.0f64; nr * nc];
+    let sampled_set: HashMap<usize, usize> = sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+    for &(stream_pos, gene_idx) in &triplets {
+        if let Some(&local_row) = sampled_set.get(&stream_pos) {
+            if let Some(&local_col) = col_local.get(&gene_idx) {
+                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+            }
+        }
+    }
+
+    let mat = DMatrix::from_row_slice(nr, nc, &dense);
+    let svd = mat.svd(false, true);
+    let v_t = match svd.v_t {
+        Some(vt) => vt,
+        None => {
+            info!("K-means gene reorder: V^T not available, falling back to SVD seriation");
+            return compute_gene_permutation_svd(points, data, row_stream_point_indices);
+        }
+    };
+
+    let n_sv = v_t.nrows();
+    let n_comp = n_sv.min(8).max(1);
+
+    // Build gene embedding matrix (active genes only)
+    let mut gene_embed = Array2::<f64>::zeros((nc, n_comp));
+    for (local_col, _) in active_cols.iter().enumerate() {
+        for j in 0..n_comp {
+            gene_embed[(local_col, j)] = v_t[(j, local_col)];
+        }
+    }
+    l2_normalize_rows_inplace(&mut gene_embed);
+
+    // K-means on gene embeddings — use sqrt(nc) clusters, capped
+    let gene_k = (nc as f64).sqrt().ceil() as usize;
+    let gene_k = gene_k.max(2).min(nc);
+    let dataset = DatasetBase::from(gene_embed.clone());
+    let model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(gene_k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(9001)))
+            .max_n_iterations(30)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("gene k-means failed: {}", e))?
+    } else {
+        KMeans::params(gene_k)
+            .max_n_iterations(30)
+            .fit(&dataset)
+            .map_err(|e| anyhow::anyhow!("gene k-means failed: {}", e))?
+    };
+    let gene_labels: Vec<usize> = model.predict(&dataset).to_vec();
+
+    // For each gene cluster, compute centroid v₁ for inter-cluster ordering
+    let mut cluster_v1_sum = vec![0.0f64; gene_k];
+    let mut cluster_count = vec![0usize; gene_k];
+    for (local_col, &label) in gene_labels.iter().enumerate() {
+        cluster_v1_sum[label] += v_t[(0, local_col)];
+        cluster_count[label] += 1;
+    }
+    let mut cluster_order: Vec<usize> = (0..gene_k).collect();
+    cluster_order.sort_unstable_by(|&a, &b| {
+        let mean_a = if cluster_count[a] > 0 { cluster_v1_sum[a] / cluster_count[a] as f64 } else { f64::INFINITY };
+        let mean_b = if cluster_count[b] > 0 { cluster_v1_sum[b] / cluster_count[b] as f64 } else { f64::INFINITY };
+        mean_a.total_cmp(&mean_b)
+    });
+    let mut cluster_rank = vec![0usize; gene_k];
+    for (rank, &cid) in cluster_order.iter().enumerate() {
+        cluster_rank[cid] = rank;
+    }
+
+    // Build final ordering: (cluster_rank, v₁ within cluster, global_gene_idx)
+    let mut scores: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(ncols);
+    for (local_col, &global_gene) in active_cols.iter().enumerate() {
+        let label = gene_labels[local_col];
+        let rank = cluster_rank[label];
+        let s1 = v_t[(0, local_col)];
+        let s2 = if n_sv >= 2 { v_t[(1, local_col)] } else { 0.0 };
+        scores.push((global_gene, rank, s1, s2));
+    }
+    for g in 0..ncols {
+        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
+            scores.push((g, usize::MAX, f64::INFINITY, g as f64));
+        }
+    }
+
+    scores.sort_unstable_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.3.total_cmp(&b.3))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut old_to_new = vec![0u32; ncols];
+    let mut new_to_old = Vec::with_capacity(ncols);
+    for (new_idx, &(old_idx, _, _, _)) in scores.iter().enumerate() {
+        old_to_new[old_idx] = new_idx as u32;
+        new_to_old.push(old_idx as u32);
+    }
+
+    info!(
+        "K-means gene reorder: {} genes -> {} gene clusters ({} active in SVD, {} total)",
+        active_cols.len(),
+        gene_k,
+        nc,
+        ncols
+    );
+
+    Ok((new_to_old, old_to_new))
+}
+
+/// True joint biclustering: one SVD on the full sparse cell×gene matrix produces
+/// **both** cell cluster assignments (from left singular vectors) **and** a gene
+/// permutation (from right singular vectors).
+///
+/// Uses TF-IDF normalization on binary support, same as [`compute_gene_permutation_svd`],
+/// and sorts cells into `k` contiguous blocks via seriation on left singular vectors,
+/// same spirit as [`cluster_cells_svd_seriation`].
+///
+/// Returns `(cell_assignments, gene_new_to_old, gene_old_to_new)`.
+fn joint_bicluster_svd(
+    points: &[Point],
+    data: &CsMat<u16>,
+    num_clusters: usize,
+    cluster_seed: Option<u64>,
+) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
+    let n_cells = points.len();
+    let n_genes = data.cols();
+
+    if n_cells == 0 {
+        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
+    }
+
+    let k = num_clusters.max(1).min(n_cells);
+
+    // --- Build binary support triplets ---
+    let mut col_nnz = vec![0u64; n_genes];
+    let mut triplets: Vec<(usize, usize)> = Vec::new();
+    for (ci, point) in points.iter().enumerate() {
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value != 0 {
+                    col_nnz[gene_idx] += 1;
+                    triplets.push((ci, gene_idx));
+                }
+            }
+        }
+    }
+
+    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
+    if active_genes.len() <= 2 {
+        return Ok((
+            (0..n_cells).map(|i| i % k).collect(),
+            (0..n_genes as u32).collect(),
+            (0..n_genes as u32).collect(),
+        ));
+    }
+
+    // --- Subsample for dense SVD tractability ---
+    let max_svd_rows = 4000usize;
+    let max_svd_cols = 2000usize;
+
+    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
+        let step = n_cells as f64 / max_svd_rows as f64;
+        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+    } else {
+        (0..n_cells).collect()
+    };
+
+    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
+        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_freq.truncate(max_svd_cols);
+        by_freq.sort_unstable_by_key(|&(g, _)| g);
+        by_freq.iter().map(|&(g, _)| g).collect()
+    } else {
+        active_genes.clone()
+    };
+
+    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
+    for (local, &global) in active_cols.iter().enumerate() {
+        col_local.insert(global, local);
+    }
+
+    let nr = sampled_rows.len();
+    let nc = active_cols.len();
+
+    // --- Build dense matrix with TF-IDF normalization ---
+    let mut dense = vec![0.0f64; nr * nc];
+    let sampled_set: HashMap<usize, usize> =
+        sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+    for &(ci, gene_idx) in &triplets {
+        if let Some(&local_row) = sampled_set.get(&ci) {
+            if let Some(&local_col) = col_local.get(&gene_idx) {
+                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+            }
+        }
+    }
+
+    // --- SVD: need both U and V^T ---
+    let mat = DMatrix::from_row_slice(nr, nc, &dense);
+    let svd = mat.svd(true, true);
+    let (u, v_t) = match (svd.u, svd.v_t) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => {
+            return Ok((
+                (0..n_cells).map(|i| i % k).collect(),
+                (0..n_genes as u32).collect(),
+                (0..n_genes as u32).collect(),
+            ));
+        }
+    };
+
+    // --- CELL SIDE: embed all cells via left singular vectors, then k-means ---
+    let n_comp_cell = k.min(u.ncols()).max(1);
+
+    // Sampled cells: direct from U
+    let mut cell_embed = Array2::<f64>::zeros((n_cells, n_comp_cell));
+    for (local_row, &ci) in sampled_rows.iter().enumerate() {
+        for j in 0..n_comp_cell {
+            cell_embed[(ci, j)] = u[(local_row, j)];
+        }
+    }
+
+    // Unsampled cells: project via V^T (Nyström)
+    let sigma = &svd.singular_values;
+    for ci in 0..n_cells {
+        if sampled_set.contains_key(&ci) {
+            continue;
+        }
+        let point = &points[ci];
+        if let Some(row) = data.outer_view(point.row_index) {
+            for j in 0..n_comp_cell {
+                let sig_inv = if sigma[j] > 1e-12 { 1.0 / sigma[j] } else { 0.0 };
+                let mut dot = 0.0f64;
+                for (g, &v) in row.iter() {
+                    if v != 0 {
+                        if let Some(&lc) = col_local.get(&g) {
+                            let tfidf = 1.0 / (col_nnz[g] as f64).sqrt().max(1e-12);
+                            dot += tfidf * v_t[(j, lc)];
+                        }
+                    }
+                }
+                cell_embed[(ci, j)] = dot * sig_inv;
+            }
+        }
+    }
+
+    l2_normalize_rows_inplace(&mut cell_embed);
+
+    let dataset_cells = DatasetBase::from(cell_embed);
+    let cell_model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(7001)))
+            .max_n_iterations(30)
+            .fit(&dataset_cells)
+            .map_err(|e| anyhow::anyhow!("joint bicluster cell k-means failed: {}", e))?
+    } else {
+        KMeans::params(k)
+            .max_n_iterations(30)
+            .fit(&dataset_cells)
+            .map_err(|e| anyhow::anyhow!("joint bicluster cell k-means failed: {}", e))?
+    };
+    let cell_labels: Vec<usize> = cell_model.predict(&dataset_cells).to_vec();
+
+    // --- GENE SIDE: sort genes by (v₁, v₂) from the same SVD ---
+    let n_sv = v_t.nrows().min(2);
+    let mut scores: Vec<(usize, f64, f64)> = Vec::with_capacity(n_genes);
+    for &global_gene in &active_cols {
+        let local_col = col_local[&global_gene];
+        let s1 = if n_sv >= 1 { v_t[(0, local_col)] } else { 0.0 };
+        let s2 = if n_sv >= 2 { v_t[(1, local_col)] } else { 0.0 };
+        scores.push((global_gene, s1, s2));
+    }
+    for g in 0..n_genes {
+        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
+            scores.push((g, f64::INFINITY, g as f64));
+        }
+    }
+    scores.sort_unstable_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut gene_old_to_new = vec![0u32; n_genes];
+    let mut gene_new_to_old = Vec::with_capacity(n_genes);
+    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
+        gene_old_to_new[old_idx] = new_idx as u32;
+        gene_new_to_old.push(old_idx as u32);
+    }
+
+    info!(
+        "Joint bicluster SVD: {} cells -> {} clusters, {} genes reordered ({} active in SVD)",
+        n_cells, k, n_genes, nc
+    );
+
+    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
+}
+
+/// Joint SVD seriation: one SVD on TF-IDF-normalized cell×gene matrix, then pure sorting
+/// on both axes — cells sorted by left singular vectors into `k` contiguous blocks,
+/// genes sorted by right singular vectors.  No k-means anywhere.
+fn joint_svd_seriation(
+    points: &[Point],
+    data: &CsMat<u16>,
+    num_clusters: usize,
+) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
+    let n_cells = points.len();
+    let n_genes = data.cols();
+
+    if n_cells == 0 {
+        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
+    }
+
+    let k = num_clusters.max(1).min(n_cells);
+
+    let mut col_nnz = vec![0u64; n_genes];
+    let mut triplets: Vec<(usize, usize)> = Vec::new();
+    for (ci, point) in points.iter().enumerate() {
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value != 0 {
+                    col_nnz[gene_idx] += 1;
+                    triplets.push((ci, gene_idx));
+                }
+            }
+        }
+    }
+
+    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
+    if active_genes.len() <= 2 {
+        return Ok((
+            (0..n_cells).map(|i| i % k).collect(),
+            (0..n_genes as u32).collect(),
+            (0..n_genes as u32).collect(),
+        ));
+    }
+
+    let max_svd_rows = 4000usize;
+    let max_svd_cols = 2000usize;
+
+    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
+        let step = n_cells as f64 / max_svd_rows as f64;
+        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+    } else {
+        (0..n_cells).collect()
+    };
+
+    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
+        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_freq.truncate(max_svd_cols);
+        by_freq.sort_unstable_by_key(|&(g, _)| g);
+        by_freq.iter().map(|&(g, _)| g).collect()
+    } else {
+        active_genes.clone()
+    };
+
+    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
+    for (local, &global) in active_cols.iter().enumerate() {
+        col_local.insert(global, local);
+    }
+
+    let nr = sampled_rows.len();
+    let nc = active_cols.len();
+
+    // TF-IDF: binary support / sqrt(doc-freq)
+    let mut dense = vec![0.0f64; nr * nc];
+    let sampled_set: HashMap<usize, usize> =
+        sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+    for &(ci, gene_idx) in &triplets {
+        if let Some(&local_row) = sampled_set.get(&ci) {
+            if let Some(&local_col) = col_local.get(&gene_idx) {
+                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+            }
+        }
+    }
+
+    let mat = DMatrix::from_row_slice(nr, nc, &dense);
+    let svd = mat.svd(true, true);
+    let (u, v_t) = match (svd.u, svd.v_t) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => {
+            return Ok((
+                (0..n_cells).map(|i| i % k).collect(),
+                (0..n_genes as u32).collect(),
+                (0..n_genes as u32).collect(),
+            ));
+        }
+    };
+
+    // --- CELL SIDE: embed all cells via U, Nyström for unsampled, then sort ---
+    let n_comp = k.min(u.ncols()).max(1);
+    let sigma = &svd.singular_values;
+
+    let mut cell_coords: Vec<(usize, Vec<f64>)> = Vec::with_capacity(n_cells);
+    for ci in 0..n_cells {
+        let mut coords = vec![0.0f64; n_comp];
+        if let Some(&lr) = sampled_set.get(&ci) {
+            for j in 0..n_comp { coords[j] = u[(lr, j)]; }
+        } else {
+            let point = &points[ci];
+            if let Some(row) = data.outer_view(point.row_index) {
+                for j in 0..n_comp {
+                    let sig_inv = if sigma[j] > 1e-12 { 1.0 / sigma[j] } else { 0.0 };
+                    let mut dot = 0.0f64;
+                    for (g, &v) in row.iter() {
+                        if v != 0 {
+                            if let Some(&lc) = col_local.get(&g) {
+                                let tfidf = 1.0 / (col_nnz[g] as f64).sqrt().max(1e-12);
+                                dot += tfidf * v_t[(j, lc)];
+                            }
+                        }
+                    }
+                    coords[j] = dot * sig_inv;
+                }
+            }
+        }
+        cell_coords.push((ci, coords));
+    }
+
+    // Sort cells by (u₁, u₂, …) lexicographically
+    cell_coords.sort_unstable_by(|a, b| {
+        for (ca, cb) in a.1.iter().zip(b.1.iter()) {
+            match ca.total_cmp(cb) {
+                std::cmp::Ordering::Equal => continue,
+                ord => return ord,
+            }
+        }
+        a.0.cmp(&b.0)
+    });
+
+    // Cut the sorted order into k contiguous blocks
+    let mut cell_labels = vec![0usize; n_cells];
+    let block_size = n_cells / k;
+    let remainder = n_cells % k;
+    let mut offset = 0usize;
+    for cluster_id in 0..k {
+        let sz = block_size + if cluster_id < remainder { 1 } else { 0 };
+        for pos in offset..offset + sz {
+            let ci = cell_coords[pos].0;
+            cell_labels[ci] = cluster_id;
+        }
+        offset += sz;
+    }
+
+    // --- GENE SIDE: sort genes by (v₁, v₂) ---
+    let n_sv = v_t.nrows().min(2);
+    let mut scores: Vec<(usize, f64, f64)> = Vec::with_capacity(n_genes);
+    for &global_gene in &active_cols {
+        let lc = col_local[&global_gene];
+        let s1 = if n_sv >= 1 { v_t[(0, lc)] } else { 0.0 };
+        let s2 = if n_sv >= 2 { v_t[(1, lc)] } else { 0.0 };
+        scores.push((global_gene, s1, s2));
+    }
+    for g in 0..n_genes {
+        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
+            scores.push((g, f64::INFINITY, g as f64));
+        }
+    }
+    scores.sort_unstable_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut gene_old_to_new = vec![0u32; n_genes];
+    let mut gene_new_to_old = Vec::with_capacity(n_genes);
+    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
+        gene_old_to_new[old_idx] = new_idx as u32;
+        gene_new_to_old.push(old_idx as u32);
+    }
+
+    info!(
+        "Joint SVD seriation: {} cells -> {} contiguous blocks, {} genes reordered ({} active in SVD)",
+        n_cells, k, n_genes, nc
+    );
+
+    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
+}
+
+/// Generic post-hoc gene permutation derived from cell cluster assignments.
+///
+/// Given cell cluster labels (from any clustering method), build a `k × n_genes` centroid
+/// matrix (mean `ln(1+count)` per cluster), SVD it, and sort genes by `(v₁, v₂)`.
+/// This couples gene ordering to cell structure without requiring a method-specific joint
+/// algorithm.
+fn derive_gene_permutation_from_cell_clusters(
+    points: &[Point],
+    data: &CsMat<u16>,
+    cell_labels: &[usize],
+    num_clusters: usize,
+) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
+    let n_genes = data.cols();
+    let k = num_clusters.max(1);
+
+    let mut centroids = vec![0.0f64; k * n_genes];
+    let mut cluster_sizes = vec![0u64; k];
+
+    for (ci, point) in points.iter().enumerate() {
+        let label = cell_labels[ci];
+        if label >= k {
+            continue;
+        }
+        cluster_sizes[label] += 1;
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value != 0 {
+                    centroids[label * n_genes + gene_idx] += (1.0 + value as f64).ln();
+                }
+            }
+        }
+    }
+
+    for c in 0..k {
+        let sz = cluster_sizes[c].max(1) as f64;
+        for g in 0..n_genes {
+            centroids[c * n_genes + g] /= sz;
+        }
+    }
+
+    let mat = DMatrix::from_row_slice(k, n_genes, &centroids);
+    let svd = mat.svd(false, true);
+    let v_t = match svd.v_t {
+        Some(vt) => vt,
+        None => {
+            return Ok(((0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
+        }
+    };
+
+    let n_sv = v_t.nrows().min(2);
+    let mut scores: Vec<(usize, f64, f64)> = (0..n_genes)
+        .map(|g| {
+            let s1 = if n_sv >= 1 { v_t[(0, g)] } else { 0.0 };
+            let s2 = if n_sv >= 2 { v_t[(1, g)] } else { 0.0 };
+            (g, s1, s2)
+        })
+        .collect();
+
+    scores.sort_unstable_by(|a, b| {
+        a.1.total_cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut gene_old_to_new = vec![0u32; n_genes];
+    let mut gene_new_to_old = Vec::with_capacity(n_genes);
+    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
+        gene_old_to_new[old_idx] = new_idx as u32;
+        gene_new_to_old.push(old_idx as u32);
+    }
+
+    info!(
+        "Derived gene permutation from {} cell clusters, {} genes",
+        k, n_genes
+    );
+
+    Ok((gene_new_to_old, gene_old_to_new))
+}
+
+/// Kluger (2003) spectral biclustering, as used in
+/// [cell-squeeze](https://github.com/maharshi95/cell-squeeze).
+///
+/// 1. Bistochastic-normalize the sparse cell×gene matrix (iterative scale-normalize).
+/// 2. SVD → U, V (first `n_components` singular vectors, discard DC).
+/// 3. For each singular vector, fit 1-D k-means to find its best piecewise-constant
+///    approximation; keep the `n_best` vectors with smallest residual.
+/// 4. Row labels: project `X @ V_best`, k-means → `n_row_clusters`.
+/// 5. Col labels: project `X^T @ U_best`, k-means → `n_col_clusters`.
+/// 6. Gene permutation: `argsort(column_labels)`.
+///
+/// Returns `(cell_assignments, gene_new_to_old, gene_old_to_new)`.
+fn joint_bicluster_kluger(
+    points: &[Point],
+    data: &CsMat<u16>,
+    num_row_clusters: usize,
+    num_col_clusters: usize,
+    cluster_seed: Option<u64>,
+) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
+    let n_cells = points.len();
+    let n_genes = data.cols();
+
+    if n_cells == 0 {
+        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
+    }
+
+    let kr = num_row_clusters.max(1).min(n_cells);
+    let kc = num_col_clusters.max(1).min(n_genes);
+
+    // --- Subsample ---
+    let max_rows = 4000usize;
+    let max_cols = 2000usize;
+
+    let mut col_nnz = vec![0u64; n_genes];
+    let mut triplets: Vec<(usize, usize, f64)> = Vec::new();
+    for (ci, point) in points.iter().enumerate() {
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (gene_idx, &value) in row.iter() {
+                if value != 0 {
+                    col_nnz[gene_idx] += 1;
+                    triplets.push((ci, gene_idx, (1.0 + value as f64).ln()));
+                }
+            }
+        }
+    }
+
+    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
+    if active_genes.len() <= 2 || n_cells <= 2 {
+        return Ok((
+            (0..n_cells).map(|i| i % kr).collect(),
+            (0..n_genes as u32).collect(),
+            (0..n_genes as u32).collect(),
+        ));
+    }
+
+    let sampled_rows: Vec<usize> = if n_cells > max_rows {
+        let step = n_cells as f64 / max_rows as f64;
+        (0..max_rows).map(|i| (i as f64 * step) as usize).collect()
+    } else {
+        (0..n_cells).collect()
+    };
+
+    let active_cols: Vec<usize> = if active_genes.len() > max_cols {
+        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+        by_freq.truncate(max_cols);
+        by_freq.sort_unstable_by_key(|&(g, _)| g);
+        by_freq.iter().map(|&(g, _)| g).collect()
+    } else {
+        active_genes.clone()
+    };
+
+    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
+    for (local, &global) in active_cols.iter().enumerate() {
+        col_local.insert(global, local);
+    }
+
+    let nr = sampled_rows.len();
+    let nc = active_cols.len();
+    let sampled_set: HashMap<usize, usize> =
+        sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+
+    // --- Build dense matrix with ln(1+count) ---
+    let mut dense = vec![0.0f64; nr * nc];
+    for &(ci, gene_idx, val) in &triplets {
+        if let Some(&local_row) = sampled_set.get(&ci) {
+            if let Some(&local_col) = col_local.get(&gene_idx) {
+                dense[local_row * nc + local_col] = val;
+            }
+        }
+    }
+
+    // --- Bistochastic normalization (iterative scale-normalize) ---
+    for _ in 0..100 {
+        // Row normalize: each row sums to constant
+        for i in 0..nr {
+            let rsum: f64 = (0..nc).map(|j| dense[i * nc + j]).sum();
+            if rsum > 1e-18 {
+                let s = 1.0 / rsum.sqrt();
+                for j in 0..nc { dense[i * nc + j] *= s; }
+            }
+        }
+        // Column normalize: each column sums to constant
+        for j in 0..nc {
+            let csum: f64 = (0..nr).map(|i| dense[i * nc + j]).sum();
+            if csum > 1e-18 {
+                let s = 1.0 / csum.sqrt();
+                for i in 0..nr { dense[i * nc + j] *= s; }
+            }
+        }
+    }
+
+    // --- SVD ---
+    let n_components = 6usize.min(nr.min(nc).saturating_sub(1)).max(1);
+    let n_best = 3usize.min(n_components);
+    let n_discard = 1usize;
+    let n_sv = n_components + n_discard;
+
+    let mat = DMatrix::from_row_slice(nr, nc, &dense);
+    let svd_result = mat.svd(true, true);
+    let (u_full, v_t_full) = match (svd_result.u, svd_result.v_t) {
+        (Some(u), Some(vt)) => (u, vt),
+        _ => {
+            return Ok((
+                (0..n_cells).map(|i| i % kr).collect(),
+                (0..n_genes as u32).collect(),
+                (0..n_genes as u32).collect(),
+            ));
+        }
+    };
+
+    let r = u_full.ncols();
+    let n_keep = n_sv.min(r).saturating_sub(n_discard);
+    if n_keep == 0 {
+        return Ok((
+            (0..n_cells).map(|i| i % kr).collect(),
+            (0..n_genes as u32).collect(),
+            (0..n_genes as u32).collect(),
+        ));
+    }
+
+    // Extract U[:,1..n_sv] and V[:,1..n_sv] (transposed from V^T)
+    let mut ut_vecs = Vec::with_capacity(n_keep); // each is a row = one singular vector across cells
+    let mut vt_vecs = Vec::with_capacity(n_keep); // each is a row = one singular vector across genes
+    for k in 0..n_keep {
+        let sc = n_discard + k;
+        let u_vec: Vec<f64> = (0..nr).map(|i| u_full[(i, sc)]).collect();
+        let v_vec: Vec<f64> = (0..nc).map(|j| v_t_full[(sc, j)]).collect();
+        ut_vecs.push(u_vec);
+        vt_vecs.push(v_vec);
+    }
+
+    // --- Find n_best vectors: for each, fit 1-D k-means, measure piecewise residual ---
+    fn piecewise_residual(vec: &[f64], n_clusters: usize, seed: u64) -> f64 {
+        let n = vec.len();
+        if n == 0 { return 0.0; }
+        let k = n_clusters.min(n).max(1);
+        let mut embed = Array2::<f64>::zeros((n, 1));
+        for i in 0..n { embed[(i, 0)] = vec[i]; }
+        let dataset = DatasetBase::from(embed);
+        let model = KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed))
+            .max_n_iterations(20)
+            .fit(&dataset);
+        match model {
+            Ok(m) => {
+                let labels = m.predict(&dataset);
+                let centroids = m.centroids();
+                labels.iter().enumerate()
+                    .map(|(i, &l)| {
+                        let diff = vec[i] - centroids[(l, 0)];
+                        diff * diff
+                    })
+                    .sum::<f64>()
+                    .sqrt()
+            }
+            Err(_) => f64::INFINITY,
+        }
+    }
+
+    let seed_base = cluster_seed.unwrap_or(42);
+
+    // Score u-vectors for row selection
+    let mut u_scores: Vec<(usize, f64)> = (0..n_keep)
+        .map(|k| (k, piecewise_residual(&ut_vecs[k], kr, seed_base.wrapping_add(k as u64))))
+        .collect();
+    u_scores.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+    let best_u_indices: Vec<usize> = u_scores.iter().take(n_best).map(|&(i, _)| i).collect();
+
+    // Score v-vectors for column selection
+    let mut v_scores: Vec<(usize, f64)> = (0..n_keep)
+        .map(|k| (k, piecewise_residual(&vt_vecs[k], kc, seed_base.wrapping_add(100 + k as u64))))
+        .collect();
+    v_scores.sort_unstable_by(|a, b| a.1.total_cmp(&b.1));
+    let best_v_indices: Vec<usize> = v_scores.iter().take(n_best).map(|&(i, _)| i).collect();
+
+    // --- Row labels: project X @ V_best, k-means ---
+    // For sampled cells, use dense matrix; for unsampled, project from sparse
+    let n_proj_cols = best_v_indices.len();
+    let mut row_projected = Array2::<f64>::zeros((n_cells, n_proj_cols));
+
+    for ci in 0..n_cells {
+        let point = &points[ci];
+        if let Some(row) = data.outer_view(point.row_index) {
+            for (g, &v) in row.iter() {
+                if v != 0 {
+                    if let Some(&lc) = col_local.get(&g) {
+                        let val = (1.0 + v as f64).ln();
+                        for (pi, &vi) in best_v_indices.iter().enumerate() {
+                            row_projected[(ci, pi)] += val * vt_vecs[vi][lc];
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let row_dataset = DatasetBase::from(row_projected);
+    let row_model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(kr, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(2001)))
+            .max_n_iterations(30)
+            .fit(&row_dataset)
+            .map_err(|e| anyhow::anyhow!("Kluger row k-means failed: {}", e))?
+    } else {
+        KMeans::params(kr)
+            .max_n_iterations(30)
+            .fit(&row_dataset)
+            .map_err(|e| anyhow::anyhow!("Kluger row k-means failed: {}", e))?
+    };
+    let cell_labels: Vec<usize> = row_model.predict(&row_dataset).to_vec();
+
+    // --- Column labels: project X^T @ U_best, k-means ---
+    // Build U_best matrix (nr × n_best_u), then X^T @ U_best gives (n_genes × n_best_u)
+    let n_proj_rows = best_u_indices.len();
+    let mut col_projected = Array2::<f64>::zeros((n_genes, n_proj_rows));
+
+    // For active genes in the SVD, compute the projection directly from the dense submatrix
+    for &global_gene in &active_cols {
+        let lc = col_local[&global_gene];
+        for (pi, &ui) in best_u_indices.iter().enumerate() {
+            let mut dot = 0.0f64;
+            for lr in 0..nr {
+                dot += dense[lr * nc + lc] * ut_vecs[ui][lr];
+            }
+            col_projected[(global_gene, pi)] = dot;
+        }
+    }
+
+    let col_dataset = DatasetBase::from(col_projected);
+    let col_model = if let Some(seed) = cluster_seed {
+        KMeans::params_with_rng(kc, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(3001)))
+            .max_n_iterations(30)
+            .fit(&col_dataset)
+            .map_err(|e| anyhow::anyhow!("Kluger col k-means failed: {}", e))?
+    } else {
+        KMeans::params(kc)
+            .max_n_iterations(30)
+            .fit(&col_dataset)
+            .map_err(|e| anyhow::anyhow!("Kluger col k-means failed: {}", e))?
+    };
+    let gene_cluster_labels: Vec<usize> = col_model.predict(&col_dataset).to_vec();
+
+    // --- Gene permutation: sort by (cluster_label, first projection coordinate) ---
+    let mut gene_scores: Vec<(usize, usize, f64)> = (0..n_genes)
+        .map(|g| {
+            let label = gene_cluster_labels[g];
+            let proj0 = if !best_v_indices.is_empty() && col_local.contains_key(&g) {
+                let lc = col_local[&g];
+                vt_vecs[best_v_indices[0]][lc]
+            } else {
+                f64::INFINITY
+            };
+            (g, label, proj0)
+        })
+        .collect();
+
+    gene_scores.sort_unstable_by(|a, b| {
+        a.1.cmp(&b.1)
+            .then_with(|| a.2.total_cmp(&b.2))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut gene_old_to_new = vec![0u32; n_genes];
+    let mut gene_new_to_old = Vec::with_capacity(n_genes);
+    for (new_idx, &(old_idx, _, _)) in gene_scores.iter().enumerate() {
+        gene_old_to_new[old_idx] = new_idx as u32;
+        gene_new_to_old.push(old_idx as u32);
+    }
+
+    info!(
+        "Kluger SpectralBiclustering: {} cells -> {} row clusters, {} genes -> {} col clusters ({} active in SVD, n_best={})",
+        n_cells, kr, n_genes, kc, nc, n_best
+    );
+
+    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
 }
 
 fn downsample_values(values: &[u16], max_values: usize) -> Vec<u16> {
@@ -2663,6 +3854,9 @@ fn run_clustered_compression(
     spatial_graph: SpatialGraphParams,
     tensor_grid: TensorGridParams,
     cluster_seed: Option<u64>,
+    gene_reorder_method: GeneReorderMethod,
+    bicluster_joint: bool,
+    gene_blocks: usize,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -2670,24 +3864,84 @@ fn run_clustered_compression(
 
     let requested_clusters = quantizers_requested.max(1).min(points.len());
     let features = build_cell_features(points, data, 24)?;
-    let assignments = match cluster_cells(
-        cell_cluster_method,
-        &features,
-        requested_clusters,
-        points,
-        spatial_graph,
-        tensor_grid,
-        cluster_seed,
-    ) {
-        Ok(a) => a,
-        Err(err) => {
-            warn!(
-                "Cell clustering failed ({}). Falling back to round-robin assignment.",
-                err
-            );
-            (0..points.len())
-                .map(|idx| idx % requested_clusters)
-                .collect::<Vec<_>>()
+
+    // --- Joint bicluster path: one operation produces both cell assignments and gene ordering ---
+    let joint_result = if cell_cluster_method == CellClusterMethodArg::CellSqueeze {
+        let n_col_clusters = requested_clusters.min(10).max(2);
+        match joint_bicluster_kluger(points, data, requested_clusters, n_col_clusters, cluster_seed) {
+            Ok(result) => Some(result),
+            Err(e) => {
+                warn!("Kluger SpectralBiclustering failed ({}), falling back to separate cell+gene", e);
+                None
+            }
+        }
+    } else if cell_cluster_method == CellClusterMethodArg::SvdJoint {
+        match joint_svd_seriation(points, data, requested_clusters) {
+            Ok(result) => Some(result),
+            Err(e) => {
+                warn!("Joint SVD seriation failed ({}), falling back to separate cell+gene", e);
+                None
+            }
+        }
+    } else if bicluster_joint && cell_cluster_method == CellClusterMethodArg::Kmeans {
+        match joint_bicluster_svd(points, data, requested_clusters, cluster_seed) {
+            Ok(result) => Some(result),
+            Err(e) => {
+                warn!("Joint bicluster SVD failed ({}), falling back to separate cell+gene", e);
+                None
+            }
+        }
+    } else if bicluster_joint {
+        // Generic bicluster: cluster cells with the specified method, then derive gene
+        // ordering from the cell cluster centroids via SVD.
+        let cell_assignments = match cluster_cells(
+            cell_cluster_method,
+            &features,
+            requested_clusters,
+            points,
+            spatial_graph,
+            tensor_grid,
+            cluster_seed,
+        ) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Cell clustering for bicluster failed ({}), using round-robin", e);
+                (0..points.len()).map(|i| i % requested_clusters).collect()
+            }
+        };
+        match derive_gene_permutation_from_cell_clusters(points, data, &cell_assignments, requested_clusters) {
+            Ok((n2o, o2n)) => Some((cell_assignments, n2o, o2n)),
+            Err(e) => {
+                warn!("Gene permutation from clusters failed ({}), falling back to independent", e);
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let assignments = if let Some((ref cell_labels, _, _)) = joint_result {
+        cell_labels.clone()
+    } else {
+        match cluster_cells(
+            cell_cluster_method,
+            &features,
+            requested_clusters,
+            points,
+            spatial_graph,
+            tensor_grid,
+            cluster_seed,
+        ) {
+            Ok(a) => a,
+            Err(err) => {
+                warn!(
+                    "Cell clustering failed ({}). Falling back to round-robin assignment.",
+                    err
+                );
+                (0..points.len())
+                    .map(|idx| idx % requested_clusters)
+                    .collect::<Vec<_>>()
+            }
         }
     };
 
@@ -2757,11 +4011,54 @@ fn run_clustered_compression(
         );
     }
 
-    let (gene_order, gene_old_to_new) = compute_gene_permutation_from_row_stream(
-        points,
-        &quantized_data,
-        &row_stream_point_indices,
-    )?;
+    let (gene_order, gene_old_to_new) = if let Some((_, ref new_to_old, ref old_to_new)) = joint_result {
+        info!("Using gene ordering from joint bicluster SVD");
+        (new_to_old.clone(), old_to_new.clone())
+    } else {
+        match gene_reorder_method {
+            GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
+                points,
+                &quantized_data,
+                &row_stream_point_indices,
+            )?,
+            GeneReorderMethod::Svd => compute_gene_permutation_svd(
+                points,
+                &quantized_data,
+                &row_stream_point_indices,
+            )?,
+            GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
+                points,
+                &quantized_data,
+                &row_stream_point_indices,
+                cluster_seed,
+            )?,
+        }
+    };
+
+    // Build per-gene-block column masks.  When gene_blocks <= 1 the single "block" is
+    // the full gene set and we skip the column-filtering overhead entirely.
+    let n_genes = data.cols();
+    let effective_gene_blocks = gene_blocks.max(1).min(n_genes);
+    let gene_block_ranges: Vec<std::ops::Range<u32>> = {
+        let block_sz = n_genes / effective_gene_blocks;
+        let remainder = n_genes % effective_gene_blocks;
+        let mut ranges = Vec::with_capacity(effective_gene_blocks);
+        let mut start = 0u32;
+        for b in 0..effective_gene_blocks {
+            let sz = block_sz + if b < remainder { 1 } else { 0 };
+            ranges.push(start..start + sz as u32);
+            start += sz as u32;
+        }
+        ranges
+    };
+
+    if effective_gene_blocks > 1 {
+        info!(
+            "Gene blocking: {} blocks, sizes {:?}",
+            effective_gene_blocks,
+            gene_block_ranges.iter().map(|r| r.len()).collect::<Vec<_>>()
+        );
+    }
 
     let mut encoded_blocks = Vec::new();
     let mut positions = Vec::new();
@@ -2769,11 +4066,146 @@ fn run_clustered_compression(
     let mut cluster_sizes = Vec::new();
     let mut total_mst_bytes = 0usize;
 
+    // Precompute per-gene-block old→new mappings once (shared across all cell clusters).
+    let block_gene_o2ns: Vec<Vec<u32>> = gene_block_ranges
+        .iter()
+        .map(|range| {
+            if effective_gene_blocks > 1 {
+                let mut o2n = vec![u32::MAX; n_genes];
+                for (new, old_remapped) in range.clone().enumerate() {
+                    let orig = gene_order[old_remapped as usize] as usize;
+                    if orig < n_genes {
+                        o2n[orig] = new as u32;
+                    }
+                }
+                o2n
+            } else {
+                gene_old_to_new.clone()
+            }
+        })
+        .collect();
+
+    let encode_tile = |cluster_points: &[Point],
+                       block_gene_o2n: &[u32],
+                       cluster_idx: usize|
+     -> anyhow::Result<(EncodedClusterBlock, Vec<u32>, usize, bool, bool)> {
+
+        let mut row_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+        let mut col_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+        let mut row_selected_adaptive = false;
+        let mut col_selected_adaptive = false;
+
+        if matches!(
+            cluster_encoding,
+            ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
+        ) {
+            let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+            let mut try_row_encode = |adaptive: bool| {
+                if let Some((row_block, dfs_order)) = encode_subarray_mst_with_metric(
+                    cluster_points,
+                    &quantized_data,
+                    knn_metric,
+                    mst_weight_mode,
+                    Some(block_gene_o2n),
+                    index_codec,
+                    sorted_index_codec,
+                    full_row_fallback_ratio,
+                    forest_cut_factor,
+                    adaptive,
+                    row_template_max,
+                ) {
+                    let bytes = row_block.total_bytes();
+                    if best_row.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
+                        best_row =
+                            Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
+                        row_selected_adaptive = adaptive;
+                    }
+                }
+            };
+
+            try_row_encode(row_template_adaptive);
+            if row_template_adaptive {
+                try_row_encode(false);
+            }
+            row_candidate = best_row;
+        }
+
+        if matches!(
+            cluster_encoding,
+            ClusterEncodingArg::Column | ClusterEncodingArg::Hybrid
+        ) {
+            let mut best_col: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+            let mut try_col_encode = |adaptive: bool| {
+                if let Some(col_block) = encode_subarray_column(
+                    cluster_points,
+                    &quantized_data,
+                    Some(block_gene_o2n),
+                    index_codec,
+                    sorted_index_codec,
+                    column_template_count,
+                    adaptive,
+                    column_template_max,
+                ) {
+                    let (col_block, order) = col_block;
+                    let bytes = col_block.total_bytes();
+                    if best_col.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
+                        best_col = Some((EncodedClusterBlock::Column(col_block), order, bytes));
+                        col_selected_adaptive = adaptive;
+                    }
+                }
+            };
+
+            try_col_encode(column_template_adaptive);
+            if column_template_adaptive {
+                try_col_encode(false);
+            }
+            col_candidate = best_col;
+        }
+
+        let row_available = row_candidate.is_some();
+        let col_available = col_candidate.is_some();
+        let (encoded, local_order, bytes) = match cluster_encoding {
+            ClusterEncodingArg::Row => row_candidate.ok_or_else(|| {
+                anyhow::anyhow!("Row-MST encoding failed for cluster {}", cluster_idx)
+            })?,
+            ClusterEncodingArg::Column => col_candidate.ok_or_else(|| {
+                anyhow::anyhow!("Column encoding failed for cluster {}", cluster_idx)
+            })?,
+            ClusterEncodingArg::Hybrid => match (row_candidate, col_candidate) {
+                (Some(r), Some(c)) => {
+                    if r.2 <= c.2 {
+                        r
+                    } else {
+                        c
+                    }
+                }
+                (Some(r), None) => r,
+                (None, Some(c)) => c,
+                (None, None) => {
+                    return Err(anyhow::anyhow!(
+                        "Both row and column encoding failed for cluster {} gene-block",
+                        cluster_idx
+                    ))
+                }
+            },
+        };
+
+        Ok((
+            encoded,
+            local_order,
+            bytes,
+            row_template_adaptive && row_available && !row_selected_adaptive,
+            column_template_adaptive && col_available && !col_selected_adaptive,
+        ))
+    };
+
+    // Each cluster produces one or more encoded blocks (one per gene block).
+    // positions / row_order come from the first gene block's DFS order.
     let cluster_results: Vec<
         anyhow::Result<
             Option<(
                 usize,
-                EncodedClusterBlock,
+                Vec<EncodedClusterBlock>,
                 Vec<DatalessPoint>,
                 Vec<u32>,
                 usize,
@@ -2792,106 +4224,26 @@ fn run_clustered_compression(
 
             let cluster_points: Vec<Point> =
                 cluster.iter().map(|&idx| points[idx].clone()).collect();
-            let mut row_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-            let mut col_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-            let mut row_selected_adaptive = false;
-            let mut col_selected_adaptive = false;
 
-            if matches!(
-                cluster_encoding,
-                ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
-            ) {
-                let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-                let mut try_row_encode = |adaptive: bool| {
-                    if let Some((row_block, dfs_order)) = encode_subarray_mst_with_metric(
-                        &cluster_points,
-                        &quantized_data,
-                        knn_metric,
-                        mst_weight_mode,
-                        Some(&gene_old_to_new),
-                        index_codec,
-                        sorted_index_codec,
-                        full_row_fallback_ratio,
-                        forest_cut_factor,
-                        adaptive,
-                        row_template_max,
-                    ) {
-                        let bytes = row_block.total_bytes();
-                        if best_row.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
-                            best_row =
-                                Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
-                            row_selected_adaptive = adaptive;
-                        }
-                    }
-                };
+            let mut tile_blocks = Vec::with_capacity(effective_gene_blocks);
+            let mut total_bytes = 0usize;
+            let mut first_order: Option<Vec<u32>> = None;
+            let mut any_row_fallback = false;
+            let mut any_col_fallback = false;
 
-                try_row_encode(row_template_adaptive);
-                if row_template_adaptive {
-                    try_row_encode(false);
+            for (gb_idx, _gene_block_range) in gene_block_ranges.iter().enumerate() {
+                let (encoded, local_order, bytes, row_fb, col_fb) =
+                    encode_tile(&cluster_points, &block_gene_o2ns[gb_idx], cluster_idx)?;
+                total_bytes += bytes;
+                if first_order.is_none() {
+                    first_order = Some(local_order);
                 }
-                row_candidate = best_row;
+                any_row_fallback |= row_fb;
+                any_col_fallback |= col_fb;
+                tile_blocks.push(encoded);
             }
 
-            if matches!(
-                cluster_encoding,
-                ClusterEncodingArg::Column | ClusterEncodingArg::Hybrid
-            ) {
-                let mut best_col: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-                let mut try_col_encode = |adaptive: bool| {
-                    if let Some(col_block) = encode_subarray_column(
-                        &cluster_points,
-                        &quantized_data,
-                        Some(&gene_old_to_new),
-                        index_codec,
-                        sorted_index_codec,
-                        column_template_count,
-                        adaptive,
-                        column_template_max,
-                    ) {
-                        let (col_block, order) = col_block;
-                        let bytes = col_block.total_bytes();
-                        if best_col.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
-                            best_col = Some((EncodedClusterBlock::Column(col_block), order, bytes));
-                            col_selected_adaptive = adaptive;
-                        }
-                    }
-                };
-
-                try_col_encode(column_template_adaptive);
-                if column_template_adaptive {
-                    try_col_encode(false);
-                }
-                col_candidate = best_col;
-            }
-
-            let row_available = row_candidate.is_some();
-            let col_available = col_candidate.is_some();
-            let (encoded, local_order, bytes) = match cluster_encoding {
-                ClusterEncodingArg::Row => row_candidate.ok_or_else(|| {
-                    anyhow::anyhow!("Row-MST encoding failed for cluster {}", cluster_idx)
-                })?,
-                ClusterEncodingArg::Column => col_candidate.ok_or_else(|| {
-                    anyhow::anyhow!("Column encoding failed for cluster {}", cluster_idx)
-                })?,
-                ClusterEncodingArg::Hybrid => match (row_candidate, col_candidate) {
-                    (Some(r), Some(c)) => {
-                        if r.2 <= c.2 {
-                            r
-                        } else {
-                            c
-                        }
-                    }
-                    (Some(r), None) => r,
-                    (None, Some(c)) => c,
-                    (None, None) => {
-                        return Err(anyhow::anyhow!(
-                            "Both row and column encoding failed for cluster {}",
-                            cluster_idx
-                        ))
-                    }
-                },
-            };
-
+            let local_order = first_order.unwrap_or_else(|| (0..cluster_points.len() as u32).collect());
             let mut cluster_positions = Vec::with_capacity(cluster_points.len());
             let mut cluster_row_order = Vec::with_capacity(cluster_points.len());
 
@@ -2906,13 +4258,13 @@ fn run_clustered_compression(
 
             Ok(Some((
                 cluster_idx,
-                encoded,
+                tile_blocks,
                 cluster_positions,
                 cluster_row_order,
                 cluster_points.len(),
-                bytes,
-                row_template_adaptive && row_available && !row_selected_adaptive,
-                column_template_adaptive && col_available && !col_selected_adaptive,
+                total_bytes,
+                any_row_fallback,
+                any_col_fallback,
             )))
         })
         .collect();
@@ -2933,7 +4285,7 @@ fn run_clustered_compression(
     let mut col_value_model_per_gene_blocks = 0usize;
     for (
         _idx,
-        encoded,
+        tile_blocks,
         cluster_positions,
         cluster_row_order,
         cluster_ncells,
@@ -2948,14 +4300,16 @@ fn run_clustered_compression(
         if col_fallback_used {
             col_adaptive_fallback_wins += 1;
         }
-        match &encoded {
-            EncodedClusterBlock::RowMst(_) => row_block_count += 1,
-            EncodedClusterBlock::Column(block) => {
-                column_block_count += 1;
-                if block.uses_per_gene_values() {
-                    col_value_model_per_gene_blocks += 1;
-                } else {
-                    col_value_model_global_blocks += 1;
+        for encoded in &tile_blocks {
+            match encoded {
+                EncodedClusterBlock::RowMst(_) => row_block_count += 1,
+                EncodedClusterBlock::Column(block) => {
+                    column_block_count += 1;
+                    if block.uses_per_gene_values() {
+                        col_value_model_per_gene_blocks += 1;
+                    } else {
+                        col_value_model_global_blocks += 1;
+                    }
                 }
             }
         }
@@ -2963,7 +4317,7 @@ fn run_clustered_compression(
         cluster_sizes.push(cluster_ncells);
         positions.extend(cluster_positions);
         row_order.extend(cluster_row_order);
-        encoded_blocks.push(encoded);
+        encoded_blocks.extend(tile_blocks);
     }
 
     info!(
@@ -3254,7 +4608,7 @@ struct BuildCommand {
     #[arg(long = "cluster-seed")]
     cluster_seed: Option<u64>,
     /// If set, run all cell-cluster methods and append one stats row per method.
-    #[arg(long = "cell-cluster-method-sweep-all", default_value_t = false)]
+    #[arg(long = "cell-cluster-method-sweep-all", visible_alias = "cluster-all", default_value_t = false)]
     cell_cluster_method_sweep_all: bool,
     /// For `spatial-graph`: number of spatial \((x,y)\) nearest neighbors per cell.
     #[arg(long = "cell-cluster-spatial-knn", default_value_t = 12)]
@@ -3280,6 +4634,15 @@ struct BuildCommand {
     /// For `tensor-grid`: use one-hot tile dims when number of tiles ≤ this (else 2D tile centers).
     #[arg(long = "cell-cluster-grid-onehot-max", default_value_t = 64)]
     cell_cluster_grid_onehot_max: usize,
+    /// How to compute the gene (column) reordering: `projection` (hash-projection seriation, fast)
+    /// or `svd` (truncated SVD on the sparse matrix, uses right singular vectors).
+    #[arg(long = "gene-reorder-method", value_enum, default_value_t = GeneReorderMethod::Projection)]
+    gene_reorder_method: GeneReorderMethod,
+    /// True joint biclustering: one SVD on the full sparse cell×gene matrix produces
+    /// both cell cluster assignments and gene ordering simultaneously.  Overrides
+    /// `--cell-cluster-method` and `--gene-reorder-method` when set.
+    #[arg(long = "bicluster", default_value_t = false)]
+    bicluster_joint: bool,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -3295,6 +4658,10 @@ struct BuildCommand {
     /// Enable adaptive row-template mode for row-MST payloads.
     #[arg(long = "row-template-adaptive", default_value_t = false)]
     row_template_adaptive: bool,
+    /// Split genes into this many contiguous blocks (after reordering) and build
+    /// MST independently on each (cell_cluster × gene_block) tile.  Default 1 = no splitting.
+    #[arg(long = "gene-blocks", default_value_t = 1)]
+    gene_blocks: usize,
     /// Maximum number of row templates to consider in adaptive mode.
     #[arg(long = "row-template-max", default_value_t = 16)]
     row_template_max: usize,
@@ -3326,8 +4693,7 @@ fn cell_cluster_method_name(method: CellClusterMethodArg) -> String {
         .unwrap_or_else(|| format!("{:?}", method).to_lowercase())
 }
 
-fn output_path_with_method_suffix(base: &Path, method: CellClusterMethodArg) -> PathBuf {
-    let method_name = cell_cluster_method_name(method);
+fn output_path_with_label_suffix(base: &Path, label: &str) -> PathBuf {
     let file_name = base
         .file_name()
         .and_then(|s| s.to_str())
@@ -3336,12 +4702,12 @@ fn output_path_with_method_suffix(base: &Path, method: CellClusterMethodArg) -> 
 
     if file_name.ends_with(".bin.gz") {
         let stem = file_name.trim_end_matches(".bin.gz");
-        parent.join(format!("{}_{}.bin.gz", stem, method_name))
+        parent.join(format!("{}_{}.bin.gz", stem, label))
     } else if let Some(dot) = file_name.rfind('.') {
         let (stem, ext) = file_name.split_at(dot);
-        parent.join(format!("{}_{}{}", stem, method_name, ext))
+        parent.join(format!("{}_{}{}", stem, label, ext))
     } else {
-        parent.join(format!("{}_{}", file_name, method_name))
+        parent.join(format!("{}_{}", file_name, label))
     }
 }
 
@@ -3349,6 +4715,7 @@ fn append_build_stats_csv(
     csv_path: &Path,
     stats_label: &str,
     cell_cluster_method: &str,
+    gene_reorder_method: &str,
     input_matrix_bytes: usize,
     input_positions_bytes: usize,
     mst_uncompressed_bytes: usize,
@@ -3385,6 +4752,7 @@ fn append_build_stats_csv(
         wtr.write_record([
             "stats_csv",
             "cell_cluster_method",
+            "gene_reorder_method",
             "input_matrix_bytes",
             "input_positions_bytes",
             "input_bytes_sum",
@@ -3408,6 +4776,7 @@ fn append_build_stats_csv(
     wtr.write_record([
         stats_label.to_string(),
         cell_cluster_method.to_string(),
+        gene_reorder_method.to_string(),
         input_matrix_bytes.to_string(),
         input_positions_bytes.to_string(),
         input_bytes_sum.to_string(),
@@ -3539,16 +4908,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.row_template_max
             );
 
-            let method_sweep: Vec<CellClusterMethodArg> = if args.cell_cluster_method_sweep_all {
-                CellClusterMethodArg::value_variants().to_vec()
-            } else {
-                vec![args.cell_cluster_method]
-            };
+            // Each sweep config: (cell_method, gene_method, bicluster_joint, label)
+            let mut sweep_configs: Vec<(CellClusterMethodArg, GeneReorderMethod, bool, String)> = Vec::new();
 
-            for &cell_cluster_method in &method_sweep {
+            if args.cell_cluster_method_sweep_all {
+                for &cm in CellClusterMethodArg::value_variants() {
+                    let label = cell_cluster_method_name(cm);
+                    sweep_configs.push((cm, args.gene_reorder_method, false, label));
+                }
+                // Add bicluster variants: each cell method + gene ordering derived from clusters.
+                // Skip inherently-joint methods (CellSqueeze, SvdJoint) — they already
+                // produce joint gene ordering in the non-bicluster entries above.
+                for &cm in CellClusterMethodArg::value_variants() {
+                    if cm == CellClusterMethodArg::CellSqueeze
+                        || cm == CellClusterMethodArg::SvdJoint
+                    {
+                        continue;
+                    }
+                    let label = format!("{}-bicluster", cell_cluster_method_name(cm));
+                    sweep_configs.push((cm, args.gene_reorder_method, true, label));
+                }
+            } else if args.bicluster_joint {
+                let label = format!("{}-bicluster", cell_cluster_method_name(args.cell_cluster_method));
+                sweep_configs.push((
+                    args.cell_cluster_method,
+                    args.gene_reorder_method,
+                    true,
+                    label,
+                ));
+            } else {
+                let label = cell_cluster_method_name(args.cell_cluster_method);
+                sweep_configs.push((args.cell_cluster_method, args.gene_reorder_method, false, label));
+            }
+
+            for (cell_cluster_method, gene_reorder_method, bicluster_joint, config_label) in &sweep_configs {
+                let is_joint = *bicluster_joint
+                    || *cell_cluster_method == CellClusterMethodArg::CellSqueeze
+                    || *cell_cluster_method == CellClusterMethodArg::SvdJoint;
+                let gene_method_label = if is_joint {
+                    config_label.clone()
+                } else {
+                    gene_reorder_method
+                        .to_possible_value()
+                        .map(|v| v.get_name().to_string())
+                        .unwrap_or_else(|| format!("{:?}", gene_reorder_method).to_lowercase())
+                };
                 info!(
-                    "Running build for cell_cluster_method={}",
-                    cell_cluster_method_name(cell_cluster_method)
+                    "Running build: cell={}, gene={}, bicluster={}",
+                    config_label, gene_method_label, bicluster_joint
                 );
                 let mut metrics = Vec::new();
                 let mut selected: Option<CompressionResult> = None;
@@ -3574,10 +4981,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.column_template_max,
                         args.row_template_adaptive,
                         args.row_template_max,
-                        cell_cluster_method,
+                        *cell_cluster_method,
                         spatial_graph,
                         tensor_grid,
                         args.cluster_seed,
+                        *gene_reorder_method,
+                        *bicluster_joint,
+                        args.gene_blocks,
                     )?;
 
                     info!(
@@ -3637,8 +5047,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .output
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
-                if method_sweep.len() > 1 {
-                    output = output_path_with_method_suffix(&output, cell_cluster_method);
+                if sweep_configs.len() > 1 {
+                    output = output_path_with_label_suffix(&output, config_label);
                 }
                 let file = File::create(&output)?;
                 let writer = BufWriter::new(file);
@@ -3726,7 +5136,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 append_build_stats_csv(
                     stats_path,
                     &stats_label,
-                    &cell_cluster_method_name(cell_cluster_method),
+                    config_label,
+                    &gene_method_label,
                     input_matrix_bytes,
                     input_positions_bytes,
                     selected.total_mst_bytes,
@@ -3808,6 +5219,101 @@ mod tests {
     use super::*;
     use sprs::TriMatI;
 
+    fn assert_is_full_permutation(values: &[u32], expected_len: usize, label: &str) {
+        assert_eq!(
+            values.len(),
+            expected_len,
+            "{} length mismatch: got {}, expected {}",
+            label,
+            values.len(),
+            expected_len
+        );
+        let mut sorted = values.to_vec();
+        sorted.sort_unstable();
+        let expected: Vec<u32> = (0..expected_len as u32).collect();
+        assert_eq!(
+            sorted, expected,
+            "{} is not a full [0, n) permutation",
+            label
+        );
+    }
+
+    fn run_tiled_roundtrip_with_encoding(cluster_encoding: ClusterEncodingArg) {
+        let n_cells = 18usize;
+        let n_genes = 15usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            let cell_group = cell / 6;
+            let base_gene = cell_group * 5;
+            for offset in 0..5 {
+                let gene = (base_gene + offset) % n_genes;
+                let value = ((cell + 3 * offset + 1) % 11 + 1) as u16;
+                tri.add_triplet(cell, gene, value);
+            }
+            // Add one cross-group signal so each cell has shared support too.
+            tri.add_triplet(cell, (cell * 7 + 2) % n_genes, ((cell % 5) + 2) as u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new((i % 6) as f64, (i / 6) as f64, i))
+            .collect();
+
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            cluster_encoding,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::Kmeans,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+            Some(7),
+            GeneReorderMethod::Svd,
+            false,
+            3,
+        )
+        .unwrap_or_else(|e| panic!("tiled {:?} compression failed: {}", cluster_encoding, e));
+
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+        assert_eq!(result.positions.len(), n_cells);
+        assert_is_full_permutation(&result.row_order, n_cells, "row_order");
+        assert_is_full_permutation(&result.gene_order, n_genes, "gene_order");
+
+        let reconstructed = reconstruct_csr_from_clustered_payload(
+            &result.encoded_blocks,
+            &result.row_order,
+            &result.gene_order,
+            n_cells,
+            n_genes,
+        )
+        .expect("reconstruct tiled payload");
+        compare_csr_exact(&csr, &reconstructed).expect("tiled payload must round-trip");
+    }
+
+    #[test]
+    fn row_mst_gene_tiling_roundtrip_preserves_original_indices() {
+        run_tiled_roundtrip_with_encoding(ClusterEncodingArg::Row);
+    }
+
+    #[test]
+    fn column_gene_tiling_roundtrip_preserves_original_indices() {
+        run_tiled_roundtrip_with_encoding(ClusterEncodingArg::Column);
+    }
+
     #[test]
     fn lossy_mode_respects_max_cluster_size() {
         let n_cells = 24usize;
@@ -3853,6 +5359,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+            1,
         )
         .expect("lossy compression should succeed");
 
@@ -3905,6 +5414,9 @@ mod tests {
                 SpatialGraphParams::default(),
                 TensorGridParams::default(),
                 None,
+                GeneReorderMethod::Projection,
+                false,
+                1,
             )
             .expect("compression")
         };
@@ -3956,6 +5468,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("spectral cocluster path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -3997,6 +5512,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("svd-kmeans path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4038,6 +5556,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("binary-l0-kmeans path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4079,6 +5600,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("bicluster-swapped path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4120,6 +5644,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("bicluster-l0 path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4161,6 +5688,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("fabia path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4202,6 +5732,9 @@ mod tests {
             SpatialGraphParams::default(),
             TensorGridParams::default(),
             None,
+            GeneReorderMethod::Projection,
+            false,
+                    1,
         )
         .expect("spatial-graph path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
@@ -4254,6 +5787,9 @@ mod tests {
                     onehot_max_tiles: 64,
                 },
                 None,
+                GeneReorderMethod::Projection,
+                false,
+                            1,
             )
             .unwrap_or_else(|e| panic!("tensor-grid {}: {}", label, e));
             assert_eq!(
@@ -4262,6 +5798,194 @@ mod tests {
                 "tensor-grid {}",
                 label
             );
+        }
+    }
+
+    #[test]
+    fn bicluster_joint_runs_on_toy_matrix() {
+        let n_cells = 12usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, (cell as u16 + 1) * 3);
+            tri.add_triplet(cell, (cell + 1) % n_genes, 5u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, (i % 3) as f64, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::Kmeans,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+            Some(42),
+            GeneReorderMethod::Projection,
+            true,
+                    1,
+        )
+        .expect("bicluster-joint path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn cell_squeeze_kluger_runs_on_toy_matrix() {
+        let n_cells = 12usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, (cell as u16 + 1) * 3);
+            tri.add_triplet(cell, (cell + 1) % n_genes, 5u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, (i % 3) as f64, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::CellSqueeze,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+            Some(42),
+            GeneReorderMethod::Projection,
+            false,
+                    1,
+        )
+        .expect("cell-squeeze/Kluger path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn svd_joint_seriation_runs_on_toy_matrix() {
+        let n_cells = 12usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, (cell as u16 + 1) * 3);
+            tri.add_triplet(cell, (cell + 1) % n_genes, 5u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, (i % 3) as f64, i))
+            .collect();
+        let result = run_clustered_compression(
+            &points,
+            &csr,
+            3,
+            8,
+            false,
+            false,
+            None,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::EliasFano,
+            Some(1.0),
+            None,
+            ClusterEncodingArg::Hybrid,
+            0,
+            false,
+            32,
+            false,
+            16,
+            CellClusterMethodArg::SvdJoint,
+            SpatialGraphParams::default(),
+            TensorGridParams::default(),
+            Some(42),
+            GeneReorderMethod::Projection,
+            false,
+                    1,
+        )
+        .expect("svd-joint seriation path");
+        assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
+    }
+
+    #[test]
+    fn generic_bicluster_wrapper_runs_for_multiple_methods() {
+        let n_cells = 12usize;
+        let n_genes = 8usize;
+        let mut tri = TriMatI::<u16, usize>::new((n_cells, n_genes));
+        for cell in 0..n_cells {
+            tri.add_triplet(cell, cell % n_genes, (cell as u16 + 1) * 3);
+            tri.add_triplet(cell, (cell + 1) % n_genes, 5u16);
+        }
+        let csr = tri.to_csr::<usize>();
+        let points: Vec<Point> = (0..n_cells)
+            .map(|i| Point::new(i as f64, (i % 3) as f64, i))
+            .collect();
+
+        for method in [
+            CellClusterMethodArg::BiclusterL0,
+            CellClusterMethodArg::BiclusterSwapped,
+            CellClusterMethodArg::SpectralCocluster,
+            CellClusterMethodArg::Fabia,
+        ] {
+            let result = run_clustered_compression(
+                &points,
+                &csr,
+                3,
+                8,
+                false,
+                false,
+                None,
+                KnnDistanceMetric::L0,
+                MstWeightMode::Metric,
+                IndexStreamCodec::Arithmetic,
+                SortedIndexCodec::EliasFano,
+                Some(1.0),
+                None,
+                ClusterEncodingArg::Hybrid,
+                0,
+                false,
+                32,
+                false,
+                16,
+                method,
+                SpatialGraphParams::default(),
+                TensorGridParams::default(),
+                Some(42),
+                GeneReorderMethod::Projection,
+                true,
+                1,
+            )
+            .unwrap_or_else(|e| panic!("{:?}-bicluster failed: {}", method, e));
+            assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
         }
     }
 }
