@@ -22,13 +22,15 @@ use sorted_indices::SortedIndexCodec;
 use sprs::CsMat;
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
 use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
+use zstd::stream::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 
 use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
@@ -103,6 +105,23 @@ impl From<SortedIndexCodecArg> for SortedIndexCodec {
         match value {
             SortedIndexCodecArg::Delta => SortedIndexCodec::Delta,
             SortedIndexCodecArg::EliasFano => SortedIndexCodec::EliasFano,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum PayloadCompressionArg {
+    Gzip,
+    Zstd,
+    SevenZip,
+}
+
+impl PayloadCompressionArg {
+    fn extension(self) -> &'static str {
+        match self {
+            PayloadCompressionArg::Gzip => "gz",
+            PayloadCompressionArg::Zstd => "zst",
+            PayloadCompressionArg::SevenZip => "7z",
         }
     }
 }
@@ -2194,21 +2213,85 @@ fn sparse_quantization_sse(original: &CsMat<u16>, quantized: &CsMat<u16>) -> any
     Ok(sse)
 }
 
-fn estimate_gzip_payload_size(
+fn serialize_payload(
+    encoded_blocks: &[EncodedClusterBlock],
+    positions: &[DatalessPoint],
+    row_order: &[u32],
+    gene_order: &[u32],
+) -> anyhow::Result<Vec<u8>> {
+    let config = bincode::config::standard()
+        .with_little_endian()
+        .with_fixed_int_encoding();
+    let mut payload = Vec::new();
+    bincode::encode_into_std_write(encoded_blocks, &mut payload, config)?;
+    bincode::encode_into_std_write(positions, &mut payload, config)?;
+    bincode::encode_into_std_write(row_order, &mut payload, config)?;
+    bincode::encode_into_std_write(gene_order, &mut payload, config)?;
+    Ok(payload)
+}
+
+fn compress_payload_bytes(
+    raw_payload: &[u8],
+    compression: PayloadCompressionArg,
+) -> anyhow::Result<Vec<u8>> {
+    match compression {
+        PayloadCompressionArg::Gzip => {
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(raw_payload)?;
+            Ok(encoder.finish()?)
+        }
+        PayloadCompressionArg::Zstd => {
+            let mut encoder = ZstdEncoder::new(Vec::new(), 3)?;
+            encoder.write_all(raw_payload)?;
+            Ok(encoder.finish()?)
+        }
+        PayloadCompressionArg::SevenZip => {
+            let nonce = format!(
+                "{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            );
+            let raw_path = std::env::temp_dir().join(format!("quadtree_payload_{}.bin", nonce));
+            let archive_path = std::env::temp_dir().join(format!("quadtree_payload_{}.7z", nonce));
+            std::fs::write(&raw_path, raw_payload)?;
+            let status = Command::new("7z")
+                .arg("a")
+                .arg("-t7z")
+                .arg("-mx=9")
+                .arg("-y")
+                .arg(&archive_path)
+                .arg(&raw_path)
+                .status()?;
+            if !status.success() {
+                let _ = std::fs::remove_file(&raw_path);
+                let _ = std::fs::remove_file(&archive_path);
+                anyhow::bail!("7z compression failed");
+            }
+            let archive = std::fs::read(&archive_path)?;
+            let _ = std::fs::remove_file(&raw_path);
+            let _ = std::fs::remove_file(&archive_path);
+            Ok(archive)
+        }
+    }
+}
+
+fn estimate_compressed_payload_size(
+    compression: PayloadCompressionArg,
     encoded_blocks: &[EncodedClusterBlock],
     positions: &[DatalessPoint],
     row_order: &[u32],
     gene_order: &[u32],
 ) -> anyhow::Result<usize> {
-    let config = bincode::config::standard()
-        .with_little_endian()
-        .with_fixed_int_encoding();
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    bincode::encode_into_std_write(encoded_blocks, &mut encoder, config)?;
-    bincode::encode_into_std_write(positions, &mut encoder, config)?;
-    bincode::encode_into_std_write(row_order, &mut encoder, config)?;
-    bincode::encode_into_std_write(gene_order, &mut encoder, config)?;
-    Ok(encoder.finish()?.len())
+    let payload = serialize_payload(
+        encoded_blocks,
+        positions,
+        row_order,
+        gene_order,
+    )?;
+    Ok(compress_payload_bytes(&payload, compression)?.len())
 }
 
 #[derive(Default)]
@@ -2852,6 +2935,7 @@ fn run_clustered_compression(
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
     gene_blocks: usize,
+    payload_compression: PayloadCompressionArg,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -3309,16 +3393,21 @@ fn run_clustered_compression(
     let total_entries = (points.len() * data.cols()).max(1);
     let mse = sse / total_entries as f64;
     let rmse = mse.sqrt();
-    let gzip_bytes_estimate =
-        estimate_gzip_payload_size(&encoded_blocks, &positions, &row_order, &gene_order)?;
-    let rate_bits_per_value = (gzip_bytes_estimate as f64 * 8.0) / total_entries as f64;
+    let compressed_bytes_estimate = estimate_compressed_payload_size(
+        payload_compression,
+        &encoded_blocks,
+        &positions,
+        &row_order,
+        &gene_order,
+    )?;
+    let rate_bits_per_value = (compressed_bytes_estimate as f64 * 8.0) / total_entries as f64;
 
     Ok(CompressionResult {
         quantizers_requested: cell_blocks_requested,
         quantizers_used: clusters.len(),
         quantizer_bins,
         total_mst_bytes,
-        gzip_bytes_estimate,
+        gzip_bytes_estimate: compressed_bytes_estimate,
         rate_bits_per_value,
         mse,
         rmse,
@@ -3332,25 +3421,68 @@ fn run_clustered_compression(
 
 fn decode_clustered_payload(
     input: &Path,
+    input_compression: Option<PayloadCompressionArg>,
 ) -> anyhow::Result<(
     Vec<EncodedClusterBlock>,
     Vec<DatalessPoint>,
     Vec<u32>,
     Vec<u32>,
 )> {
-    let file = File::open(input)?;
-    let mut reader = BufReader::new(file);
-    let gz = GzDecoder::new(&mut reader);
-    let mut gz_reader = BufReader::new(gz);
+    let compression = input_compression.unwrap_or_else(|| {
+        input
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| {
+                if ext.eq_ignore_ascii_case("gz") {
+                    PayloadCompressionArg::Gzip
+                } else if ext.eq_ignore_ascii_case("7z") {
+                    PayloadCompressionArg::SevenZip
+                } else {
+                    PayloadCompressionArg::Zstd
+                }
+            })
+            .unwrap_or(PayloadCompressionArg::Zstd)
+    });
     let config = bincode::config::standard()
         .with_little_endian()
         .with_fixed_int_encoding();
 
+    let raw_payload = match compression {
+        PayloadCompressionArg::Gzip => {
+            let file = File::open(input)?;
+            let mut reader = BufReader::new(file);
+            let mut gz_reader = BufReader::new(GzDecoder::new(&mut reader));
+            let mut raw = Vec::new();
+            std::io::Read::read_to_end(&mut gz_reader, &mut raw)?;
+            raw
+        }
+        PayloadCompressionArg::Zstd => {
+            let file = File::open(input)?;
+            let mut reader = BufReader::new(file);
+            let mut zstd_reader = BufReader::new(ZstdDecoder::new(&mut reader)?);
+            let mut raw = Vec::new();
+            std::io::Read::read_to_end(&mut zstd_reader, &mut raw)?;
+            raw
+        }
+        PayloadCompressionArg::SevenZip => {
+            let output = Command::new("7z")
+                .arg("x")
+                .arg("-so")
+                .arg(input)
+                .output()?;
+            if !output.status.success() {
+                anyhow::bail!("7z decode failed for {}", input.display());
+            }
+            output.stdout
+        }
+    };
+    let mut payload_reader = Cursor::new(raw_payload);
+
     let encoded_blocks: Vec<EncodedClusterBlock> =
-        bincode::decode_from_std_read(&mut gz_reader, config)?;
-    let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut gz_reader, config)?;
-    let row_order: Vec<u32> = bincode::decode_from_std_read(&mut gz_reader, config)?;
-    let gene_order: Vec<u32> = bincode::decode_from_std_read(&mut gz_reader, config)?;
+        bincode::decode_from_std_read(&mut payload_reader, config)?;
+    let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut payload_reader, config)?;
+    let row_order: Vec<u32> = bincode::decode_from_std_read(&mut payload_reader, config)?;
+    let gene_order: Vec<u32> = bincode::decode_from_std_read(&mut payload_reader, config)?;
     Ok((encoded_blocks, positions, row_order, gene_order))
 }
 
@@ -3504,6 +3636,9 @@ struct BuildCommand {
     /// If set, do not write compressed payload to disk.
     #[arg(long = "no-output", default_value_t = false)]
     no_output: bool,
+    /// Compression codec for payload output and size estimation.
+    #[arg(long = "output-compression", value_enum, default_value_t = PayloadCompressionArg::SevenZip)]
+    output_compression: PayloadCompressionArg,
     /// Optional CSV path to append compression statistics per run.
     #[arg(long = "stats-csv")]
     stats_csv: Option<PathBuf>,
@@ -3611,7 +3746,7 @@ struct BuildCommand {
     row_template_adaptive: bool,
     /// Split genes into this many contiguous blocks (after reordering) and build
     /// MST independently on each (cell_cluster × gene_block) tile.  Default 1 = no splitting.
-    #[arg(long = "gene-blocks", default_value_t = 1)]
+    #[arg(long = "gene-blocks", default_value_t = 4)]
     gene_blocks: usize,
     /// Maximum number of row templates to consider in adaptive mode.
     #[arg(long = "row-template-max", default_value_t = 16)]
@@ -3648,12 +3783,18 @@ fn output_path_with_label_suffix(base: &Path, label: &str) -> PathBuf {
     let file_name = base
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("output.bin.gz");
+        .unwrap_or("output.bin.zst");
     let parent = base.parent().unwrap_or_else(|| Path::new(""));
 
     if file_name.ends_with(".bin.gz") {
         let stem = file_name.trim_end_matches(".bin.gz");
         parent.join(format!("{}_{}.bin.gz", stem, label))
+    } else if file_name.ends_with(".bin.zst") {
+        let stem = file_name.trim_end_matches(".bin.zst");
+        parent.join(format!("{}_{}.bin.zst", stem, label))
+    } else if file_name.ends_with(".bin.7z") {
+        let stem = file_name.trim_end_matches(".bin.7z");
+        parent.join(format!("{}_{}.bin.7z", stem, label))
     } else if let Some(dot) = file_name.rfind('.') {
         let (stem, ext) = file_name.split_at(dot);
         parent.join(format!("{}_{}{}", stem, label, ext))
@@ -3754,6 +3895,9 @@ fn append_build_stats_csv(
 struct RoundtripCheckCommand {
     #[arg(short = 'e', long = "encoded")]
     encoded: PathBuf,
+    /// Override encoded payload compression format (`gzip` or `zstd`).
+    #[arg(long = "input-compression", value_enum)]
+    input_compression: Option<PayloadCompressionArg>,
     #[arg(short = 'i', long)]
     input: PathBuf,
     #[arg(short = 'p', long = "input-pos")]
@@ -3839,8 +3983,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
+                args.output_compression,
                 target_quantizers,
                 target_cell_blocks,
                 quantizer_bins,
@@ -3918,10 +4063,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.cluster_seed,
                         *gene_reorder_method,
                         args.gene_blocks,
+                        args.output_compression,
                     )?;
 
                     info!(
-                        "q={} (used={}): gzip≈{} bytes, rate={:.4} bits/value, mse={:.6}, rmse={:.6}",
+                        "q={} (used={}): compressed≈{} bytes, rate={:.4} bits/value, mse={:.6}, rmse={:.6}",
                         result.quantizers_requested,
                         result.quantizers_used,
                         result.gzip_bytes_estimate,
@@ -3951,7 +4097,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             info!("Rate-distortion sweep summary:");
             for metric in &metrics {
                 info!(
-                    "  q={} (used={}): rate={:.4}, mse={:.6}, rmse={:.6}, gzip≈{} bytes",
+                    "  q={} (used={}): rate={:.4}, mse={:.6}, rmse={:.6}, compressed≈{} bytes",
                     metric.quantizers_requested,
                     metric.quantizers_used,
                     metric.rate_bits_per_value,
@@ -3961,33 +4107,39 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
 
-            let config = bincode::config::standard()
-                .with_little_endian()
-                .with_fixed_int_encoding();
             let actual_gzip_bytes = if args.no_output {
                 // Keep size metrics available while skipping disk writes.
-                let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-                bincode::encode_into_std_write(&selected.encoded_blocks, &mut encoder, config)?;
-                bincode::encode_into_std_write(&selected.positions, &mut encoder, config)?;
-                bincode::encode_into_std_write(&selected.row_order, &mut encoder, config)?;
-                bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
-                encoder.finish()?.len()
+                let payload = serialize_payload(
+                    &selected.encoded_blocks,
+                    &selected.positions,
+                    &selected.row_order,
+                    &selected.gene_order,
+                )?;
+                compress_payload_bytes(&payload, args.output_compression)?.len()
             } else {
                 let mut output = args
                     .output
                     .clone()
-                    .unwrap_or_else(|| PathBuf::from("output.bin.gz"));
+                    .unwrap_or_else(|| {
+                        PathBuf::from(format!(
+                            "output.bin.{}",
+                            args.output_compression.extension()
+                        ))
+                    });
                 if sweep_configs.len() > 1 {
                     output = output_path_with_label_suffix(&output, config_label);
                 }
+                let payload = serialize_payload(
+                    &selected.encoded_blocks,
+                    &selected.positions,
+                    &selected.row_order,
+                    &selected.gene_order,
+                )?;
+                let compressed = compress_payload_bytes(&payload, args.output_compression)?;
                 let file = File::create(&output)?;
-                let writer = BufWriter::new(file);
-                let mut encoder = GzEncoder::new(writer, Compression::default());
-                bincode::encode_into_std_write(&selected.encoded_blocks, &mut encoder, config)?;
-                bincode::encode_into_std_write(&selected.positions, &mut encoder, config)?;
-                bincode::encode_into_std_write(&selected.row_order, &mut encoder, config)?;
-                bincode::encode_into_std_write(&selected.gene_order, &mut encoder, config)?;
-                let _ = encoder.finish()?;
+                let mut writer = BufWriter::new(file);
+                writer.write_all(&compressed)?;
+                writer.flush()?;
                 info!("Saved encoded payload to {}", output.display());
                 std::fs::metadata(&output)?.len() as usize
             };
@@ -4001,7 +4153,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut bytes_delta_vals = 0usize;
             let mut bytes_num_genes = 0usize;
 
-            for block in &selected.encoded_blocks {
+            for (block_idx, block) in selected.encoded_blocks.iter().enumerate() {
                 let (p, ri, rv, i, dv, ng) = block.bytes_breakdown();
                 bytes_parent += p;
                 bytes_root_indices += ri;
@@ -4009,6 +4161,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 bytes_indices += i;
                 bytes_delta_vals += dv;
                 bytes_num_genes += ng;
+                match block {
+                    EncodedClusterBlock::RowMst(_) => info!(
+                        "  block[{}] type=row_mst: parent={} root_indices={} root_vals={} op_indices={} op_vals={} num_genes_meta={} total={}",
+                        block_idx,
+                        p,
+                        ri,
+                        rv,
+                        i,
+                        dv,
+                        ng,
+                        p + ri + rv + i + dv + ng
+                    ),
+                    EncodedClusterBlock::Column(_) => info!(
+                        "  block[{}] type=column: local_to_global={} posting_count_streams={} posting_index_streams={} vals={} num_cells_genes_meta={} total={}",
+                        block_idx,
+                        ri,
+                        rv,
+                        i,
+                        dv,
+                        ng,
+                        p + ri + rv + i + dv + ng
+                    ),
+                }
             }
 
             let topology_bytes = bytes_parent;
@@ -4029,7 +4204,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 selected.cluster_sizes.len()
             );
             info!(
-                "Size: mst_uncompressed={} bytes, gzip_estimate={} bytes, gzip_actual={} bytes",
+                "Size: mst_uncompressed={} bytes, compressed_estimate={} bytes, compressed_actual={} bytes",
                 selected.total_mst_bytes, selected.gzip_bytes_estimate, actual_gzip_bytes
             );
             info!(
@@ -4097,7 +4272,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
 
             let (encoded_blocks, _positions, row_order, gene_order) =
-                decode_clustered_payload(&args.encoded)?;
+                decode_clustered_payload(&args.encoded, args.input_compression)?;
             info!(
                 "Loaded payload: blocks={}, mapped_rows={}, gene_order_len={}",
                 encoded_blocks.len(),
@@ -4196,6 +4371,7 @@ mod tests {
             None,
             GeneReorderMethod::Projection,
             1,
+            PayloadCompressionArg::Zstd,
         )
         .expect("lossy compression should succeed");
 
@@ -4242,6 +4418,7 @@ mod tests {
             Some(42),
             GeneReorderMethod::Projection,
             1,
+            PayloadCompressionArg::Zstd,
         )
         .expect("svd-joint seriation path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
