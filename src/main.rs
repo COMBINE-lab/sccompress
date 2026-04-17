@@ -167,11 +167,42 @@ enum CellClusterMethodArg {
     /// K-means on `build_cell_features` (hashed ln1p buckets, L2-normalized per cell).
     #[default]
     Kmeans,
-    /// Joint SVD seriation: one TF-IDF-normalized SVD on the full sparse cell×gene matrix,
-    /// **sort** cells by `(u₁, u₂, …)` into `k` contiguous blocks (like `svd-seriation`),
-    /// **sort** genes by `(v₁, v₂)` (like `--gene-reorder-method svd`).  Pure permutation on
-    /// both axes from the same decomposition — no k-means anywhere.
+    /// Joint SVD on a sparse cell×gene matrix (see `--svd-joint-matrix`), shared gene ordering
+    /// from `V^T`. Cell labels: `--svd-joint-cell-groups` chooses equal contiguous blocks after
+    /// seriation (default) or k-means on the cell embedding.
     SvdJoint,
+}
+
+/// Sparse matrix weights for the `svd-joint` SVD (only used when [`CellClusterMethodArg::SvdJoint`]).
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+enum SvdJointMatrixArg {
+    /// TF-IDF on **binary** presence: nonzero entry = `1 / sqrt(doc_freq[g])` (original `svd-joint`).
+    #[default]
+    TfidfBinary,
+    /// TF-IDF-style on **log1p(count)** magnitudes: `ln(1 + count) / sqrt(doc_freq[g])`.
+    TfidfLog1pCount,
+    /// Raw count (no TF-IDF scaling): nonzero entry = count.
+    RawCount,
+}
+
+/// How to turn the per-cell SVD embedding into `k` cluster labels (only for [`CellClusterMethodArg::SvdJoint`]).
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+enum SvdJointCellGroupsArg {
+    /// Lexicographic sort on `(u₁, u₂, …)` then **equal-size** contiguous blocks (original behavior).
+    #[default]
+    SeriationEqual,
+    /// **K-means** (Euclidean) on the first `min(k, rank)` embedding coordinates — cluster sizes follow the data.
+    KmeansEmbedding,
+}
+
+/// Entry weight for one nonzero, given column document frequency `df` and raw count `value`.
+fn svd_joint_entry_weight(matrix: SvdJointMatrixArg, df: u64, value: u16) -> f64 {
+    let idf_denom = (df as f64).sqrt().max(1e-12);
+    match matrix {
+        SvdJointMatrixArg::TfidfBinary => 1.0 / idf_denom,
+        SvdJointMatrixArg::TfidfLog1pCount => (value as f64).ln_1p() / idf_denom,
+        SvdJointMatrixArg::RawCount => value as f64,
+    }
 }
 
 /// Parameters for [`CellClusterMethodArg::SpatialGraph`] (ignored for other methods).
@@ -1430,9 +1461,34 @@ fn reorder_rows_within_clusters(
         .map(|c| projection_weight(c, 0x0FED_CBA9_8765_4321))
         .collect();
 
-    clusters
-        .par_iter()
-        .map(|cluster| {
+    if mst_codec::is_deterministic_mode() {
+        clusters
+            .iter()
+            .map(|cluster| {
+                let mut scored = Vec::with_capacity(cluster.len());
+                for &point_idx in cluster {
+                    let mut p1 = 0.0f64;
+                    let mut p2 = 0.0f64;
+                    for col in 0..ncols {
+                        let v = features[(point_idx, col)];
+                        p1 += v * w1[col];
+                        p2 += v * w2[col];
+                    }
+                    scored.push((point_idx, p1, p2));
+                }
+
+                scored.sort_unstable_by(|a, b| {
+                    a.1.total_cmp(&b.1)
+                        .then_with(|| a.2.total_cmp(&b.2))
+                        .then_with(|| a.0.cmp(&b.0))
+                });
+                scored.into_iter().map(|(idx, _, _)| idx).collect()
+            })
+            .collect()
+    } else {
+        clusters
+            .par_iter()
+            .map(|cluster| {
             let mut scored = Vec::with_capacity(cluster.len());
             for &point_idx in cluster {
                 let mut p1 = 0.0f64;
@@ -1451,8 +1507,9 @@ fn reorder_rows_within_clusters(
                     .then_with(|| a.0.cmp(&b.0))
             });
             scored.into_iter().map(|(idx, _, _)| idx).collect()
-        })
-        .collect()
+            })
+            .collect()
+    }
 }
 
 fn compute_gene_permutation_from_row_stream(
@@ -1860,14 +1917,16 @@ fn compute_gene_permutation_kmeans(
     Ok((new_to_old, old_to_new))
 }
 
-/// Joint SVD seriation: one SVD on TF-IDF-normalized cell×gene matrix, then pure sorting
-/// on both axes — cells sorted by left singular vectors into `k` contiguous blocks,
-/// genes sorted by right singular vectors.  No k-means anywhere.
+/// Joint SVD seriation: one SVD on a TF-IDF-style cell×gene matrix, then either
+/// lexicographic sort + equal contiguous blocks, or k-means on the cell embedding;
+/// genes sorted by right singular vectors.
 fn joint_svd_seriation(
     points: &[Point],
     data: &CsMat<u16>,
     num_clusters: usize,
     cluster_seed: Option<u64>,
+    matrix: SvdJointMatrixArg,
+    cell_groups: SvdJointCellGroupsArg,
 ) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
     let n_cells = points.len();
     let n_genes = data.cols();
@@ -1879,13 +1938,13 @@ fn joint_svd_seriation(
     let k = num_clusters.max(1).min(n_cells);
 
     let mut col_nnz = vec![0u64; n_genes];
-    let mut triplets: Vec<(usize, usize)> = Vec::new();
+    let mut triplets: Vec<(usize, usize, u16)> = Vec::new();
     for (ci, point) in points.iter().enumerate() {
         if let Some(row) = data.outer_view(point.row_index) {
             for (gene_idx, &value) in row.iter() {
                 if value != 0 {
                     col_nnz[gene_idx] += 1;
-                    triplets.push((ci, gene_idx));
+                    triplets.push((ci, gene_idx, value));
                 }
             }
         }
@@ -1950,15 +2009,16 @@ fn joint_svd_seriation(
     let nr = sampled_rows.len();
     let nc = active_cols.len();
 
-    // TF-IDF: binary support / sqrt(doc-freq)
+    // TF-IDF-style support depending on selected matrix mode.
     let mut dense = vec![0.0f64; nr * nc];
     let sampled_set: HashMap<usize, usize> =
         sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
 
-    for &(ci, gene_idx) in &triplets {
+    for &(ci, gene_idx, value) in &triplets {
         if let Some(&local_row) = sampled_set.get(&ci) {
             if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+                dense[local_row * nc + local_col] =
+                    svd_joint_entry_weight(matrix, col_nnz[gene_idx], value);
             }
         }
     }
@@ -1980,11 +2040,12 @@ fn joint_svd_seriation(
     let n_comp = k.min(u.ncols()).max(1);
     let sigma = &svd.singular_values;
 
-    let mut cell_coords: Vec<(usize, Vec<f64>)> = Vec::with_capacity(n_cells);
+    let mut cell_emb: Vec<Vec<f64>> = vec![vec![0.0f64; n_comp]; n_cells];
     for ci in 0..n_cells {
-        let mut coords = vec![0.0f64; n_comp];
         if let Some(&lr) = sampled_set.get(&ci) {
-            for j in 0..n_comp { coords[j] = u[(lr, j)]; }
+            for j in 0..n_comp {
+                cell_emb[ci][j] = u[(lr, j)];
+            }
         } else {
             let point = &points[ci];
             if let Some(row) = data.outer_view(point.row_index) {
@@ -1994,42 +2055,53 @@ fn joint_svd_seriation(
                     for (g, &v) in row.iter() {
                         if v != 0 {
                             if let Some(&lc) = col_local.get(&g) {
-                                let tfidf = 1.0 / (col_nnz[g] as f64).sqrt().max(1e-12);
+                                let tfidf = svd_joint_entry_weight(matrix, col_nnz[g], v);
                                 dot += tfidf * v_t[(j, lc)];
                             }
                         }
                     }
-                    coords[j] = dot * sig_inv;
+                    cell_emb[ci][j] = dot * sig_inv;
                 }
             }
         }
-        cell_coords.push((ci, coords));
     }
 
-    // Sort cells by (u₁, u₂, …) lexicographically
-    cell_coords.sort_unstable_by(|a, b| {
-        for (ca, cb) in a.1.iter().zip(b.1.iter()) {
-            match ca.total_cmp(cb) {
-                std::cmp::Ordering::Equal => continue,
-                ord => return ord,
+    let cell_labels = match cell_groups {
+        SvdJointCellGroupsArg::KmeansEmbedding => {
+            let mut feat = Array2::<f64>::zeros((n_cells, n_comp));
+            for ci in 0..n_cells {
+                for j in 0..n_comp {
+                    feat[(ci, j)] = cell_emb[ci][j];
+                }
             }
+            cluster_cells_with_kmeans(&feat, k, cluster_seed)?
         }
-        a.0.cmp(&b.0)
-    });
-
-    // Cut the sorted order into k contiguous blocks
-    let mut cell_labels = vec![0usize; n_cells];
-    let block_size = n_cells / k;
-    let remainder = n_cells % k;
-    let mut offset = 0usize;
-    for cluster_id in 0..k {
-        let sz = block_size + if cluster_id < remainder { 1 } else { 0 };
-        for pos in offset..offset + sz {
-            let ci = cell_coords[pos].0;
-            cell_labels[ci] = cluster_id;
+        SvdJointCellGroupsArg::SeriationEqual => {
+            let mut order: Vec<usize> = (0..n_cells).collect();
+            order.sort_unstable_by(|&a, &b| {
+                for (ca, cb) in cell_emb[a].iter().zip(cell_emb[b].iter()) {
+                    match ca.total_cmp(cb) {
+                        std::cmp::Ordering::Equal => continue,
+                        ord => return ord,
+                    }
+                }
+                a.cmp(&b)
+            });
+            let mut labels = vec![0usize; n_cells];
+            let block_size = n_cells / k;
+            let remainder = n_cells % k;
+            let mut offset = 0usize;
+            for cluster_id in 0..k {
+                let sz = block_size + if cluster_id < remainder { 1 } else { 0 };
+                for pos in offset..offset + sz {
+                    let ci = order[pos];
+                    labels[ci] = cluster_id;
+                }
+                offset += sz;
+            }
+            labels
         }
-        offset += sz;
-    }
+    };
 
     // --- GENE SIDE: sort genes by (v₁, v₂) ---
     let n_sv = v_t.nrows().min(2);
@@ -2059,8 +2131,8 @@ fn joint_svd_seriation(
     }
 
     info!(
-        "Joint SVD seriation: {} cells -> {} contiguous blocks, {} genes reordered ({} active in SVD)",
-        n_cells, k, n_genes, nc
+        "Joint SVD seriation: {} cells -> {} clusters (matrix={:?}, cell_groups={:?}), {} genes reordered ({} active in SVD)",
+        n_cells, k, matrix, cell_groups, n_genes, nc
     );
 
     Ok((cell_labels, gene_new_to_old, gene_old_to_new))
@@ -2936,6 +3008,8 @@ fn run_clustered_compression(
     gene_reorder_method: GeneReorderMethod,
     gene_blocks: usize,
     payload_compression: PayloadCompressionArg,
+    svd_joint_matrix: SvdJointMatrixArg,
+    svd_joint_cell_groups: SvdJointCellGroupsArg,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -2946,7 +3020,14 @@ fn run_clustered_compression(
 
     // Joint path: one operation produces both cell assignments and gene ordering.
     let joint_result = if cell_cluster_method == CellClusterMethodArg::SvdJoint {
-        match joint_svd_seriation(points, data, requested_clusters, cluster_seed) {
+        match joint_svd_seriation(
+            points,
+            data,
+            requested_clusters,
+            cluster_seed,
+            svd_joint_matrix,
+            svd_joint_cell_groups,
+        ) {
             Ok(result) => Some(result),
             Err(e) => {
                 warn!("Joint SVD seriation failed ({}), falling back to separate cell+gene", e);
@@ -3251,10 +3332,67 @@ fn run_clustered_compression(
                 bool,
             )>,
         >,
-    > = clusters
-        .par_iter()
-        .enumerate()
-        .map(|(cluster_idx, cluster)| {
+    > = if mst_codec::is_deterministic_mode() {
+        clusters
+            .iter()
+            .enumerate()
+            .map(|(cluster_idx, cluster)| {
+                if cluster.is_empty() {
+                    return Ok(None);
+                }
+
+                let cluster_points: Vec<Point> =
+                    cluster.iter().map(|&idx| points[idx].clone()).collect();
+
+                let mut tile_blocks = Vec::with_capacity(effective_gene_blocks);
+                let mut total_bytes = 0usize;
+                let mut first_order: Option<Vec<u32>> = None;
+                let mut any_row_fallback = false;
+                let mut any_col_fallback = false;
+
+                for (gb_idx, _gene_block_range) in gene_block_ranges.iter().enumerate() {
+                    let (encoded, local_order, bytes, row_fb, col_fb) =
+                        encode_tile(&cluster_points, &block_gene_o2ns[gb_idx], cluster_idx)?;
+                    total_bytes += bytes;
+                    if first_order.is_none() {
+                        first_order = Some(local_order);
+                    }
+                    any_row_fallback |= row_fb;
+                    any_col_fallback |= col_fb;
+                    tile_blocks.push(encoded);
+                }
+
+                let local_order =
+                    first_order.unwrap_or_else(|| (0..cluster_points.len() as u32).collect());
+                let mut cluster_positions = Vec::with_capacity(cluster_points.len());
+                let mut cluster_row_order = Vec::with_capacity(cluster_points.len());
+
+                for &local_idx_u32 in &local_order {
+                    let local_idx = local_idx_u32 as usize;
+                    let point = cluster_points
+                        .get(local_idx)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid local order index {}", local_idx))?;
+                    cluster_positions.push(DatalessPoint::new(point.x, point.y));
+                    cluster_row_order.push(point.row_index as u32);
+                }
+
+                Ok(Some((
+                    cluster_idx,
+                    tile_blocks,
+                    cluster_positions,
+                    cluster_row_order,
+                    cluster_points.len(),
+                    total_bytes,
+                    any_row_fallback,
+                    any_col_fallback,
+                )))
+            })
+            .collect()
+    } else {
+        clusters
+            .par_iter()
+            .enumerate()
+            .map(|(cluster_idx, cluster)| {
             if cluster.is_empty() {
                 return Ok(None);
             }
@@ -3303,8 +3441,9 @@ fn run_clustered_compression(
                 any_row_fallback,
                 any_col_fallback,
             )))
-        })
-        .collect();
+            })
+            .collect()
+    };
 
     let mut ordered = Vec::new();
     for result in cluster_results {
@@ -3695,9 +3834,15 @@ struct BuildCommand {
     /// How to cluster cells (`kmeans` or `svd-joint`).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
-    /// Optional RNG seed for cell clustering stages, including `svd-joint` row sampling.
-    #[arg(long = "cluster-seed")]
-    cluster_seed: Option<u64>,
+    /// Optional RNG seed. When set, forces deterministic mode (single-thread, stable MST ties).
+    #[arg(long = "set-seed", visible_alias = "cluster-seed")]
+    set_seed: Option<u64>,
+    /// For `svd-joint` only: SVD matrix weights — raw count (default), binary TF-IDF, or log1p(count).
+    #[arg(long = "svd-joint-matrix", value_enum, default_value_t = SvdJointMatrixArg::RawCount)]
+    svd_joint_matrix: SvdJointMatrixArg,
+    /// For `svd-joint` only: equal contiguous blocks after seriation (default) or k-means on the SVD embedding.
+    #[arg(long = "svd-joint-cell-groups", value_enum, default_value_t = SvdJointCellGroupsArg::SeriationEqual)]
+    svd_joint_cell_groups: SvdJointCellGroupsArg,
     /// If set, run all cell-cluster methods and append one stats row per method.
     #[arg(long = "cell-cluster-method-sweep-all", visible_alias = "cluster-all", default_value_t = false)]
     cell_cluster_method_sweep_all: bool,
@@ -3929,6 +4074,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Build(args) => {
+            // Deterministic mode is enabled when a seed is provided.
+            let deterministic = args.set_seed.is_some();
+            mst_codec::set_deterministic_mode(deterministic);
+            if deterministic {
+                // Force single-threaded rayon to eliminate scheduling nondeterminism.
+                // Ignore error if the global pool was already initialized.
+                let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
+            }
             let (csr, points) = match args.platform {
                 Some(Platform::SingleCell) => {
                     // Single-cell mode: no positions file required; generate dummy points.
@@ -4060,10 +4213,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *cell_cluster_method,
                         spatial_graph,
                         tensor_grid,
-                        args.cluster_seed,
+                        args.set_seed,
                         *gene_reorder_method,
                         args.gene_blocks,
                         args.output_compression,
+                        args.svd_joint_matrix,
+                        args.svd_joint_cell_groups,
                     )?;
 
                     info!(
@@ -4372,6 +4527,8 @@ mod tests {
             GeneReorderMethod::Projection,
             1,
             PayloadCompressionArg::Zstd,
+            SvdJointMatrixArg::TfidfBinary,
+            SvdJointCellGroupsArg::SeriationEqual,
         )
         .expect("lossy compression should succeed");
 
@@ -4419,6 +4576,8 @@ mod tests {
             GeneReorderMethod::Projection,
             1,
             PayloadCompressionArg::Zstd,
+            SvdJointMatrixArg::TfidfBinary,
+            SvdJointCellGroupsArg::SeriationEqual,
         )
         .expect("svd-joint seriation path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
