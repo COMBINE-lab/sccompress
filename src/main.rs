@@ -4,6 +4,7 @@ mod index_stream;
 mod matrix_io;
 mod mst_codec;
 mod sorted_indices;
+mod cluster;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::read::GzDecoder;
@@ -32,10 +33,14 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 use zstd::stream::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 
+use cluster::{
+    build_cell_features, cluster_cells, group_points_by_cluster, joint_svd_seriation,
+    projection_weight, reorder_rows_within_clusters, split_oversized_clusters, CellClusterMethodArg,
+    SpatialGraphParams, TensorGridDisc, TensorGridParams,
+};
 use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
 use linfa_clustering::KMeans;
-use nalgebra::linalg::SymmetricEigen;
 use nalgebra::DMatrix;
 use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256Plus;
@@ -56,8 +61,6 @@ struct CompressionResult {
     cluster_sizes: Vec<usize>,
     encoded_blocks: Vec<EncodedClusterBlock>,
     positions: Vec<DatalessPoint>,
-    row_order: Vec<u32>,
-    gene_order: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -161,102 +164,6 @@ enum GeneReorderMethod {
     Kmeans,
 }
 
-/// How to partition cells into encoder clusters (before row-MST / column payloads).
-#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
-enum CellClusterMethodArg {
-    /// K-means on `build_cell_features` (hashed ln1p buckets, L2-normalized per cell).
-    #[default]
-    Kmeans,
-    /// Joint SVD on a sparse cell×gene matrix (see `--svd-joint-matrix`), shared gene ordering
-    /// from `V^T`. Cell labels: `--svd-joint-cell-groups` chooses equal contiguous blocks after
-    /// seriation (default) or k-means on the cell embedding.
-    SvdJoint,
-}
-
-/// Sparse matrix weights for the `svd-joint` SVD (only used when [`CellClusterMethodArg::SvdJoint`]).
-#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
-enum SvdJointMatrixArg {
-    /// TF-IDF on **binary** presence: nonzero entry = `1 / sqrt(doc_freq[g])` (original `svd-joint`).
-    #[default]
-    TfidfBinary,
-    /// TF-IDF-style on **log1p(count)** magnitudes: `ln(1 + count) / sqrt(doc_freq[g])`.
-    TfidfLog1pCount,
-    /// Raw count (no TF-IDF scaling): nonzero entry = count.
-    RawCount,
-}
-
-/// How to turn the per-cell SVD embedding into `k` cluster labels (only for [`CellClusterMethodArg::SvdJoint`]).
-#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
-enum SvdJointCellGroupsArg {
-    /// Lexicographic sort on `(u₁, u₂, …)` then **equal-size** contiguous blocks (original behavior).
-    #[default]
-    SeriationEqual,
-    /// **K-means** (Euclidean) on the first `min(k, rank)` embedding coordinates — cluster sizes follow the data.
-    KmeansEmbedding,
-}
-
-/// Entry weight for one nonzero, given column document frequency `df` and raw count `value`.
-fn svd_joint_entry_weight(matrix: SvdJointMatrixArg, df: u64, value: u16) -> f64 {
-    let idf_denom = (df as f64).sqrt().max(1e-12);
-    match matrix {
-        SvdJointMatrixArg::TfidfBinary => 1.0 / idf_denom,
-        SvdJointMatrixArg::TfidfLog1pCount => (value as f64).ln_1p() / idf_denom,
-        SvdJointMatrixArg::RawCount => value as f64,
-    }
-}
-
-/// Parameters for [`CellClusterMethodArg::SpatialGraph`] (ignored for other methods).
-#[derive(Clone, Copy, Debug)]
-struct SpatialGraphParams {
-    spatial_knn: usize,
-    expr_knn: usize,
-    /// Weight on spatial kNN affinity (`1 - blend` on expression kNN).
-    blend: f64,
-}
-
-impl Default for SpatialGraphParams {
-    fn default() -> Self {
-        Self {
-            spatial_knn: 12,
-            expr_knn: 12,
-            blend: 0.45,
-        }
-    }
-}
-
-/// How to bin \((x,y)\) into tiles for [`CellClusterMethodArg::TensorGrid`].
-#[derive(Debug, Clone, Copy, ValueEnum, Default)]
-enum TensorGridDisc {
-    /// Axis-aligned grid of `nx × ny` tiles.
-    #[default]
-    Rect,
-    /// Pointy-top hex bins (axial coordinates); `nx`,`ny` control approximate resolution via hex size.
-    Hex,
-}
-
-/// Tile binning for [`CellClusterMethodArg::TensorGrid`].
-#[derive(Clone, Copy, Debug)]
-struct TensorGridParams {
-    nx: usize,
-    ny: usize,
-    /// Scale for tile coordinates / one-hot vs expression features.
-    tile_weight: f64,
-    disc: TensorGridDisc,
-    /// Use one-hot over tiles when the number of distinct tiles ≤ this; otherwise append 2D normalized tile centers.
-    onehot_max_tiles: usize,
-}
-
-impl Default for TensorGridParams {
-    fn default() -> Self {
-        Self {
-            nx: 8,
-            ny: 8,
-            tile_weight: 0.55,
-            disc: TensorGridDisc::Rect,
-            onehot_max_tiles: 64,
-        }
-    }
-}
 
 impl From<MstWeightArg> for MstWeightMode {
     fn from(value: MstWeightArg) -> Self {
@@ -300,219 +207,6 @@ fn normalize_quantizer_counts(selected: usize, sweep: &[usize]) -> Vec<usize> {
     counts
 }
 
-fn build_cell_features(
-    points: &[Point],
-    data: &CsMat<u16>,
-    feature_dims: usize,
-) -> anyhow::Result<Array2<f64>> {
-    let feature_dims = feature_dims.max(8);
-    let mut features = Array2::<f64>::zeros((points.len(), feature_dims));
-
-    for (point_idx, point) in points.iter().enumerate() {
-        let row = data
-            .outer_view(point.row_index)
-            .ok_or_else(|| anyhow::anyhow!("Missing CSR row {}", point.row_index))?;
-        for (gene_idx, &value) in row.iter() {
-            let bucket = gene_idx % feature_dims;
-            features[(point_idx, bucket)] += (value as f64).ln_1p();
-        }
-    }
-
-    for row_idx in 0..features.nrows() {
-        let mut norm_sq = 0.0;
-        for col_idx in 0..features.ncols() {
-            let v = features[(row_idx, col_idx)];
-            norm_sq += v * v;
-        }
-        let norm = norm_sq.sqrt();
-        if norm > 0.0 {
-            for col_idx in 0..features.ncols() {
-                features[(row_idx, col_idx)] /= norm;
-            }
-        }
-    }
-
-    Ok(features)
-}
-
-fn cluster_cells_with_kmeans(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let nrows = features.nrows();
-    if nrows == 0 {
-        return Ok(Vec::new());
-    }
-
-    let k = num_clusters.max(1).min(nrows);
-    let dataset = DatasetBase::from(features.clone());
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed))
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means clustering failed: {}", e))?
-    };
-
-    Ok(model.predict(&dataset).to_vec())
-}
-
-fn cluster_cells_binary_l0_kmeans(
-    features: &Array2<f64>,
-    num_clusters: usize,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    if m == 0 {
-        anyhow::bail!("binary-l0-kmeans: zero feature columns");
-    }
-    let k = num_clusters.max(1).min(n);
-    if k == 1 {
-        return Ok(vec![0usize; n]);
-    }
-
-    let mut x = vec![0u8; n * m];
-    for i in 0..n {
-        for j in 0..m {
-            x[i * m + j] = if features[(i, j)] > 0.0 { 1 } else { 0 };
-        }
-    }
-
-    Ok(binary_l0_lloyd_assign(&x, n, m, k, 30))
-}
-
-fn binary_l0_lloyd_assign(x: &[u8], n: usize, m: usize, k: usize, max_iter: usize) -> Vec<usize> {
-    let mut centers = vec![0u8; k * m];
-    for c in 0..k {
-        let src = c * n / k;
-        for j in 0..m {
-            centers[c * m + j] = x[src * m + j];
-        }
-    }
-
-    let mut assignments = vec![0usize; n];
-    let mut changed_any = true;
-
-    for _ in 0..max_iter {
-        if !changed_any {
-            break;
-        }
-        changed_any = false;
-
-        for i in 0..n {
-            let mut best_c = 0usize;
-            let mut best_d = usize::MAX;
-            for c in 0..k {
-                let mut d = 0usize;
-                for j in 0..m {
-                    if x[i * m + j] != centers[c * m + j] {
-                        d += 1;
-                    }
-                }
-                if d < best_d {
-                    best_d = d;
-                    best_c = c;
-                }
-            }
-            if assignments[i] != best_c {
-                assignments[i] = best_c;
-                changed_any = true;
-            }
-        }
-
-        let mut cluster_sizes = vec![0usize; k];
-        let mut sums = vec![0usize; k * m];
-        for i in 0..n {
-            let c = assignments[i];
-            cluster_sizes[c] += 1;
-            for j in 0..m {
-                sums[c * m + j] += x[i * m + j] as usize;
-            }
-        }
-
-        for c in 0..k {
-            if cluster_sizes[c] == 0 {
-                let src = c * n / k;
-                for j in 0..m {
-                    centers[c * m + j] = x[src * m + j];
-                }
-                continue;
-            }
-            for j in 0..m {
-                let ones = sums[c * m + j];
-                let zeros = cluster_sizes[c] - ones;
-                centers[c * m + j] = if ones >= zeros { 1 } else { 0 };
-            }
-        }
-    }
-
-    assignments
-}
-
-fn normalize_l1_rows_inplace(a: &mut Array2<f64>) {
-    for mut row in a.rows_mut() {
-        let s: f64 = row.sum();
-        if s > 1e-15 {
-            row.mapv_inplace(|x| x / s);
-        }
-    }
-}
-
-fn normalize_l1_cols_inplace(a: &mut Array2<f64>) {
-    for j in 0..a.ncols() {
-        let s: f64 = a.column(j).sum();
-        if s > 1e-15 {
-            let mut col = a.column_mut(j);
-            col.mapv_inplace(|x| x / s);
-        }
-    }
-}
-
-/// `G = X^T X` with `X` shape `(n, m)` — `G` is `(m, m)` (inner products between bucket columns).
-fn gram_xt_x(x: &Array2<f64>) -> Array2<f64> {
-    let n = x.nrows();
-    let m = x.ncols();
-    let mut g = Array2::<f64>::zeros((m, m));
-    for p in 0..m {
-        for q in 0..=p {
-            let mut s = 0.0f64;
-            for i in 0..n {
-                s += x[(i, p)] * x[(i, q)];
-            }
-            g[(p, q)] = s;
-            g[(q, p)] = s;
-        }
-    }
-    g
-}
-
-/// Sum `X[:, j]` over bucket columns `j` that share the same column-k-means label.
-fn aggregate_rows_by_column_clusters(
-    x: &Array2<f64>,
-    col_assign: &[usize],
-    k_col: usize,
-) -> Array2<f64> {
-    let n = x.nrows();
-    let mut z = Array2::<f64>::zeros((n, k_col));
-    for i in 0..n {
-        for j in 0..x.ncols() {
-            let c = col_assign[j];
-            if c < k_col {
-                z[(i, c)] += x[(i, j)];
-            }
-        }
-    }
-    z
-}
-
 fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
     for mut row in a.rows_mut() {
         let norm_sq: f64 = row.iter().map(|v| v * v).sum();
@@ -523,994 +217,6 @@ fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
     }
 }
 
-#[inline]
-fn soft_threshold_scalar(x: f64, t: f64) -> f64 {
-    if x > t {
-        x - t
-    } else if x < -t {
-        x + t
-    } else {
-        0.0
-    }
-}
-
-/// FABIA-style: `X` is `m×n` (bucket features × cells), row-z-score, `X ≈ Λ Z` with sparse `Λ`, `Z` via ISTA.
-fn cluster_cells_fabia(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    if m == 0 {
-        anyhow::bail!("fabia: zero feature columns");
-    }
-    let k_req = num_clusters.max(1).min(n);
-    if k_req == 1 {
-        return Ok(vec![0; n]);
-    }
-
-    let mut x = Array2::<f64>::zeros((m, n));
-    for i in 0..m {
-        for j in 0..n {
-            x[(i, j)] = features[(j, i)];
-        }
-    }
-    for i in 0..m {
-        let mut mean = 0.0f64;
-        for j in 0..n {
-            mean += x[(i, j)];
-        }
-        mean /= n as f64;
-        let mut var = 0.0f64;
-        for j in 0..n {
-            let d = x[(i, j)] - mean;
-            var += d * d;
-        }
-        let sd = (var / n.max(1) as f64).max(1e-18).sqrt();
-        for j in 0..n {
-            x[(i, j)] = (x[(i, j)] - mean) / sd;
-        }
-    }
-
-    let p = k_req.min(m).min(n);
-    if p < 2 {
-        return cluster_cells_with_kmeans(features, k_req, cluster_seed);
-    }
-
-    let data: Vec<f64> = x.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(m, n, &data);
-    let svd = mat.svd(true, true);
-    let (u, v_t) = match (svd.u, svd.v_t) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => return cluster_cells_with_kmeans(features, k_req, cluster_seed),
-    };
-    let sigma = svd.singular_values;
-
-    let mut lambda = Array2::<f64>::zeros((m, p));
-    let mut z = Array2::<f64>::zeros((p, n));
-    for l in 0..p {
-        let s = sigma[l].max(1e-18).sqrt();
-        for i in 0..m {
-            lambda[(i, l)] = u[(i, l)] * s;
-        }
-        for j in 0..n {
-            z[(l, j)] = s * v_t[(l, j)];
-        }
-    }
-
-    let mut abs_buf: Vec<f64> = Vec::with_capacity(m * n);
-    for &v in x.iter() {
-        abs_buf.push(v.abs());
-    }
-    abs_buf.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let med = abs_buf[abs_buf.len() / 2].max(1e-12);
-    let lambda_l1 = 0.08 * med;
-    let z_l1 = 0.08 * med;
-
-    let max_iter = 48usize;
-    let mut residual = Array2::<f64>::zeros((m, n));
-    let mut gz = Array2::<f64>::zeros((p, n));
-    let mut gl = Array2::<f64>::zeros((m, p));
-
-    for _ in 0..max_iter {
-        // R = Λ Z - X
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0f64;
-                for l in 0..p {
-                    s += lambda[(i, l)] * z[(l, j)];
-                }
-                residual[(i, j)] = s - x[(i, j)];
-            }
-        }
-
-        let tr_zzt: f64 = (0..p)
-            .map(|l| {
-                (0..n)
-                    .map(|j| z[(l, j)] * z[(l, j)])
-                    .sum::<f64>()
-            })
-            .sum();
-        let eta_l = 1.0 / tr_zzt.max(1e-18);
-
-        for i in 0..m {
-            for l in 0..p {
-                let mut s = 0.0f64;
-                for j in 0..n {
-                    s += residual[(i, j)] * z[(l, j)];
-                }
-                gl[(i, l)] = s;
-            }
-        }
-        for i in 0..m {
-            for l in 0..p {
-                let v = lambda[(i, l)] - eta_l * gl[(i, l)];
-                lambda[(i, l)] = soft_threshold_scalar(v, eta_l * lambda_l1);
-            }
-        }
-
-        for i in 0..m {
-            for j in 0..n {
-                let mut s = 0.0f64;
-                for l in 0..p {
-                    s += lambda[(i, l)] * z[(l, j)];
-                }
-                residual[(i, j)] = s - x[(i, j)];
-            }
-        }
-
-        let mut tr_ll = 0.0f64;
-        for i in 0..m {
-            for l in 0..p {
-                tr_ll += lambda[(i, l)] * lambda[(i, l)];
-            }
-        }
-        let eta_z = 1.0 / tr_ll.max(1e-18);
-
-        for l in 0..p {
-            for j in 0..n {
-                let mut s = 0.0f64;
-                for i in 0..m {
-                    s += lambda[(i, l)] * residual[(i, j)];
-                }
-                gz[(l, j)] = s;
-            }
-        }
-        for l in 0..p {
-            for j in 0..n {
-                let v = z[(l, j)] - eta_z * gz[(l, j)];
-                z[(l, j)] = soft_threshold_scalar(v, eta_z * z_l1);
-            }
-        }
-    }
-
-    if z.iter().any(|v| !v.is_finite()) || lambda.iter().any(|v| !v.is_finite()) {
-        return cluster_cells_with_kmeans(features, k_req, cluster_seed);
-    }
-
-    if p >= k_req {
-        let mut labels = vec![0usize; n];
-        for j in 0..n {
-            let mut best = 0usize;
-            let mut best_abs = 0.0f64;
-            for l in 0..k_req.min(p) {
-                let a = z[(l, j)].abs();
-                if a > best_abs {
-                    best_abs = a;
-                    best = l;
-                }
-            }
-            labels[j] = best;
-        }
-        Ok(labels)
-    } else {
-        let mut z_sub = Array2::<f64>::zeros((n, p));
-        for j in 0..n {
-            for l in 0..p {
-                z_sub[(j, l)] = z[(l, j)];
-            }
-        }
-        let dataset = DatasetBase::from(z_sub);
-        let model = if let Some(seed) = cluster_seed {
-            KMeans::params_with_rng(k_req, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(2001)))
-                .max_n_iterations(20)
-                .fit(&dataset)
-                .map_err(|e| anyhow::anyhow!("fabia fallback k-means failed: {}", e))?
-        } else {
-            KMeans::params(k_req)
-                .max_n_iterations(20)
-                .fit(&dataset)
-                .map_err(|e| anyhow::anyhow!("fabia fallback k-means failed: {}", e))?
-        };
-        Ok(model.predict(&dataset).to_vec())
-    }
-}
-
-/// Double-L1 normalized nonnegative `X`, truncated SVD row embedding `U Σ^{1/2}`, L2-normalize rows, k-means only.
-fn cluster_cells_svd_kmeans_only(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    let k = num_clusters.max(1).min(n);
-
-    let mut a = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            a[(i, j)] = features[(i, j)].max(0.0);
-        }
-    }
-    normalize_l1_rows_inplace(&mut a);
-    normalize_l1_cols_inplace(&mut a);
-
-    let data: Vec<f64> = a.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(n, m, &data);
-    let svd = mat.svd(true, false);
-    let u = svd
-        .u
-        .ok_or_else(|| anyhow::anyhow!("SVD did not return U"))?;
-    let sigma = svd.singular_values;
-
-    let max_rank = n.min(m);
-    let n_comp = k.min(max_rank).max(1);
-    let mut embed = Array2::<f64>::zeros((n, n_comp));
-    for i in 0..n {
-        for j in 0..n_comp {
-            let s_j = sigma[j].max(1e-18);
-            embed[(i, j)] = u[(i, j)] * s_j.sqrt();
-        }
-    }
-    l2_normalize_rows_inplace(&mut embed);
-
-    let dataset = DatasetBase::from(embed);
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(5001)))
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means on SVD embedding failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means on SVD embedding failed: {}", e))?
-    };
-
-    Ok(model.predict(&dataset).to_vec())
-}
-
-/// SVD seriation: double-L1 normalize nonneg `X`, truncated SVD to get left singular vectors,
-/// sort cells by `(u₁, u₂, …)` coordinates, then cut the sorted order into `k` contiguous blocks.
-/// Cells within each block are expression-neighbours in the SVD embedding, and the block
-/// boundaries respect the continuous ordering — unlike k-means, which can assign spatially
-/// interleaved labels.
-fn cluster_cells_svd_seriation(
-    features: &Array2<f64>,
-    num_clusters: usize,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    let k = num_clusters.max(1).min(n);
-    if k <= 1 {
-        return Ok(vec![0; n]);
-    }
-
-    let mut a = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            a[(i, j)] = features[(i, j)].max(0.0);
-        }
-    }
-    normalize_l1_rows_inplace(&mut a);
-    normalize_l1_cols_inplace(&mut a);
-
-    let data: Vec<f64> = a.iter().copied().collect();
-    let mat = DMatrix::from_row_slice(n, m, &data);
-    let svd = mat.svd(true, false);
-    let u = match svd.u {
-        Some(u) => u,
-        None => return Ok((0..n).map(|i| i % k).collect()),
-    };
-
-    let max_rank = n.min(m);
-    let n_comp = k.min(max_rank).max(1).min(u.ncols());
-
-    // Build sortable key per cell: (u₁, u₂, …, original_index)
-    let mut cell_keys: Vec<(usize, Vec<f64>)> = (0..n)
-        .map(|i| {
-            let scores: Vec<f64> = (0..n_comp).map(|j| u[(i, j)]).collect();
-            (i, scores)
-        })
-        .collect();
-
-    cell_keys.sort_unstable_by(|a, b| {
-        for (va, vb) in a.1.iter().zip(b.1.iter()) {
-            match va.total_cmp(vb) {
-                std::cmp::Ordering::Equal => continue,
-                other => return other,
-            }
-        }
-        a.0.cmp(&b.0)
-    });
-
-    // Cut the sorted order into k contiguous blocks
-    let mut labels = vec![0usize; n];
-    let block_size = n / k;
-    let remainder = n % k;
-    let mut cursor = 0usize;
-    for cluster_id in 0..k {
-        let sz = block_size + if cluster_id < remainder { 1 } else { 0 };
-        for offset in 0..sz {
-            let original_idx = cell_keys[cursor + offset].0;
-            labels[original_idx] = cluster_id;
-        }
-        cursor += sz;
-    }
-
-    Ok(labels)
-}
-
-/// Double-L1 normalized `X`; k-means on columns via Gram `X^T X`; per-cell column-cluster sums;
-/// L2-normalize rows; k-means on cells only (no spectral term).
-fn cluster_cells_simple_column_kmeans(
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    let m = features.ncols();
-    let k = num_clusters.max(1).min(n);
-
-    let mut a = Array2::<f64>::zeros((n, m));
-    for i in 0..n {
-        for j in 0..m {
-            a[(i, j)] = features[(i, j)].max(0.0);
-        }
-    }
-    normalize_l1_rows_inplace(&mut a);
-    normalize_l1_cols_inplace(&mut a);
-
-    let g = gram_xt_x(&a);
-    let k_col = k.min(m).max(1);
-    let col_assign = match cluster_cells_with_kmeans(
-        &g,
-        k_col,
-        cluster_seed.map(|s| s.wrapping_add(6001)),
-    ) {
-        Ok(a) => a,
-        Err(_) => (0..m).map(|j| j % k_col).collect::<Vec<_>>(),
-    };
-
-    let mut agg = aggregate_rows_by_column_clusters(&a, &col_assign, k_col);
-    l2_normalize_rows_inplace(&mut agg);
-
-    let dataset = DatasetBase::from(agg);
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(6002)))
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means on column-cluster aggregates failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(20)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("k-means on column-cluster aggregates failed: {}", e))?
-    };
-
-    Ok(model.predict(&dataset).to_vec())
-}
-
-fn median_f64(mut xs: Vec<f64>) -> f64 {
-    if xs.is_empty() {
-        return 1.0;
-    }
-    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
-    let mid = xs.len() / 2;
-    if xs.len() % 2 == 0 {
-        (xs[mid - 1] + xs[mid]) * 0.5
-    } else {
-        xs[mid]
-    }
-}
-
-/// k-means on concatenated L2 features + weighted z-scored `(x,y)` when spectral graph is too large.
-fn cluster_cells_spatial_augmented_kmeans(
-    points: &[Point],
-    features: &Array2<f64>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    let m = features.ncols();
-    let k = num_clusters.max(1).min(n);
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    if points.len() != n {
-        anyhow::bail!("spatial augmented k-means: points/features length mismatch");
-    }
-    let mut mean_x = 0.0f64;
-    let mut mean_y = 0.0f64;
-    for p in points {
-        mean_x += p.x;
-        mean_y += p.y;
-    }
-    mean_x /= n as f64;
-    mean_y /= n as f64;
-    let mut vx = 0.0f64;
-    let mut vy = 0.0f64;
-    for p in points {
-        vx += (p.x - mean_x).powi(2);
-        vy += (p.y - mean_y).powi(2);
-    }
-    let sdx = (vx / n.max(1) as f64).max(1e-18).sqrt();
-    let sdy = (vy / n.max(1) as f64).max(1e-18).sqrt();
-    let w = 0.5f64;
-    let mut aug = Array2::<f64>::zeros((n, m + 2));
-    for i in 0..n {
-        for j in 0..m {
-            aug[(i, j)] = features[(i, j)];
-        }
-        aug[(i, m)] = w * (points[i].x - mean_x) / sdx;
-        aug[(i, m + 1)] = w * (points[i].y - mean_y) / sdy;
-    }
-    cluster_cells_with_kmeans(&aug, k, cluster_seed)
-}
-
-/// Combined spatial + expression kNN affinity, normalized Laplacian spectral embedding, k-means (`n` small);
-/// otherwise [`cluster_cells_spatial_augmented_kmeans`].
-fn cluster_cells_spatial_graph(
-    points: &[Point],
-    features: &Array2<f64>,
-    num_clusters: usize,
-    params: SpatialGraphParams,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    const DENSE_SPECTRAL_MAX_N: usize = 2048;
-
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    if points.len() != n {
-        anyhow::bail!("spatial graph: points/features length mismatch");
-    }
-    let k = num_clusters.max(1).min(n);
-    if k == 1 {
-        return Ok(vec![0; n]);
-    }
-    let m = features.ncols();
-
-    if n > DENSE_SPECTRAL_MAX_N {
-        warn!(
-            "spatial-graph clustering: n={} > {} — using augmented (expression + xy) k-means",
-            n, DENSE_SPECTRAL_MAX_N
-        );
-        return cluster_cells_spatial_augmented_kmeans(points, features, k, cluster_seed);
-    }
-
-    let ks = params.spatial_knn.max(1).min(n - 1);
-    let ke = params.expr_knn.max(1).min(n - 1);
-    let blend = params.blend.clamp(0.0, 1.0);
-
-    let mut d2 = vec![0.0f64; n * n];
-    let mut sim = vec![0.0f64; n * n];
-    for i in 0..n {
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            let dx = points[i].x - points[j].x;
-            let dy = points[i].y - points[j].y;
-            d2[i * n + j] = dx * dx + dy * dy;
-            let mut s = 0.0f64;
-            for t in 0..m {
-                s += features[(i, t)] * features[(j, t)];
-            }
-            sim[i * n + j] = s.max(0.0);
-        }
-    }
-
-    let mut spatial_d2_samples: Vec<f64> = Vec::new();
-    let mut expr_one_minus_sim: Vec<f64> = Vec::new();
-
-    for i in 0..n {
-        let mut order: Vec<usize> = (0..n).filter(|&j| j != i).collect();
-        order.sort_by(|&a, &b| {
-            d2[i * n + a]
-                .partial_cmp(&d2[i * n + b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &j in order.iter().take(ks) {
-            spatial_d2_samples.push(d2[i * n + j]);
-        }
-
-        order.sort_by(|&a, &b| {
-            sim[i * n + b]
-                .partial_cmp(&sim[i * n + a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &j in order.iter().take(ke) {
-            expr_one_minus_sim.push((1.0 - sim[i * n + j]).max(0.0));
-        }
-    }
-
-    let sigma_s_sq = median_f64(spatial_d2_samples).max(1e-18);
-    let tau_e = median_f64(expr_one_minus_sim).max(1e-6);
-
-    let mut w = vec![0.0f64; n * n];
-    for i in 0..n {
-        let mut order: Vec<usize> = (0..n).filter(|&j| j != i).collect();
-        order.sort_by(|&a, &b| {
-            d2[i * n + a]
-                .partial_cmp(&d2[i * n + b])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &j in order.iter().take(ks) {
-            let ws = (-0.5 * d2[i * n + j] / sigma_s_sq).exp();
-            w[i * n + j] += blend * ws;
-        }
-
-        order.sort_by(|&a, &b| {
-            sim[i * n + b]
-                .partial_cmp(&sim[i * n + a])
-                .unwrap_or(std::cmp::Ordering::Equal)
-        });
-        for &j in order.iter().take(ke) {
-            let we = (-(1.0 - sim[i * n + j]).max(0.0) / tau_e).exp();
-            w[i * n + j] += (1.0 - blend) * we;
-        }
-    }
-
-    for i in 0..n {
-        for j in 0..n {
-            if i != j {
-                let v = 0.5 * (w[i * n + j] + w[j * n + i]);
-                w[i * n + j] = v;
-                w[j * n + i] = v;
-            }
-        }
-    }
-
-    let eps = 1e-9f64;
-    for i in 0..n {
-        w[i * n + i] = eps;
-    }
-
-    let mut deg = vec![0.0f64; n];
-    for i in 0..n {
-        for j in 0..n {
-            deg[i] += w[i * n + j];
-        }
-        deg[i] = deg[i].max(1e-12);
-    }
-
-    let mut l_data = vec![0.0f64; n * n];
-    for i in 0..n {
-        let si = deg[i].sqrt();
-        for j in 0..n {
-            let sj = deg[j].sqrt();
-            let val = if i == j {
-                1.0 - w[i * n + j] / (si * sj)
-            } else {
-                -w[i * n + j] / (si * sj)
-            };
-            l_data[i * n + j] = val;
-        }
-    }
-
-    let l_sym = DMatrix::from_row_slice(n, n, &l_data);
-    let decomp = SymmetricEigen::new(l_sym);
-    let evecs = decomp.eigenvectors;
-    let n_ev = k.min(n - 1).max(1);
-    let mut embed = Array2::<f64>::zeros((n, n_ev));
-    for col in 0..n_ev {
-        let src = col + 1;
-        if src >= n {
-            break;
-        }
-        for row in 0..n {
-            embed[(row, col)] = evecs[(row, src)];
-        }
-    }
-
-    let dataset = DatasetBase::from(embed);
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(7001)))
-            .max_n_iterations(30)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("spatial-graph spectral k-means failed: {}", e))?
-    } else {
-        KMeans::params(k)
-            .max_n_iterations(30)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("spatial-graph spectral k-means failed: {}", e))?
-    };
-    Ok(model.predict(&dataset).to_vec())
-}
-
-fn bounds_xy(points: &[Point]) -> (f64, f64, f64, f64) {
-    let mut xmin = f64::INFINITY;
-    let mut xmax = f64::NEG_INFINITY;
-    let mut ymin = f64::INFINITY;
-    let mut ymax = f64::NEG_INFINITY;
-    for p in points {
-        xmin = xmin.min(p.x);
-        xmax = xmax.max(p.x);
-        ymin = ymin.min(p.y);
-        ymax = ymax.max(p.y);
-    }
-    if !xmin.is_finite() || !xmax.is_finite() {
-        (0.0, 1.0, 0.0, 1.0)
-    } else {
-        (xmin, xmax, ymin, ymax)
-    }
-}
-
-/// Fractional axial coords, then cube rounding → integer axial (q, r).
-fn axial_hex_round(q: f64, r: f64) -> (i32, i32) {
-    let x = q;
-    let y = r;
-    let z = -q - r;
-    let mut rx = x.round() as i32;
-    let mut ry = y.round() as i32;
-    let mut rz = z.round() as i32;
-    let x_diff = (rx as f64 - x).abs();
-    let y_diff = (ry as f64 - y).abs();
-    let z_diff = (rz as f64 - z).abs();
-    if x_diff > y_diff && x_diff > z_diff {
-        rx = -ry - rz;
-    } else if y_diff > z_diff {
-        ry = -rx - rz;
-    } else {
-        let new_z = -rx - ry;
-        rz = new_z;
-    }
-    debug_assert_eq!(rx + ry + rz, 0);
-    let _ = rz;
-    (rx, ry)
-}
-
-/// Pointy-top hex: pixel (x,y) relative to origin → fractional axial (q,r).
-fn pixel_to_axial_hex(x: f64, y: f64, hex_size: f64) -> (f64, f64) {
-    let s = hex_size.max(1e-18);
-    let q = (3f64.sqrt() / 3.0 * x - 1.0 / 3.0 * y) / s;
-    let r = (2.0 / 3.0 * y) / s;
-    (q, r)
-}
-
-/// Pointy-top hex center (pixel space) for integer axial (q, r).
-fn axial_hex_center_xy(q: i32, r: i32, hex_size: f64) -> (f64, f64) {
-    let s = hex_size.max(1e-18);
-    let q = q as f64;
-    let r = r as f64;
-    let x = s * (3f64.sqrt() * q + 3f64.sqrt() / 2.0 * r);
-    let y = s * (3.0 / 2.0 * r);
-    (x, y)
-}
-
-/// Discretize the slide into tiles, then k-means on `[per-cell buckets \| tile embedding]`.
-fn cluster_cells_tensor_grid(
-    points: &[Point],
-    features: &Array2<f64>,
-    num_clusters: usize,
-    params: TensorGridParams,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let n = features.nrows();
-    if n == 0 {
-        return Ok(Vec::new());
-    }
-    if points.len() != n {
-        anyhow::bail!("tensor-grid: points/features length mismatch");
-    }
-    let k = num_clusters.max(1).min(n);
-    let m = features.ncols();
-    let nx = params.nx.max(1);
-    let ny = params.ny.max(1);
-    let w_t = params.tile_weight.max(0.0);
-
-    let (xmin, xmax, ymin, ymax) = bounds_xy(points);
-    let span_x = (xmax - xmin).max(1e-18);
-    let span_y = (ymax - ymin).max(1e-18);
-
-    let mut tile_id: Vec<usize> = Vec::with_capacity(n);
-    let mut center_tx: Vec<f64> = Vec::with_capacity(n);
-    let mut center_ty: Vec<f64> = Vec::with_capacity(n);
-
-    match params.disc {
-        TensorGridDisc::Rect => {
-            for i in 0..n {
-                let x = points[i].x;
-                let y = points[i].y;
-                let fx = ((x - xmin) / span_x * nx as f64).floor() as i64;
-                let fy = ((y - ymin) / span_y * ny as f64).floor() as i64;
-                let ix = fx.clamp(0, nx as i64 - 1) as usize;
-                let iy = fy.clamp(0, ny as i64 - 1) as usize;
-                let tid = ix + iy * nx;
-                tile_id.push(tid);
-                center_tx.push((ix as f64 + 0.5) / nx as f64);
-                center_ty.push((iy as f64 + 0.5) / ny as f64);
-            }
-        }
-        TensorGridDisc::Hex => {
-            let hex_size = (span_x / (nx as f64 * 1.25 + 0.25))
-                .max(span_y / (ny as f64 * 1.25 + 0.25))
-                .max(1e-18);
-            let mut axial: Vec<(i32, i32)> = Vec::with_capacity(n);
-            for i in 0..n {
-                let x = points[i].x - xmin;
-                let y = points[i].y - ymin;
-                let (fq, fr) = pixel_to_axial_hex(x, y, hex_size);
-                axial.push(axial_hex_round(fq, fr));
-            }
-            let min_q = axial.iter().map(|(q, _)| *q).min().unwrap_or(0);
-            let min_r = axial.iter().map(|(_, r)| *r).min().unwrap_or(0);
-            let max_r = axial.iter().map(|(_, r)| *r).max().unwrap_or(0);
-            let nr = (max_r - min_r + 1).max(1) as usize;
-            for i in 0..n {
-                let (iq, ir) = axial[i];
-                let tid = (iq - min_q) as usize * nr + (ir - min_r) as usize;
-                tile_id.push(tid);
-                let (cx, cy) = axial_hex_center_xy(iq, ir, hex_size);
-                center_tx.push((cx / span_x).clamp(0.0, 1.0));
-                center_ty.push((cy / span_y).clamp(0.0, 1.0));
-            }
-        }
-    }
-
-    let num_tiles = tile_id.iter().copied().max().unwrap_or(0) + 1;
-    let use_onehot = num_tiles <= params.onehot_max_tiles.max(1) && num_tiles <= 4096;
-
-    if use_onehot {
-        let mut aug = Array2::<f64>::zeros((n, m + num_tiles));
-        for i in 0..n {
-            for j in 0..m {
-                aug[(i, j)] = features[(i, j)];
-            }
-            aug[(i, m + tile_id[i])] = w_t;
-        }
-        cluster_cells_with_kmeans(&aug, k, cluster_seed)
-    } else {
-        let mut aug = Array2::<f64>::zeros((n, m + 2));
-        for i in 0..n {
-            for j in 0..m {
-                aug[(i, j)] = features[(i, j)];
-            }
-            aug[(i, m)] = w_t * center_tx[i];
-            aug[(i, m + 1)] = w_t * center_ty[i];
-        }
-        cluster_cells_with_kmeans(&aug, k, cluster_seed)
-    }
-}
-
-fn cluster_cells(
-    method: CellClusterMethodArg,
-    features: &Array2<f64>,
-    num_clusters: usize,
-    points: &[Point],
-    spatial: SpatialGraphParams,
-    tensor_grid: TensorGridParams,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<usize>> {
-    let _ = points;
-    let _ = spatial;
-    let _ = tensor_grid;
-    match method {
-        CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features, num_clusters, cluster_seed),
-        CellClusterMethodArg::SvdJoint => {
-            // Normally handled by joint_bicluster_kluger / joint_svd_seriation in
-            // run_clustered_compression; this branch is only reached as a fallback.
-            cluster_cells_with_kmeans(features, num_clusters, cluster_seed)
-        }
-    }
-}
-
-fn group_points_by_cluster(assignments: &[usize], num_clusters: usize) -> Vec<Vec<usize>> {
-    let mut clusters = vec![Vec::new(); num_clusters];
-    for (point_idx, &cluster_id) in assignments.iter().enumerate() {
-        if cluster_id < num_clusters {
-            clusters[cluster_id].push(point_idx);
-        }
-    }
-    clusters.retain(|cluster| !cluster.is_empty());
-    clusters
-}
-
-fn slice_feature_rows(features: &Array2<f64>, row_ids: &[usize]) -> Array2<f64> {
-    let mut sliced = Array2::<f64>::zeros((row_ids.len(), features.ncols()));
-    for (dst_row, &src_row) in row_ids.iter().enumerate() {
-        for col in 0..features.ncols() {
-            sliced[(dst_row, col)] = features[(src_row, col)];
-        }
-    }
-    sliced
-}
-
-fn split_oversized_clusters(
-    points: &[Point],
-    initial_clusters: Vec<Vec<usize>>,
-    features: &Array2<f64>,
-    max_cluster_size: Option<usize>,
-    cell_cluster_method: CellClusterMethodArg,
-    spatial: SpatialGraphParams,
-    tensor_grid: TensorGridParams,
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<Vec<Vec<usize>>> {
-    let Some(max_cluster_size_raw) = max_cluster_size else {
-        return Ok(initial_clusters);
-    };
-    let max_cluster_size = max_cluster_size_raw.max(1);
-
-    let mut pending = initial_clusters;
-    let mut final_clusters = Vec::new();
-
-    while let Some(cluster) = pending.pop() {
-        if cluster.len() <= max_cluster_size {
-            final_clusters.push(cluster);
-            continue;
-        }
-
-        let split_k = ((cluster.len() + max_cluster_size - 1) / max_cluster_size)
-            .max(2)
-            .min(cluster.len());
-
-        info!(
-            "Re-clustering oversized cluster: size={} target_subclusters={} max_cluster_size={}",
-            cluster.len(),
-            split_k,
-            max_cluster_size
-        );
-
-        let subfeatures = slice_feature_rows(features, &cluster);
-        let subpoints: Vec<Point> = cluster.iter().map(|&i| points[i].clone()).collect();
-        let sub_assignments = match cluster_cells(
-            cell_cluster_method,
-            &subfeatures,
-            split_k,
-            &subpoints,
-            spatial,
-            tensor_grid,
-            cluster_seed.map(|s| s.wrapping_add(cluster.len() as u64)),
-        ) {
-            Ok(a) => a,
-            Err(err) => {
-                warn!(
-                    "Sub-clustering failed ({}). Falling back to deterministic chunk split.",
-                    err
-                );
-                let mut offset = 0usize;
-                while offset < cluster.len() {
-                    let end = (offset + max_cluster_size).min(cluster.len());
-                    final_clusters.push(cluster[offset..end].to_vec());
-                    offset = end;
-                }
-                continue;
-            }
-        };
-
-        let local_clusters = group_points_by_cluster(&sub_assignments, split_k);
-        let max_local_size = local_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
-        if local_clusters.len() <= 1 || max_local_size == cluster.len() {
-            warn!(
-                "Sub-clustering made no progress (size={}): using deterministic chunk split.",
-                cluster.len()
-            );
-            let mut offset = 0usize;
-            while offset < cluster.len() {
-                let end = (offset + max_cluster_size).min(cluster.len());
-                final_clusters.push(cluster[offset..end].to_vec());
-                offset = end;
-            }
-            continue;
-        }
-
-        for local_cluster in local_clusters {
-            let mapped: Vec<usize> = local_cluster
-                .into_iter()
-                .map(|local_idx| cluster[local_idx])
-                .collect();
-            if mapped.len() > max_cluster_size {
-                pending.push(mapped);
-            } else {
-                final_clusters.push(mapped);
-            }
-        }
-    }
-
-    final_clusters.sort_unstable_by_key(|cluster| cluster[0]);
-    Ok(final_clusters)
-}
-
-fn projection_weight(col: usize, seed: u64) -> f64 {
-    let mut z = (col as u64)
-        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(seed);
-    z ^= z >> 30;
-    z = z.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-    z ^= z >> 27;
-    z = z.wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^= z >> 31;
-    let unit = (z as f64) / (u64::MAX as f64);
-    (unit * 2.0) - 1.0
-}
-
-fn reorder_rows_within_clusters(
-    clusters: &[Vec<usize>],
-    features: &Array2<f64>,
-) -> Vec<Vec<usize>> {
-    let ncols = features.ncols();
-    let w1: Vec<f64> = (0..ncols)
-        .map(|c| projection_weight(c, 0x1234_5678_9ABC_DEF0))
-        .collect();
-    let w2: Vec<f64> = (0..ncols)
-        .map(|c| projection_weight(c, 0x0FED_CBA9_8765_4321))
-        .collect();
-
-    if mst_codec::is_deterministic_mode() {
-        clusters
-            .iter()
-            .map(|cluster| {
-                let mut scored = Vec::with_capacity(cluster.len());
-                for &point_idx in cluster {
-                    let mut p1 = 0.0f64;
-                    let mut p2 = 0.0f64;
-                    for col in 0..ncols {
-                        let v = features[(point_idx, col)];
-                        p1 += v * w1[col];
-                        p2 += v * w2[col];
-                    }
-                    scored.push((point_idx, p1, p2));
-                }
-
-                scored.sort_unstable_by(|a, b| {
-                    a.1.total_cmp(&b.1)
-                        .then_with(|| a.2.total_cmp(&b.2))
-                        .then_with(|| a.0.cmp(&b.0))
-                });
-                scored.into_iter().map(|(idx, _, _)| idx).collect()
-            })
-            .collect()
-    } else {
-        clusters
-            .par_iter()
-            .map(|cluster| {
-            let mut scored = Vec::with_capacity(cluster.len());
-            for &point_idx in cluster {
-                let mut p1 = 0.0f64;
-                let mut p2 = 0.0f64;
-                for col in 0..ncols {
-                    let v = features[(point_idx, col)];
-                    p1 += v * w1[col];
-                    p2 += v * w2[col];
-                }
-                scored.push((point_idx, p1, p2));
-            }
-
-            scored.sort_unstable_by(|a, b| {
-                a.1.total_cmp(&b.1)
-                    .then_with(|| a.2.total_cmp(&b.2))
-                    .then_with(|| a.0.cmp(&b.0))
-            });
-            scored.into_iter().map(|(idx, _, _)| idx).collect()
-            })
-            .collect()
-    }
-}
 
 fn compute_gene_permutation_from_row_stream(
     points: &[Point],
@@ -1917,226 +623,6 @@ fn compute_gene_permutation_kmeans(
     Ok((new_to_old, old_to_new))
 }
 
-/// Joint SVD seriation: one SVD on a TF-IDF-style cell×gene matrix, then either
-/// lexicographic sort + equal contiguous blocks, or k-means on the cell embedding;
-/// genes sorted by right singular vectors.
-fn joint_svd_seriation(
-    points: &[Point],
-    data: &CsMat<u16>,
-    num_clusters: usize,
-    cluster_seed: Option<u64>,
-    matrix: SvdJointMatrixArg,
-    cell_groups: SvdJointCellGroupsArg,
-) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
-    let n_cells = points.len();
-    let n_genes = data.cols();
-
-    if n_cells == 0 {
-        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
-    }
-
-    let k = num_clusters.max(1).min(n_cells);
-
-    let mut col_nnz = vec![0u64; n_genes];
-    let mut triplets: Vec<(usize, usize, u16)> = Vec::new();
-    for (ci, point) in points.iter().enumerate() {
-        if let Some(row) = data.outer_view(point.row_index) {
-            for (gene_idx, &value) in row.iter() {
-                if value != 0 {
-                    col_nnz[gene_idx] += 1;
-                    triplets.push((ci, gene_idx, value));
-                }
-            }
-        }
-    }
-
-    let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
-    if active_genes.len() <= 2 {
-        return Ok((
-            (0..n_cells).map(|i| i % k).collect(),
-            (0..n_genes as u32).collect(),
-            (0..n_genes as u32).collect(),
-        ));
-    }
-
-    let max_svd_rows = 4000usize;
-    let max_svd_cols = 2000usize;
-
-    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
-        if let Some(seed) = cluster_seed {
-            let mut ranked_rows: Vec<(u64, usize)> = (0..n_cells)
-                .map(|row| {
-                    let mut x = (row as u64) ^ seed ^ 0x9E37_79B9_7F4A_7C15;
-                    x ^= x >> 30;
-                    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
-                    x ^= x >> 27;
-                    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
-                    x ^= x >> 31;
-                    (x, row)
-                })
-                .collect();
-            ranked_rows.sort_unstable();
-            let mut sample: Vec<usize> = ranked_rows
-                .into_iter()
-                .take(max_svd_rows)
-                .map(|(_, row)| row)
-                .collect();
-            sample.sort_unstable();
-            sample
-        } else {
-            let step = n_cells as f64 / max_svd_rows as f64;
-            (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
-        }
-    } else {
-        (0..n_cells).collect()
-    };
-
-    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
-        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
-        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        by_freq.truncate(max_svd_cols);
-        by_freq.sort_unstable_by_key(|&(g, _)| g);
-        by_freq.iter().map(|&(g, _)| g).collect()
-    } else {
-        active_genes.clone()
-    };
-
-    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
-    for (local, &global) in active_cols.iter().enumerate() {
-        col_local.insert(global, local);
-    }
-
-    let nr = sampled_rows.len();
-    let nc = active_cols.len();
-
-    // TF-IDF-style support depending on selected matrix mode.
-    let mut dense = vec![0.0f64; nr * nc];
-    let sampled_set: HashMap<usize, usize> =
-        sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
-
-    for &(ci, gene_idx, value) in &triplets {
-        if let Some(&local_row) = sampled_set.get(&ci) {
-            if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] =
-                    svd_joint_entry_weight(matrix, col_nnz[gene_idx], value);
-            }
-        }
-    }
-
-    let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let svd = mat.svd(true, true);
-    let (u, v_t) = match (svd.u, svd.v_t) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => {
-            return Ok((
-                (0..n_cells).map(|i| i % k).collect(),
-                (0..n_genes as u32).collect(),
-                (0..n_genes as u32).collect(),
-            ));
-        }
-    };
-
-    // --- CELL SIDE: embed all cells via U, Nyström for unsampled, then sort ---
-    let n_comp = k.min(u.ncols()).max(1);
-    let sigma = &svd.singular_values;
-
-    let mut cell_emb: Vec<Vec<f64>> = vec![vec![0.0f64; n_comp]; n_cells];
-    for ci in 0..n_cells {
-        if let Some(&lr) = sampled_set.get(&ci) {
-            for j in 0..n_comp {
-                cell_emb[ci][j] = u[(lr, j)];
-            }
-        } else {
-            let point = &points[ci];
-            if let Some(row) = data.outer_view(point.row_index) {
-                for j in 0..n_comp {
-                    let sig_inv = if sigma[j] > 1e-12 { 1.0 / sigma[j] } else { 0.0 };
-                    let mut dot = 0.0f64;
-                    for (g, &v) in row.iter() {
-                        if v != 0 {
-                            if let Some(&lc) = col_local.get(&g) {
-                                let tfidf = svd_joint_entry_weight(matrix, col_nnz[g], v);
-                                dot += tfidf * v_t[(j, lc)];
-                            }
-                        }
-                    }
-                    cell_emb[ci][j] = dot * sig_inv;
-                }
-            }
-        }
-    }
-
-    let cell_labels = match cell_groups {
-        SvdJointCellGroupsArg::KmeansEmbedding => {
-            let mut feat = Array2::<f64>::zeros((n_cells, n_comp));
-            for ci in 0..n_cells {
-                for j in 0..n_comp {
-                    feat[(ci, j)] = cell_emb[ci][j];
-                }
-            }
-            cluster_cells_with_kmeans(&feat, k, cluster_seed)?
-        }
-        SvdJointCellGroupsArg::SeriationEqual => {
-            let mut order: Vec<usize> = (0..n_cells).collect();
-            order.sort_unstable_by(|&a, &b| {
-                for (ca, cb) in cell_emb[a].iter().zip(cell_emb[b].iter()) {
-                    match ca.total_cmp(cb) {
-                        std::cmp::Ordering::Equal => continue,
-                        ord => return ord,
-                    }
-                }
-                a.cmp(&b)
-            });
-            let mut labels = vec![0usize; n_cells];
-            let block_size = n_cells / k;
-            let remainder = n_cells % k;
-            let mut offset = 0usize;
-            for cluster_id in 0..k {
-                let sz = block_size + if cluster_id < remainder { 1 } else { 0 };
-                for pos in offset..offset + sz {
-                    let ci = order[pos];
-                    labels[ci] = cluster_id;
-                }
-                offset += sz;
-            }
-            labels
-        }
-    };
-
-    // --- GENE SIDE: sort genes by (v₁, v₂) ---
-    let n_sv = v_t.nrows().min(2);
-    let mut scores: Vec<(usize, f64, f64)> = Vec::with_capacity(n_genes);
-    for &global_gene in &active_cols {
-        let lc = col_local[&global_gene];
-        let s1 = if n_sv >= 1 { v_t[(0, lc)] } else { 0.0 };
-        let s2 = if n_sv >= 2 { v_t[(1, lc)] } else { 0.0 };
-        scores.push((global_gene, s1, s2));
-    }
-    for g in 0..n_genes {
-        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
-            scores.push((g, f64::INFINITY, g as f64));
-        }
-    }
-    scores.sort_unstable_by(|a, b| {
-        a.1.total_cmp(&b.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut gene_old_to_new = vec![0u32; n_genes];
-    let mut gene_new_to_old = Vec::with_capacity(n_genes);
-    for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
-        gene_old_to_new[old_idx] = new_idx as u32;
-        gene_new_to_old.push(old_idx as u32);
-    }
-
-    info!(
-        "Joint SVD seriation: {} cells -> {} clusters (matrix={:?}, cell_groups={:?}), {} genes reordered ({} active in SVD)",
-        n_cells, k, matrix, cell_groups, n_genes, nc
-    );
-
-    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
-}
 
 fn downsample_values(values: &[u16], max_values: usize) -> Vec<u16> {
     if values.len() <= max_values {
@@ -2285,11 +771,12 @@ fn sparse_quantization_sse(original: &CsMat<u16>, quantized: &CsMat<u16>) -> any
     Ok(sse)
 }
 
+/// Serialized layout: `encoded_blocks`, then `positions`. Row/gene order permutations are
+/// not stored on disk (smaller archives; [`decode_clustered_payload`] returns empty order
+/// vectors for new payloads).
 fn serialize_payload(
     encoded_blocks: &[EncodedClusterBlock],
     positions: &[DatalessPoint],
-    row_order: &[u32],
-    gene_order: &[u32],
 ) -> anyhow::Result<Vec<u8>> {
     let config = bincode::config::standard()
         .with_little_endian()
@@ -2297,8 +784,6 @@ fn serialize_payload(
     let mut payload = Vec::new();
     bincode::encode_into_std_write(encoded_blocks, &mut payload, config)?;
     bincode::encode_into_std_write(positions, &mut payload, config)?;
-    bincode::encode_into_std_write(row_order, &mut payload, config)?;
-    bincode::encode_into_std_write(gene_order, &mut payload, config)?;
     Ok(payload)
 }
 
@@ -2354,15 +839,8 @@ fn estimate_compressed_payload_size(
     compression: PayloadCompressionArg,
     encoded_blocks: &[EncodedClusterBlock],
     positions: &[DatalessPoint],
-    row_order: &[u32],
-    gene_order: &[u32],
 ) -> anyhow::Result<usize> {
-    let payload = serialize_payload(
-        encoded_blocks,
-        positions,
-        row_order,
-        gene_order,
-    )?;
+    let payload = serialize_payload(encoded_blocks, positions)?;
     Ok(compress_payload_bytes(&payload, compression)?.len())
 }
 
@@ -3008,8 +1486,6 @@ fn run_clustered_compression(
     gene_reorder_method: GeneReorderMethod,
     gene_blocks: usize,
     payload_compression: PayloadCompressionArg,
-    svd_joint_matrix: SvdJointMatrixArg,
-    svd_joint_cell_groups: SvdJointCellGroupsArg,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
@@ -3020,14 +1496,7 @@ fn run_clustered_compression(
 
     // Joint path: one operation produces both cell assignments and gene ordering.
     let joint_result = if cell_cluster_method == CellClusterMethodArg::SvdJoint {
-        match joint_svd_seriation(
-            points,
-            data,
-            requested_clusters,
-            cluster_seed,
-            svd_joint_matrix,
-            svd_joint_cell_groups,
-        ) {
+        match joint_svd_seriation(points, data, requested_clusters, cluster_seed) {
             Ok(result) => Some(result),
             Err(e) => {
                 warn!("Joint SVD seriation failed ({}), falling back to separate cell+gene", e);
@@ -3332,67 +1801,10 @@ fn run_clustered_compression(
                 bool,
             )>,
         >,
-    > = if mst_codec::is_deterministic_mode() {
-        clusters
-            .iter()
-            .enumerate()
-            .map(|(cluster_idx, cluster)| {
-                if cluster.is_empty() {
-                    return Ok(None);
-                }
-
-                let cluster_points: Vec<Point> =
-                    cluster.iter().map(|&idx| points[idx].clone()).collect();
-
-                let mut tile_blocks = Vec::with_capacity(effective_gene_blocks);
-                let mut total_bytes = 0usize;
-                let mut first_order: Option<Vec<u32>> = None;
-                let mut any_row_fallback = false;
-                let mut any_col_fallback = false;
-
-                for (gb_idx, _gene_block_range) in gene_block_ranges.iter().enumerate() {
-                    let (encoded, local_order, bytes, row_fb, col_fb) =
-                        encode_tile(&cluster_points, &block_gene_o2ns[gb_idx], cluster_idx)?;
-                    total_bytes += bytes;
-                    if first_order.is_none() {
-                        first_order = Some(local_order);
-                    }
-                    any_row_fallback |= row_fb;
-                    any_col_fallback |= col_fb;
-                    tile_blocks.push(encoded);
-                }
-
-                let local_order =
-                    first_order.unwrap_or_else(|| (0..cluster_points.len() as u32).collect());
-                let mut cluster_positions = Vec::with_capacity(cluster_points.len());
-                let mut cluster_row_order = Vec::with_capacity(cluster_points.len());
-
-                for &local_idx_u32 in &local_order {
-                    let local_idx = local_idx_u32 as usize;
-                    let point = cluster_points
-                        .get(local_idx)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid local order index {}", local_idx))?;
-                    cluster_positions.push(DatalessPoint::new(point.x, point.y));
-                    cluster_row_order.push(point.row_index as u32);
-                }
-
-                Ok(Some((
-                    cluster_idx,
-                    tile_blocks,
-                    cluster_positions,
-                    cluster_row_order,
-                    cluster_points.len(),
-                    total_bytes,
-                    any_row_fallback,
-                    any_col_fallback,
-                )))
-            })
-            .collect()
-    } else {
-        clusters
-            .par_iter()
-            .enumerate()
-            .map(|(cluster_idx, cluster)| {
+    > = clusters
+        .par_iter()
+        .enumerate()
+        .map(|(cluster_idx, cluster)| {
             if cluster.is_empty() {
                 return Ok(None);
             }
@@ -3441,9 +1853,8 @@ fn run_clustered_compression(
                 any_row_fallback,
                 any_col_fallback,
             )))
-            })
-            .collect()
-    };
+        })
+        .collect();
 
     let mut ordered = Vec::new();
     for result in cluster_results {
@@ -3536,8 +1947,6 @@ fn run_clustered_compression(
         payload_compression,
         &encoded_blocks,
         &positions,
-        &row_order,
-        &gene_order,
     )?;
     let rate_bits_per_value = (compressed_bytes_estimate as f64 * 8.0) / total_entries as f64;
 
@@ -3553,8 +1962,6 @@ fn run_clustered_compression(
         cluster_sizes,
         encoded_blocks,
         positions,
-        row_order,
-        gene_order,
     })
 }
 
@@ -3620,8 +2027,19 @@ fn decode_clustered_payload(
     let encoded_blocks: Vec<EncodedClusterBlock> =
         bincode::decode_from_std_read(&mut payload_reader, config)?;
     let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut payload_reader, config)?;
-    let row_order: Vec<u32> = bincode::decode_from_std_read(&mut payload_reader, config)?;
-    let gene_order: Vec<u32> = bincode::decode_from_std_read(&mut payload_reader, config)?;
+    let end = payload_reader.get_ref().len();
+    let pos = payload_reader.position() as usize;
+    let row_order = if pos < end {
+        bincode::decode_from_std_read(&mut payload_reader, config)?
+    } else {
+        Vec::new()
+    };
+    let pos = payload_reader.position() as usize;
+    let gene_order = if pos < end {
+        bincode::decode_from_std_read(&mut payload_reader, config)?
+    } else {
+        Vec::new()
+    };
     Ok((encoded_blocks, positions, row_order, gene_order))
 }
 
@@ -3632,6 +2050,11 @@ fn reconstruct_csr_from_clustered_payload(
     nrows: usize,
     ncols: usize,
 ) -> anyhow::Result<CsMat<u16>> {
+    if row_order.is_empty() {
+        anyhow::bail!(
+            "Cannot reconstruct CSR: payload has no row_order (and possibly no gene_order); current encoder omits these from the bincode stream"
+        );
+    }
     let mut tri = sprs::TriMatI::<u16, usize>::new((nrows, ncols));
     let mut cursor = 0usize;
 
@@ -3834,15 +2257,9 @@ struct BuildCommand {
     /// How to cluster cells (`kmeans` or `svd-joint`).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
-    /// Optional RNG seed. When set, forces deterministic mode (single-thread, stable MST ties).
+    /// Optional RNG seed for cell clustering/SVD stages.
     #[arg(long = "set-seed", visible_alias = "cluster-seed")]
     set_seed: Option<u64>,
-    /// For `svd-joint` only: SVD matrix weights — raw count (default), binary TF-IDF, or log1p(count).
-    #[arg(long = "svd-joint-matrix", value_enum, default_value_t = SvdJointMatrixArg::RawCount)]
-    svd_joint_matrix: SvdJointMatrixArg,
-    /// For `svd-joint` only: equal contiguous blocks after seriation (default) or k-means on the SVD embedding.
-    #[arg(long = "svd-joint-cell-groups", value_enum, default_value_t = SvdJointCellGroupsArg::SeriationEqual)]
-    svd_joint_cell_groups: SvdJointCellGroupsArg,
     /// If set, run all cell-cluster methods and append one stats row per method.
     #[arg(long = "cell-cluster-method-sweep-all", visible_alias = "cluster-all", default_value_t = false)]
     cell_cluster_method_sweep_all: bool,
@@ -4074,14 +2491,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Build(args) => {
-            // Deterministic mode is enabled when a seed is provided.
-            let deterministic = args.set_seed.is_some();
-            mst_codec::set_deterministic_mode(deterministic);
-            if deterministic {
-                // Force single-threaded rayon to eliminate scheduling nondeterminism.
-                // Ignore error if the global pool was already initialized.
-                let _ = rayon::ThreadPoolBuilder::new().num_threads(1).build_global();
-            }
             let (csr, points) = match args.platform {
                 Some(Platform::SingleCell) => {
                     // Single-cell mode: no positions file required; generate dummy points.
@@ -4217,8 +2626,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         *gene_reorder_method,
                         args.gene_blocks,
                         args.output_compression,
-                        args.svd_joint_matrix,
-                        args.svd_joint_cell_groups,
                     )?;
 
                     info!(
@@ -4264,12 +2671,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let actual_gzip_bytes = if args.no_output {
                 // Keep size metrics available while skipping disk writes.
-                let payload = serialize_payload(
-                    &selected.encoded_blocks,
-                    &selected.positions,
-                    &selected.row_order,
-                    &selected.gene_order,
-                )?;
+                let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
                 compress_payload_bytes(&payload, args.output_compression)?.len()
             } else {
                 let mut output = args
@@ -4284,12 +2686,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if sweep_configs.len() > 1 {
                     output = output_path_with_label_suffix(&output, config_label);
                 }
-                let payload = serialize_payload(
-                    &selected.encoded_blocks,
-                    &selected.positions,
-                    &selected.row_order,
-                    &selected.gene_order,
-                )?;
+                let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
                 let compressed = compress_payload_bytes(&payload, args.output_compression)?;
                 let file = File::create(&output)?;
                 let mut writer = BufWriter::new(file);
@@ -4345,7 +2742,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let value_bytes =
                 bytes_root_indices + bytes_root_vals + bytes_indices + bytes_delta_vals;
             let mst_payload_bytes = topology_bytes + value_bytes + bytes_num_genes;
-            let gene_order_bytes = selected.gene_order.len() * std::mem::size_of::<u32>();
+            let gene_order_bytes = csr.cols() * std::mem::size_of::<u32>();
             let payload_with_col_order = mst_payload_bytes + gene_order_bytes;
 
             if args.no_output {
@@ -4367,7 +2764,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 selected.mse, selected.rmse, actual_rate
             );
             info!(
-                "MST breakdown: topology(parent_offset)={} bytes, values(root+ops)={} bytes, metadata(num_genes)={} bytes, column_order={} bytes, total={} bytes",
+                "MST breakdown: topology(parent_offset)={} bytes, values(root+ops)={} bytes, metadata(num_genes)={} bytes, gene_order_if_serialized={} bytes, total={} bytes",
                 topology_bytes,
                 value_bytes,
                 bytes_num_genes,
@@ -4429,11 +2826,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let (encoded_blocks, _positions, row_order, gene_order) =
                 decode_clustered_payload(&args.encoded, args.input_compression)?;
             info!(
-                "Loaded payload: blocks={}, mapped_rows={}, gene_order_len={}",
+                "Loaded payload: blocks={}, row_order_len={}, gene_order_len={}",
                 encoded_blocks.len(),
                 row_order.len(),
                 gene_order.len()
             );
+            if row_order.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "Round-trip check requires row_order (and typically gene_order) in the payload; current builds omit these for a smaller archive. Use an older payload or a matching encoder/decoder pair."
+                )
+                .into());
+            }
 
             let (csr_truth, _points) = load_10x_with_positions(
                 &args.input,
@@ -4527,8 +2930,6 @@ mod tests {
             GeneReorderMethod::Projection,
             1,
             PayloadCompressionArg::Zstd,
-            SvdJointMatrixArg::TfidfBinary,
-            SvdJointCellGroupsArg::SeriationEqual,
         )
         .expect("lossy compression should succeed");
 
@@ -4576,8 +2977,6 @@ mod tests {
             GeneReorderMethod::Projection,
             1,
             PayloadCompressionArg::Zstd,
-            SvdJointMatrixArg::TfidfBinary,
-            SvdJointCellGroupsArg::SeriationEqual,
         )
         .expect("svd-joint seriation path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
