@@ -1812,15 +1812,38 @@ fn run_clustered_compression(
             let cluster_points: Vec<Point> =
                 cluster.iter().map(|&idx| points[idx].clone()).collect();
 
+            // Encode all gene blocks for this cluster concurrently, then re-order by
+            // block index to keep output deterministic.
+            let tile_results: Vec<anyhow::Result<(
+                usize,
+                EncodedClusterBlock,
+                Vec<u32>,
+                usize,
+                bool,
+                bool,
+            )>> = block_gene_o2ns
+                .par_iter()
+                .enumerate()
+                .map(|(gb_idx, block_gene_o2n)| {
+                    let (encoded, local_order, bytes, row_fb, col_fb) =
+                        encode_tile(&cluster_points, block_gene_o2n, cluster_idx)?;
+                    Ok((gb_idx, encoded, local_order, bytes, row_fb, col_fb))
+                })
+                .collect();
+
+            let mut ordered_tiles = Vec::with_capacity(effective_gene_blocks);
+            for result in tile_results {
+                ordered_tiles.push(result?);
+            }
+            ordered_tiles.sort_unstable_by_key(|(gb_idx, _, _, _, _, _)| *gb_idx);
+
             let mut tile_blocks = Vec::with_capacity(effective_gene_blocks);
             let mut total_bytes = 0usize;
             let mut first_order: Option<Vec<u32>> = None;
             let mut any_row_fallback = false;
             let mut any_col_fallback = false;
 
-            for (gb_idx, _gene_block_range) in gene_block_ranges.iter().enumerate() {
-                let (encoded, local_order, bytes, row_fb, col_fb) =
-                    encode_tile(&cluster_points, &block_gene_o2ns[gb_idx], cluster_idx)?;
+            for (_gb_idx, encoded, local_order, bytes, row_fb, col_fb) in ordered_tiles {
                 total_bytes += bytes;
                 if first_order.is_none() {
                     first_order = Some(local_order);
@@ -1830,7 +1853,8 @@ fn run_clustered_compression(
                 tile_blocks.push(encoded);
             }
 
-            let local_order = first_order.unwrap_or_else(|| (0..cluster_points.len() as u32).collect());
+            let local_order =
+                first_order.unwrap_or_else(|| (0..cluster_points.len() as u32).collect());
             let mut cluster_positions = Vec::with_capacity(cluster_points.len());
             let mut cluster_row_order = Vec::with_capacity(cluster_points.len());
 
