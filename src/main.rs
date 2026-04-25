@@ -14,8 +14,9 @@ use index_stream::IndexStreamCodec;
 use matrix_io::{load_10x_no_positions, load_10x_with_positions, InputPosType, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
-    encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
-    EncodedColumnBlock, EncodedDiffsMST, KnnDistanceMetric, MstWeightMode, Point,
+    encode_subarray_column, encode_subarray_mst_from_precomputed, encode_subarray_mst_with_metric,
+    precompute_subarray_mst_graph, DatalessPoint, EncodedClusterBlock, EncodedColumnBlock,
+    EncodedDiffsMST, HnswBuildConfig, KnnDistanceMetric, MstWeightMode, Point, PrecomputedMstGraph,
 };
 use ndarray::Array2;
 use rayon::prelude::*;
@@ -26,6 +27,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 use tracing::{info, warn};
 use tracing_subscriber::filter::LevelFilter;
 use tracing_subscriber::fmt;
@@ -42,7 +45,7 @@ use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
 use linfa_clustering::KMeans;
 use nalgebra::DMatrix;
-use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256Plus;
 
 #[global_allocator]
@@ -58,6 +61,12 @@ struct CompressionResult {
     rate_bits_per_value: f64,
     mse: f64,
     rmse: f64,
+    timing_cluster_prep_ms: u64,
+    timing_gene_order_ms: u64,
+    timing_encode_tiles_ms: u64,
+    timing_row_mst_precompute_ms: u64,
+    timing_row_mst_encode_ms: u64,
+    timing_column_encode_ms: u64,
     cluster_sizes: Vec<usize>,
     encoded_blocks: Vec<EncodedClusterBlock>,
     positions: Vec<DatalessPoint>,
@@ -133,6 +142,31 @@ impl PayloadCompressionArg {
 enum MstWeightArg {
     Metric,
     EncodingCost,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum HnswProfileArg {
+    Default,
+    Fast,
+    Faster,
+}
+
+impl HnswProfileArg {
+    fn to_config(self) -> HnswBuildConfig {
+        match self {
+            HnswProfileArg::Default => HnswBuildConfig::default(),
+            HnswProfileArg::Fast => HnswBuildConfig {
+                max_nb_connection: 12,
+                ef_construction: 64,
+                ef_search: 24,
+            },
+            HnswProfileArg::Faster => HnswBuildConfig {
+                max_nb_connection: 8,
+                ef_construction: 40,
+                ef_search: 16,
+            },
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -297,6 +331,61 @@ fn compute_gene_permutation_from_row_stream(
     ))
 }
 
+/// Thin orthonormal basis for the column space of `y` (modified Gram–Schmidt).
+fn orthonormalize_columns(y: &DMatrix<f64>) -> DMatrix<f64> {
+    let nr = y.nrows();
+    let l = y.ncols();
+    let mut q = DMatrix::zeros(nr, l);
+    for j in 0..l {
+        let mut v: Vec<f64> = (0..nr).map(|i| y[(i, j)]).collect();
+        for k in 0..j {
+            let mut dot = 0.0f64;
+            for i in 0..nr {
+                dot += v[i] * q[(i, k)];
+            }
+            for i in 0..nr {
+                v[i] -= dot * q[(i, k)];
+            }
+        }
+        let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 1e-14 {
+            for i in 0..nr {
+                q[(i, j)] = v[i] / norm;
+            }
+        }
+    }
+    q
+}
+
+/// Randomized range finder + small SVD: approximate first `k` rows of `V^T`
+/// for `a` (same layout as `DMatrix::svd(..., v_t)`).
+fn approx_v_t_top_k(a: &DMatrix<f64>, k: usize, seed: u64) -> Option<DMatrix<f64>> {
+    let nr = a.nrows();
+    let nc = a.ncols();
+    if k == 0 || nc == 0 || nr == 0 {
+        return None;
+    }
+    let oversample = 4usize;
+    let l = (k + oversample).min(nc).max(k);
+    let mut rng = Xoshiro256Plus::seed_from_u64(seed);
+    let omega = DMatrix::from_fn(nc, l, |_, _| {
+        let u = rng.next_u64();
+        (u as f64 / (u64::MAX as f64)) * 2.0 - 1.0
+    });
+    let y0 = a * &omega;
+    let at_y0 = a.transpose() * &y0;
+    let y = a * &at_y0;
+    let q = orthonormalize_columns(&y);
+    let w = q.transpose() * a;
+    let svd = w.svd(false, true);
+    let v_t = svd.v_t?;
+    let nkeep = k.min(v_t.nrows());
+    if nkeep == 0 {
+        return None;
+    }
+    Some(v_t.rows(0, nkeep).into_owned())
+}
+
 /// SVD-based gene reordering: build a sparse cell×gene matrix from the cluster
 /// row stream, compute a truncated SVD, and sort genes by their coordinates in
 /// the first two right singular vectors (v₁, v₂).  Genes with similar cell
@@ -306,6 +395,8 @@ fn compute_gene_permutation_svd(
     points: &[Point],
     data: &CsMat<u16>,
     row_stream_point_indices: &[usize],
+    gene_svd_fast: bool,
+    svd_seed: u64,
 ) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let ncols = data.cols();
     if ncols == 0 {
@@ -392,12 +483,33 @@ fn compute_gene_permutation_svd(
     }
 
     let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let svd = mat.svd(false, true);
-    let v_t = match svd.v_t {
-        Some(vt) => vt,
-        None => {
-            info!("SVD gene reorder: V^T not available, falling back to projection method");
-            return compute_gene_permutation_from_row_stream(points, data, row_stream_point_indices);
+    let v_t = if gene_svd_fast {
+        match approx_v_t_top_k(&mat, 2, svd_seed) {
+            Some(vt) if vt.nrows() >= 1 && vt.iter().all(|x| x.is_finite()) => vt,
+            _ => {
+                warn!("SVD gene reorder: randomized top-2 failed or non-finite; using exact SVD");
+                let svd = mat.svd(false, true);
+                match svd.v_t {
+                    Some(vt) => vt,
+                    None => {
+                        info!("SVD gene reorder: V^T not available, falling back to projection method");
+                        return compute_gene_permutation_from_row_stream(
+                            points,
+                            data,
+                            row_stream_point_indices,
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        let svd = mat.svd(false, true);
+        match svd.v_t {
+            Some(vt) => vt,
+            None => {
+                info!("SVD gene reorder: V^T not available, falling back to projection method");
+                return compute_gene_permutation_from_row_stream(points, data, row_stream_point_indices);
+            }
         }
     };
 
@@ -431,10 +543,11 @@ fn compute_gene_permutation_svd(
     }
 
     info!(
-        "SVD gene reorder: {} genes reordered ({} active in SVD, {} total)",
+        "SVD gene reorder: {} genes reordered ({} active in SVD, {} total) fast_top2={}",
         active_cols.len(),
         nc,
-        ncols
+        ncols,
+        gene_svd_fast
     );
 
     Ok((new_to_old, old_to_new))
@@ -532,7 +645,7 @@ fn compute_gene_permutation_kmeans(
         Some(vt) => vt,
         None => {
             info!("K-means gene reorder: V^T not available, falling back to SVD seriation");
-            return compute_gene_permutation_svd(points, data, row_stream_point_indices);
+            return compute_gene_permutation_svd(points, data, row_stream_point_indices, false, 0);
         }
     };
 
@@ -1473,6 +1586,8 @@ fn run_clustered_compression(
     sorted_index_codec: SortedIndexCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
+    hnsw_build: HnswBuildConfig,
+    disable_mst_graph_cache: bool,
     cluster_encoding: ClusterEncodingArg,
     column_template_count: usize,
     column_template_adaptive: bool,
@@ -1484,12 +1599,14 @@ fn run_clustered_compression(
     tensor_grid: TensorGridParams,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
+    gene_svd_fast: bool,
     gene_blocks: usize,
     payload_compression: PayloadCompressionArg,
 ) -> anyhow::Result<CompressionResult> {
     if points.is_empty() {
         anyhow::bail!("Cannot encode empty point set");
     }
+    let cluster_prep_start = Instant::now();
 
     let requested_clusters = cell_blocks_requested.max(1).min(points.len());
     let features = build_cell_features(points, data, 24)?;
@@ -1597,7 +1714,12 @@ fn run_clustered_compression(
             points.len()
         );
     }
+    let timing_cluster_prep_ms = cluster_prep_start.elapsed().as_millis() as u64;
 
+    let gene_order_start = Instant::now();
+    let svd_rng_seed = cluster_seed
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0xA5A5_A5A5_A5A5_A5A5);
     let (gene_order, gene_old_to_new) = if let Some((_, ref new_to_old, ref old_to_new)) = joint_result {
         info!("Using gene ordering from joint SVD seriation");
         (new_to_old.clone(), old_to_new.clone())
@@ -1612,6 +1734,8 @@ fn run_clustered_compression(
                 points,
                 &quantized_data,
                 &row_stream_point_indices,
+                gene_svd_fast,
+                svd_rng_seed,
             )?,
             GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
                 points,
@@ -1621,6 +1745,7 @@ fn run_clustered_compression(
             )?,
         }
     };
+    let timing_gene_order_ms = gene_order_start.elapsed().as_millis() as u64;
 
     // Build per-gene-block column masks.  When gene_blocks <= 1 the single "block" is
     // the full gene set and we skip the column-filtering overhead entirely.
@@ -1652,6 +1777,9 @@ fn run_clustered_compression(
     let mut row_order = Vec::new();
     let mut cluster_sizes = Vec::new();
     let mut total_mst_bytes = 0usize;
+    let row_mst_precompute_us = AtomicU64::new(0);
+    let row_mst_encode_us = AtomicU64::new(0);
+    let column_encode_us = AtomicU64::new(0);
 
     // Precompute per-gene-block old→new mappings once (shared across all cell clusters).
     let block_gene_o2ns: Vec<Vec<u32>> = gene_block_ranges
@@ -1687,20 +1815,54 @@ fn run_clustered_compression(
             ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
         ) {
             let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
+            let mst_graph_cache: Option<PrecomputedMstGraph> =
+                if row_template_adaptive && !disable_mst_graph_cache {
+                    let t = Instant::now();
+                    let out = precompute_subarray_mst_graph(
+                        cluster_points,
+                        &quantized_data,
+                        knn_metric,
+                        mst_weight_mode,
+                        Some(block_gene_o2n),
+                        index_codec,
+                        full_row_fallback_ratio,
+                        forest_cut_factor,
+                        hnsw_build,
+                    );
+                    row_mst_precompute_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    out
+                } else {
+                    None
+                };
             let mut try_row_encode = |adaptive: bool| {
-                if let Some((row_block, dfs_order)) = encode_subarray_mst_with_metric(
-                    cluster_points,
-                    &quantized_data,
-                    knn_metric,
-                    mst_weight_mode,
-                    Some(block_gene_o2n),
-                    index_codec,
-                    sorted_index_codec,
-                    full_row_fallback_ratio,
-                    forest_cut_factor,
-                    adaptive,
-                    row_template_max,
-                ) {
+                let t = Instant::now();
+                let encoded = if let Some(precomputed) = mst_graph_cache.as_ref() {
+                    encode_subarray_mst_from_precomputed(
+                        precomputed,
+                        sorted_index_codec,
+                        index_codec,
+                        full_row_fallback_ratio,
+                        adaptive,
+                        row_template_max,
+                    )
+                } else {
+                    encode_subarray_mst_with_metric(
+                        cluster_points,
+                        &quantized_data,
+                        knn_metric,
+                        mst_weight_mode,
+                        Some(block_gene_o2n),
+                        index_codec,
+                        sorted_index_codec,
+                        full_row_fallback_ratio,
+                        forest_cut_factor,
+                        hnsw_build,
+                        adaptive,
+                        row_template_max,
+                    )
+                };
+                row_mst_encode_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                if let Some((row_block, dfs_order)) = encoded {
                     let bytes = row_block.total_bytes();
                     if best_row.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
                         best_row =
@@ -1723,6 +1885,7 @@ fn run_clustered_compression(
         ) {
             let mut best_col: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
             let mut try_col_encode = |adaptive: bool| {
+                let t = Instant::now();
                 if let Some(col_block) = encode_subarray_column(
                     cluster_points,
                     &quantized_data,
@@ -1740,6 +1903,7 @@ fn run_clustered_compression(
                         col_selected_adaptive = adaptive;
                     }
                 }
+                column_encode_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
             };
 
             try_col_encode(column_template_adaptive);
@@ -1788,6 +1952,7 @@ fn run_clustered_compression(
 
     // Each cluster produces one or more encoded blocks (one per gene block).
     // positions / row_order come from the first gene block's DFS order.
+    let encode_tiles_start = Instant::now();
     let cluster_results: Vec<
         anyhow::Result<
             Option<(
@@ -1894,6 +2059,16 @@ fn run_clustered_compression(
     let mut col_adaptive_fallback_wins = 0usize;
     let mut col_value_model_global_blocks = 0usize;
     let mut col_value_model_per_gene_blocks = 0usize;
+    let mut col_mode_raw_total = 0usize;
+    let mut col_mode_ref_total = 0usize;
+    let mut col_mode_template_total = 0usize;
+    let mut col_blocks_with_raw = 0usize;
+    let mut col_blocks_with_ref = 0usize;
+    let mut col_blocks_with_template = 0usize;
+    let mut col_blocks_raw_only = 0usize;
+    let mut col_blocks_ref_only = 0usize;
+    let mut col_blocks_template_only = 0usize;
+    let mut col_blocks_mixed_modes = 0usize;
     for (
         _idx,
         tile_blocks,
@@ -1921,6 +2096,41 @@ fn run_clustered_compression(
                     } else {
                         col_value_model_global_blocks += 1;
                     }
+                    let modes = block.posting_modes.decode_all().unwrap_or_default();
+                    let mut has_raw = false;
+                    let mut has_ref = false;
+                    let mut has_template = false;
+                    for mode in modes {
+                        if mode == EncodedColumnBlock::MODE_RAW {
+                            col_mode_raw_total += 1;
+                            has_raw = true;
+                        } else if mode == EncodedColumnBlock::MODE_REF {
+                            col_mode_ref_total += 1;
+                            has_ref = true;
+                        } else if mode == EncodedColumnBlock::MODE_TEMPLATE {
+                            col_mode_template_total += 1;
+                            has_template = true;
+                        }
+                    }
+                    let mode_kinds = (has_raw as u8) + (has_ref as u8) + (has_template as u8);
+                    if has_raw {
+                        col_blocks_with_raw += 1;
+                    }
+                    if has_ref {
+                        col_blocks_with_ref += 1;
+                    }
+                    if has_template {
+                        col_blocks_with_template += 1;
+                    }
+                    if mode_kinds > 1 {
+                        col_blocks_mixed_modes += 1;
+                    } else if has_raw {
+                        col_blocks_raw_only += 1;
+                    } else if has_ref {
+                        col_blocks_ref_only += 1;
+                    } else if has_template {
+                        col_blocks_template_only += 1;
+                    }
                 }
             }
         }
@@ -1930,6 +2140,10 @@ fn run_clustered_compression(
         row_order.extend(cluster_row_order);
         encoded_blocks.extend(tile_blocks);
     }
+    let timing_encode_tiles_ms = encode_tiles_start.elapsed().as_millis() as u64;
+    let timing_row_mst_precompute_ms = row_mst_precompute_us.load(Ordering::Relaxed) / 1_000;
+    let timing_row_mst_encode_ms = row_mst_encode_us.load(Ordering::Relaxed) / 1_000;
+    let timing_column_encode_ms = column_encode_us.load(Ordering::Relaxed) / 1_000;
 
     info!(
         "Cluster payload selection: row_blocks={} column_blocks={}",
@@ -1945,6 +2159,22 @@ fn run_clustered_compression(
         info!(
             "Column value model selection: global_blocks={} per_gene_blocks={}",
             col_value_model_global_blocks, col_value_model_per_gene_blocks
+        );
+        let col_mode_total = col_mode_raw_total + col_mode_ref_total + col_mode_template_total;
+        info!(
+            "Column posting mode usage: raw={} ref={} template={} total={}",
+            col_mode_raw_total, col_mode_ref_total, col_mode_template_total, col_mode_total
+        );
+        info!(
+            "Column block mode coverage: blocks={} with_raw={} with_ref={} with_template={} raw_only={} ref_only={} template_only={} mixed={}",
+            column_block_count,
+            col_blocks_with_raw,
+            col_blocks_with_ref,
+            col_blocks_with_template,
+            col_blocks_raw_only,
+            col_blocks_ref_only,
+            col_blocks_template_only,
+            col_blocks_mixed_modes
         );
     }
 
@@ -1983,6 +2213,12 @@ fn run_clustered_compression(
         rate_bits_per_value,
         mse,
         rmse,
+        timing_cluster_prep_ms,
+        timing_gene_order_ms,
+        timing_encode_tiles_ms,
+        timing_row_mst_precompute_ms,
+        timing_row_mst_encode_ms,
+        timing_column_encode_ms,
         cluster_sizes,
         encoded_blocks,
         positions,
@@ -2278,6 +2514,12 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
+    /// Disable per-cluster MST graph reuse across row adaptive/non-adaptive dual-pass.
+    #[arg(long = "disable-mst-graph-cache", default_value_t = false)]
+    disable_mst_graph_cache: bool,
+    /// HNSW construction/search preset for MST KNN graph build.
+    #[arg(long = "hnsw-fast-profile", value_enum, default_value_t = HnswProfileArg::Default)]
+    hnsw_fast_profile: HnswProfileArg,
     /// How to cluster cells (`kmeans` or `svd-joint`).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
@@ -2315,6 +2557,10 @@ struct BuildCommand {
     /// or `svd` (truncated SVD on the sparse matrix, uses right singular vectors).
     #[arg(long = "gene-reorder-method", value_enum, default_value_t = GeneReorderMethod::Projection)]
     gene_reorder_method: GeneReorderMethod,
+    /// For `gene-reorder-method=svd`: use randomized subspace iteration for the top-2 right singular
+    /// vectors only (faster than full dense SVD on the sampled matrix).
+    #[arg(long = "gene-svd-fast", default_value_t = false)]
+    gene_svd_fast: bool,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -2554,6 +2800,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(args.full_row_fallback_ratio.max(0.0))
             };
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
+            let hnsw_build = args.hnsw_fast_profile.to_config();
             let cluster_encoding = args.cluster_encoding;
             let spatial_graph = SpatialGraphParams {
                 spatial_knn: args.cell_cluster_spatial_knn.max(1),
@@ -2569,7 +2816,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} mst_graph_cache_enabled={} gene_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2580,6 +2827,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.cell_cluster_method,
                 args.knn_metric,
                 args.mst_weight,
+                args.hnsw_fast_profile,
+                hnsw_build.max_nb_connection,
+                hnsw_build.ef_construction,
+                hnsw_build.ef_search,
+                !args.disable_mst_graph_cache,
+                args.gene_svd_fast,
                 args.index_codec,
                 args.sorted_index_codec,
                 fallback_ratio,
@@ -2637,6 +2890,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sorted_index_codec,
                         fallback_ratio,
                         forest_cut_factor,
+                        hnsw_build,
+                        args.disable_mst_graph_cache,
                         cluster_encoding,
                         args.column_template_count,
                         args.column_template_adaptive,
@@ -2648,6 +2903,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tensor_grid,
                         args.set_seed,
                         *gene_reorder_method,
+                        args.gene_svd_fast,
                         args.gene_blocks,
                         args.output_compression,
                     )?;
@@ -2660,6 +2916,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         result.rate_bits_per_value,
                         result.mse,
                         result.rmse
+                    );
+                    info!(
+                        "timing: cluster_prep={}ms gene_order={}ms encode_tiles={}ms row_mst_precompute={}ms row_mst_encode={}ms column_encode={}ms",
+                        result.timing_cluster_prep_ms,
+                        result.timing_gene_order_ms,
+                        result.timing_encode_tiles_ms,
+                        result.timing_row_mst_precompute_ms,
+                        result.timing_row_mst_encode_ms,
+                        result.timing_column_encode_ms
                     );
 
                     metrics.push(SweepMetric {
@@ -2941,6 +3206,8 @@ mod tests {
             SortedIndexCodec::EliasFano,
             Some(1.0),
             None,
+            HnswBuildConfig::default(),
+            false,
             ClusterEncodingArg::Hybrid,
             0,
             false,
@@ -2952,6 +3219,7 @@ mod tests {
             TensorGridParams::default(),
             None,
             GeneReorderMethod::Projection,
+            false,
             1,
             PayloadCompressionArg::Zstd,
         )
@@ -2988,6 +3256,8 @@ mod tests {
             SortedIndexCodec::EliasFano,
             Some(1.0),
             None,
+            HnswBuildConfig::default(),
+            false,
             ClusterEncodingArg::Hybrid,
             0,
             false,
@@ -2999,6 +3269,7 @@ mod tests {
             TensorGridParams::default(),
             Some(42),
             GeneReorderMethod::Projection,
+            false,
             1,
             PayloadCompressionArg::Zstd,
         )

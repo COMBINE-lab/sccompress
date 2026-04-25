@@ -11,6 +11,32 @@ use rayon::prelude::*;
 use sprs::CsMat;
 use std::collections::{HashMap, HashSet};
 
+#[derive(Clone, Copy, Debug)]
+pub struct HnswBuildConfig {
+    pub max_nb_connection: usize,
+    pub ef_construction: usize,
+    pub ef_search: usize,
+}
+
+impl Default for HnswBuildConfig {
+    fn default() -> Self {
+        Self {
+            max_nb_connection: 16,
+            ef_construction: 100,
+            ef_search: 50,
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct PrecomputedMstGraph {
+    num_genes: u32,
+    expressions: Vec<SparseExpression>,
+    local_to_global_raw: Vec<u32>,
+    root: usize,
+    parent: Vec<u32>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Point {
     pub x: f64,
@@ -274,9 +300,9 @@ pub struct EncodedColumnBlock {
 }
 
 impl EncodedColumnBlock {
-    const MODE_RAW: u32 = 0;
-    const MODE_REF: u32 = 1;
-    const MODE_TEMPLATE: u32 = 2;
+    pub(crate) const MODE_RAW: u32 = 0;
+    pub(crate) const MODE_REF: u32 = 1;
+    pub(crate) const MODE_TEMPLATE: u32 = 2;
 
     pub fn total_bytes(&self) -> usize {
         self.local_to_global.size_in_bytes()
@@ -1479,6 +1505,7 @@ fn build_mst_prim(
     index_codec: IndexStreamCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
+    hnsw_build: HnswBuildConfig,
 ) -> (usize, Vec<u32>) {
     let n = expressions.len();
     if n == 0 {
@@ -1492,10 +1519,10 @@ fn build_mst_prim(
     let nodes: Vec<_> = (0..n).map(|i| graph.add_node(i)).collect();
 
     if n >= 64 {
-        let max_nb_connection = 16;
-        let ef_construction = 100;
+        let max_nb_connection = hnsw_build.max_nb_connection.max(1);
+        let ef_construction = hnsw_build.ef_construction.max(1);
         let nb_layers = 16;
-        let ef_search = 50;
+        let ef_search = hnsw_build.ef_search.max(k).max(1);
         match metric {
             KnnDistanceMetric::L0 => {
                 let hnsw = Hnsw::<(u32, u16), L0Distance>::new(
@@ -2183,22 +2210,50 @@ pub fn encode_subarray_mst_with_metric(
     sorted_index_codec: SortedIndexCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
+    hnsw_build: HnswBuildConfig,
     row_template_adaptive: bool,
     row_template_max: usize,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
+    let precomputed = precompute_subarray_mst_graph(
+        points,
+        data,
+        knn_metric,
+        mst_weight_mode,
+        gene_old_to_new,
+        index_codec,
+        full_row_fallback_ratio,
+        forest_cut_factor,
+        hnsw_build,
+    )?;
+    encode_subarray_mst_from_precomputed(
+        &precomputed,
+        sorted_index_codec,
+        index_codec,
+        full_row_fallback_ratio,
+        row_template_adaptive,
+        row_template_max,
+    )
+}
+
+pub fn precompute_subarray_mst_graph(
+    points: &[Point],
+    data: &CsMat<u16>,
+    knn_metric: KnnDistanceMetric,
+    mst_weight_mode: MstWeightMode,
+    gene_old_to_new: Option<&[u32]>,
+    index_codec: IndexStreamCodec,
+    full_row_fallback_ratio: Option<f32>,
+    forest_cut_factor: Option<f32>,
+    hnsw_build: HnswBuildConfig,
+) -> Option<PrecomputedMstGraph> {
     if points.is_empty() {
         return None;
     }
-
-    let num_genes = data.cols() as u32;
     let expressions_global: Vec<SparseExpression> = points
         .par_iter()
         .map(|p| compute_sparse_expression(p, data, gene_old_to_new))
         .collect();
     let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
-    let local_to_global =
-        EncodedSortedIndices::from_sorted_u32(&local_to_global_raw, sorted_index_codec);
-
     let k = 8usize.min(points.len().saturating_sub(1)).max(1);
     let (root, parent) = build_mst_prim(
         &expressions,
@@ -2208,10 +2263,33 @@ pub fn encode_subarray_mst_with_metric(
         index_codec,
         full_row_fallback_ratio,
         forest_cut_factor,
+        hnsw_build,
     );
-    let (dfs_order, parent_offset_raw) = compute_dfs_order(root, &parent, points.len());
+    Some(PrecomputedMstGraph {
+        num_genes: data.cols() as u32,
+        expressions,
+        local_to_global_raw,
+        root,
+        parent,
+    })
+}
 
-    let root_expr = &expressions[root];
+pub fn encode_subarray_mst_from_precomputed(
+    precomputed: &PrecomputedMstGraph,
+    sorted_index_codec: SortedIndexCodec,
+    index_codec: IndexStreamCodec,
+    full_row_fallback_ratio: Option<f32>,
+    row_template_adaptive: bool,
+    row_template_max: usize,
+) -> Option<(EncodedDiffsMST, Vec<u32>)> {
+    let num_genes = precomputed.num_genes;
+    let expressions = &precomputed.expressions;
+    let parent = &precomputed.parent;
+    let local_to_global =
+        EncodedSortedIndices::from_sorted_u32(&precomputed.local_to_global_raw, sorted_index_codec);
+    let (dfs_order, parent_offset_raw) =
+        compute_dfs_order(precomputed.root, parent, expressions.len());
+    let root_expr = &expressions[precomputed.root];
     let root_genes: Vec<u32> = root_expr.iter().map(|(g, _)| *g).collect();
     let root_vals_raw: Vec<u32> = root_expr.iter().map(|(_, v)| *v as u32).collect();
 
@@ -2219,11 +2297,11 @@ pub fn encode_subarray_mst_with_metric(
     const ROW_MODE_FULL: u32 = 1;
     const ROW_MODE_TEMPLATE: u32 = 2;
 
-    let mut child_modes_raw = Vec::<u32>::with_capacity(points.len().saturating_sub(1));
-    let mut child_full_counts_raw = Vec::<u32>::with_capacity(points.len().saturating_sub(1));
-    let mut child_remove_counts_raw = Vec::<u32>::with_capacity(points.len().saturating_sub(1));
-    let mut child_add_counts_raw = Vec::<u32>::with_capacity(points.len().saturating_sub(1));
-    let mut child_update_counts_raw = Vec::<u32>::with_capacity(points.len().saturating_sub(1));
+    let mut child_modes_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
+    let mut child_full_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
+    let mut child_remove_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
+    let mut child_add_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
+    let mut child_update_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
     let mut row_template_counts_raw = Vec::<u32>::new();
 
     let mut row_template_first_genes_raw = Vec::<u32>::new();
@@ -2536,6 +2614,7 @@ pub fn encode_subarray_mst(
         SortedIndexCodec::EliasFano,
         Some(1.0),
         None,
+        HnswBuildConfig::default(),
         false,
         0,
     )
