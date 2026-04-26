@@ -1,10 +1,10 @@
 mod arith_encode;
+mod cluster;
 mod delta_indices;
 mod index_stream;
 mod matrix_io;
 mod mst_codec;
 mod sorted_indices;
-mod cluster;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use flate2::read::GzDecoder;
@@ -17,6 +17,7 @@ use mst_codec::{
     encode_subarray_column, encode_subarray_mst_from_precomputed, encode_subarray_mst_with_metric,
     precompute_subarray_mst_graph, DatalessPoint, EncodedClusterBlock, EncodedColumnBlock,
     EncodedDiffsMST, HnswBuildConfig, KnnDistanceMetric, MstWeightMode, Point, PrecomputedMstGraph,
+    RowMstNeighborMode,
 };
 use ndarray::Array2;
 use rayon::prelude::*;
@@ -38,8 +39,8 @@ use zstd::stream::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 
 use cluster::{
     build_cell_features, cluster_cells, group_points_by_cluster, joint_svd_seriation,
-    projection_weight, reorder_rows_within_clusters, split_oversized_clusters, CellClusterMethodArg,
-    SpatialGraphParams, TensorGridDisc, TensorGridParams,
+    projection_weight, reorder_rows_within_clusters, split_oversized_clusters,
+    CellClusterMethodArg, SpatialGraphParams, TensorGridDisc, TensorGridParams,
 };
 use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
@@ -170,6 +171,21 @@ impl HnswProfileArg {
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
+enum RowMstNeighborArg {
+    Hnsw,
+    LocalWindow,
+}
+
+impl From<RowMstNeighborArg> for RowMstNeighborMode {
+    fn from(value: RowMstNeighborArg) -> Self {
+        match value {
+            RowMstNeighborArg::Hnsw => RowMstNeighborMode::Hnsw,
+            RowMstNeighborArg::LocalWindow => RowMstNeighborMode::LocalWindow,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
 enum ClusterEncodingArg {
     Row,
     Column,
@@ -197,7 +213,6 @@ enum GeneReorderMethod {
     /// structure that pure seriation may miss when the manifold is not 1-D.
     Kmeans,
 }
-
 
 impl From<MstWeightArg> for MstWeightMode {
     fn from(value: MstWeightArg) -> Self {
@@ -250,7 +265,6 @@ fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
         }
     }
 }
-
 
 fn compute_gene_permutation_from_row_stream(
     points: &[Point],
@@ -443,14 +457,17 @@ fn compute_gene_permutation_svd(
 
     let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
         let step = n_cells as f64 / max_svd_rows as f64;
-        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+        (0..max_svd_rows)
+            .map(|i| (i as f64 * step) as usize)
+            .collect()
     } else {
         (0..n_cells).collect()
     };
 
     let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
         // Keep the most frequent genes
-        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        let mut by_freq: Vec<(usize, u64)> =
+            active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
         by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         by_freq.truncate(max_svd_cols);
         by_freq.sort_unstable_by_key(|&(g, _)| g);
@@ -472,12 +489,17 @@ fn compute_gene_permutation_svd(
     //   value = (1 if gene present) / sqrt(col_nnz[gene])
     // This down-weights ubiquitous genes and emphasizes discriminative ones.
     let mut dense = vec![0.0f64; nr * nc];
-    let sampled_set: HashMap<usize, usize> = sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+    let sampled_set: HashMap<usize, usize> = sampled_rows
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| (r, i))
+        .collect();
 
     for &(stream_pos, gene_idx, _) in &triplets {
         if let Some(&local_row) = sampled_set.get(&stream_pos) {
             if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+                dense[local_row * nc + local_col] =
+                    1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
             }
         }
     }
@@ -508,7 +530,11 @@ fn compute_gene_permutation_svd(
             Some(vt) => vt,
             None => {
                 info!("SVD gene reorder: V^T not available, falling back to projection method");
-                return compute_gene_permutation_from_row_stream(points, data, row_stream_point_indices);
+                return compute_gene_permutation_from_row_stream(
+                    points,
+                    data,
+                    row_stream_point_indices,
+                );
             }
         }
     };
@@ -605,13 +631,16 @@ fn compute_gene_permutation_kmeans(
 
     let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
         let step = n_cells as f64 / max_svd_rows as f64;
-        (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+        (0..max_svd_rows)
+            .map(|i| (i as f64 * step) as usize)
+            .collect()
     } else {
         (0..n_cells).collect()
     };
 
     let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
-        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        let mut by_freq: Vec<(usize, u64)> =
+            active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
         by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         by_freq.truncate(max_svd_cols);
         by_freq.sort_unstable_by_key(|&(g, _)| g);
@@ -629,12 +658,17 @@ fn compute_gene_permutation_kmeans(
     let nc = active_cols.len();
 
     let mut dense = vec![0.0f64; nr * nc];
-    let sampled_set: HashMap<usize, usize> = sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+    let sampled_set: HashMap<usize, usize> = sampled_rows
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| (r, i))
+        .collect();
 
     for &(stream_pos, gene_idx) in &triplets {
         if let Some(&local_row) = sampled_set.get(&stream_pos) {
             if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] = 1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
+                dense[local_row * nc + local_col] =
+                    1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
             }
         }
     }
@@ -666,10 +700,13 @@ fn compute_gene_permutation_kmeans(
     let gene_k = gene_k.max(2).min(nc);
     let dataset = DatasetBase::from(gene_embed.clone());
     let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(gene_k, Xoshiro256Plus::seed_from_u64(seed.wrapping_add(9001)))
-            .max_n_iterations(30)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("gene k-means failed: {}", e))?
+        KMeans::params_with_rng(
+            gene_k,
+            Xoshiro256Plus::seed_from_u64(seed.wrapping_add(9001)),
+        )
+        .max_n_iterations(30)
+        .fit(&dataset)
+        .map_err(|e| anyhow::anyhow!("gene k-means failed: {}", e))?
     } else {
         KMeans::params(gene_k)
             .max_n_iterations(30)
@@ -687,8 +724,16 @@ fn compute_gene_permutation_kmeans(
     }
     let mut cluster_order: Vec<usize> = (0..gene_k).collect();
     cluster_order.sort_unstable_by(|&a, &b| {
-        let mean_a = if cluster_count[a] > 0 { cluster_v1_sum[a] / cluster_count[a] as f64 } else { f64::INFINITY };
-        let mean_b = if cluster_count[b] > 0 { cluster_v1_sum[b] / cluster_count[b] as f64 } else { f64::INFINITY };
+        let mean_a = if cluster_count[a] > 0 {
+            cluster_v1_sum[a] / cluster_count[a] as f64
+        } else {
+            f64::INFINITY
+        };
+        let mean_b = if cluster_count[b] > 0 {
+            cluster_v1_sum[b] / cluster_count[b] as f64
+        } else {
+            f64::INFINITY
+        };
         mean_a.total_cmp(&mean_b)
     });
     let mut cluster_rank = vec![0usize; gene_k];
@@ -735,7 +780,6 @@ fn compute_gene_permutation_kmeans(
 
     Ok((new_to_old, old_to_new))
 }
-
 
 fn downsample_values(values: &[u16], max_values: usize) -> Vec<u16> {
     if values.len() <= max_values {
@@ -1587,6 +1631,8 @@ fn run_clustered_compression(
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
     hnsw_build: HnswBuildConfig,
+    row_mst_neighbor_mode: RowMstNeighborMode,
+    row_mst_window: usize,
     disable_mst_graph_cache: bool,
     cluster_encoding: ClusterEncodingArg,
     column_template_count: usize,
@@ -1600,6 +1646,7 @@ fn run_clustered_compression(
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
     gene_svd_fast: bool,
+    joint_svd_fast: bool,
     gene_blocks: usize,
     payload_compression: PayloadCompressionArg,
 ) -> anyhow::Result<CompressionResult> {
@@ -1613,10 +1660,19 @@ fn run_clustered_compression(
 
     // Joint path: one operation produces both cell assignments and gene ordering.
     let joint_result = if cell_cluster_method == CellClusterMethodArg::SvdJoint {
-        match joint_svd_seriation(points, data, requested_clusters, cluster_seed) {
+        match joint_svd_seriation(
+            points,
+            data,
+            requested_clusters,
+            cluster_seed,
+            joint_svd_fast,
+        ) {
             Ok(result) => Some(result),
             Err(e) => {
-                warn!("Joint SVD seriation failed ({}), falling back to separate cell+gene", e);
+                warn!(
+                    "Joint SVD seriation failed ({}), falling back to separate cell+gene",
+                    e
+                );
                 None
             }
         }
@@ -1720,31 +1776,32 @@ fn run_clustered_compression(
     let svd_rng_seed = cluster_seed
         .unwrap_or(0x9E37_79B9_7F4A_7C15)
         .wrapping_add(0xA5A5_A5A5_A5A5_A5A5);
-    let (gene_order, gene_old_to_new) = if let Some((_, ref new_to_old, ref old_to_new)) = joint_result {
-        info!("Using gene ordering from joint SVD seriation");
-        (new_to_old.clone(), old_to_new.clone())
-    } else {
-        match gene_reorder_method {
-            GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
-                points,
-                &quantized_data,
-                &row_stream_point_indices,
-            )?,
-            GeneReorderMethod::Svd => compute_gene_permutation_svd(
-                points,
-                &quantized_data,
-                &row_stream_point_indices,
-                gene_svd_fast,
-                svd_rng_seed,
-            )?,
-            GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
-                points,
-                &quantized_data,
-                &row_stream_point_indices,
-                cluster_seed,
-            )?,
-        }
-    };
+    let (gene_order, gene_old_to_new) =
+        if let Some((_, ref new_to_old, ref old_to_new)) = joint_result {
+            info!("Using gene ordering from joint SVD seriation");
+            (new_to_old.clone(), old_to_new.clone())
+        } else {
+            match gene_reorder_method {
+                GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
+                    points,
+                    &quantized_data,
+                    &row_stream_point_indices,
+                )?,
+                GeneReorderMethod::Svd => compute_gene_permutation_svd(
+                    points,
+                    &quantized_data,
+                    &row_stream_point_indices,
+                    gene_svd_fast,
+                    svd_rng_seed,
+                )?,
+                GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
+                    points,
+                    &quantized_data,
+                    &row_stream_point_indices,
+                    cluster_seed,
+                )?,
+            }
+        };
     let timing_gene_order_ms = gene_order_start.elapsed().as_millis() as u64;
 
     // Build per-gene-block column masks.  When gene_blocks <= 1 the single "block" is
@@ -1768,7 +1825,10 @@ fn run_clustered_compression(
         info!(
             "Gene blocking: {} blocks, sizes {:?}",
             effective_gene_blocks,
-            gene_block_ranges.iter().map(|r| r.len()).collect::<Vec<_>>()
+            gene_block_ranges
+                .iter()
+                .map(|r| r.len())
+                .collect::<Vec<_>>()
         );
     }
 
@@ -1804,7 +1864,6 @@ fn run_clustered_compression(
                        block_gene_o2n: &[u32],
                        cluster_idx: usize|
      -> anyhow::Result<(EncodedClusterBlock, Vec<u32>, usize, bool, bool)> {
-
         let mut row_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
         let mut col_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
         let mut row_selected_adaptive = false;
@@ -1815,25 +1874,28 @@ fn run_clustered_compression(
             ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
         ) {
             let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-            let mst_graph_cache: Option<PrecomputedMstGraph> =
-                if row_template_adaptive && !disable_mst_graph_cache {
-                    let t = Instant::now();
-                    let out = precompute_subarray_mst_graph(
-                        cluster_points,
-                        &quantized_data,
-                        knn_metric,
-                        mst_weight_mode,
-                        Some(block_gene_o2n),
-                        index_codec,
-                        full_row_fallback_ratio,
-                        forest_cut_factor,
-                        hnsw_build,
-                    );
-                    row_mst_precompute_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    out
-                } else {
-                    None
-                };
+            let mst_graph_cache: Option<PrecomputedMstGraph> = if row_template_adaptive
+                && !disable_mst_graph_cache
+            {
+                let t = Instant::now();
+                let out = precompute_subarray_mst_graph(
+                    cluster_points,
+                    &quantized_data,
+                    knn_metric,
+                    mst_weight_mode,
+                    Some(block_gene_o2n),
+                    index_codec,
+                    full_row_fallback_ratio,
+                    forest_cut_factor,
+                    hnsw_build,
+                    row_mst_neighbor_mode,
+                    row_mst_window,
+                );
+                row_mst_precompute_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                out
+            } else {
+                None
+            };
             let mut try_row_encode = |adaptive: bool| {
                 let t = Instant::now();
                 let encoded = if let Some(precomputed) = mst_graph_cache.as_ref() {
@@ -1857,6 +1919,8 @@ fn run_clustered_compression(
                         full_row_fallback_ratio,
                         forest_cut_factor,
                         hnsw_build,
+                        row_mst_neighbor_mode,
+                        row_mst_window,
                         adaptive,
                         row_template_max,
                     )
@@ -1865,8 +1929,7 @@ fn run_clustered_compression(
                 if let Some((row_block, dfs_order)) = encoded {
                     let bytes = row_block.total_bytes();
                     if best_row.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
-                        best_row =
-                            Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
+                        best_row = Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
                         row_selected_adaptive = adaptive;
                     }
                 }
@@ -1979,14 +2042,9 @@ fn run_clustered_compression(
 
             // Encode all gene blocks for this cluster concurrently, then re-order by
             // block index to keep output deterministic.
-            let tile_results: Vec<anyhow::Result<(
-                usize,
-                EncodedClusterBlock,
-                Vec<u32>,
-                usize,
-                bool,
-                bool,
-            )>> = block_gene_o2ns
+            let tile_results: Vec<
+                anyhow::Result<(usize, EncodedClusterBlock, Vec<u32>, usize, bool, bool)>,
+            > = block_gene_o2ns
                 .par_iter()
                 .enumerate()
                 .map(|(gb_idx, block_gene_o2n)| {
@@ -2197,11 +2255,8 @@ fn run_clustered_compression(
     let total_entries = (points.len() * data.cols()).max(1);
     let mse = sse / total_entries as f64;
     let rmse = mse.sqrt();
-    let compressed_bytes_estimate = estimate_compressed_payload_size(
-        payload_compression,
-        &encoded_blocks,
-        &positions,
-    )?;
+    let compressed_bytes_estimate =
+        estimate_compressed_payload_size(payload_compression, &encoded_blocks, &positions)?;
     let rate_bits_per_value = (compressed_bytes_estimate as f64 * 8.0) / total_entries as f64;
 
     Ok(CompressionResult {
@@ -2271,11 +2326,7 @@ fn decode_clustered_payload(
             raw
         }
         PayloadCompressionArg::SevenZip => {
-            let output = Command::new("7z")
-                .arg("x")
-                .arg("-so")
-                .arg(input)
-                .output()?;
+            let output = Command::new("7z").arg("x").arg("-so").arg(input).output()?;
             if !output.status.success() {
                 anyhow::bail!("7z decode failed for {}", input.display());
             }
@@ -2520,6 +2571,12 @@ struct BuildCommand {
     /// HNSW construction/search preset for MST KNN graph build.
     #[arg(long = "hnsw-fast-profile", value_enum, default_value_t = HnswProfileArg::Default)]
     hnsw_fast_profile: HnswProfileArg,
+    /// Candidate graph used before row-MST: HNSW kNN, or local row-order window.
+    #[arg(long = "row-mst-neighbor-mode", value_enum, default_value_t = RowMstNeighborArg::LocalWindow)]
+    row_mst_neighbor_mode: RowMstNeighborArg,
+    /// Number of nearby rows on each side to connect when `--row-mst-neighbor-mode=local-window`.
+    #[arg(long = "row-mst-window", default_value_t = 8)]
+    row_mst_window: usize,
     /// How to cluster cells (`kmeans` or `svd-joint`).
     #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
     cell_cluster_method: CellClusterMethodArg,
@@ -2527,7 +2584,11 @@ struct BuildCommand {
     #[arg(long = "set-seed", visible_alias = "cluster-seed")]
     set_seed: Option<u64>,
     /// If set, run all cell-cluster methods and append one stats row per method.
-    #[arg(long = "cell-cluster-method-sweep-all", visible_alias = "cluster-all", default_value_t = false)]
+    #[arg(
+        long = "cell-cluster-method-sweep-all",
+        visible_alias = "cluster-all",
+        default_value_t = false
+    )]
     cell_cluster_method_sweep_all: bool,
     /// For `spatial-graph`: number of spatial \((x,y)\) nearest neighbors per cell.
     #[arg(long = "cell-cluster-spatial-knn", default_value_t = 12)]
@@ -2561,6 +2622,9 @@ struct BuildCommand {
     /// vectors only (faster than full dense SVD on the sampled matrix).
     #[arg(long = "gene-svd-fast", default_value_t = false)]
     gene_svd_fast: bool,
+    /// For `cell-cluster-method=svd-joint`: use randomized joint SVD for cell clusters and gene order.
+    #[arg(long = "joint-svd-fast", default_value_t = false)]
+    joint_svd_fast: bool,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
     #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
     cluster_encoding: ClusterEncodingArg,
@@ -2801,6 +2865,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
             let hnsw_build = args.hnsw_fast_profile.to_config();
+            let row_mst_neighbor_mode = RowMstNeighborMode::from(args.row_mst_neighbor_mode);
+            let row_mst_window = args.row_mst_window.max(1);
             let cluster_encoding = args.cluster_encoding;
             let spatial_graph = SpatialGraphParams {
                 spatial_knn: args.cell_cluster_spatial_knn.max(1),
@@ -2816,7 +2882,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} mst_graph_cache_enabled={} gene_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} row_mst_neighbor_mode={:?} row_mst_window={} mst_graph_cache_enabled={} gene_svd_fast={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2831,8 +2897,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hnsw_build.max_nb_connection,
                 hnsw_build.ef_construction,
                 hnsw_build.ef_search,
+                args.row_mst_neighbor_mode,
+                row_mst_window,
                 !args.disable_mst_graph_cache,
                 args.gene_svd_fast,
+                args.joint_svd_fast,
                 args.index_codec,
                 args.sorted_index_codec,
                 fallback_ratio,
@@ -2846,7 +2915,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             );
 
             // Each sweep config: (cell_method, gene_method, label)
-            let mut sweep_configs: Vec<(CellClusterMethodArg, GeneReorderMethod, String)> = Vec::new();
+            let mut sweep_configs: Vec<(CellClusterMethodArg, GeneReorderMethod, String)> =
+                Vec::new();
 
             if args.cell_cluster_method_sweep_all {
                 for &cm in CellClusterMethodArg::value_variants() {
@@ -2891,6 +2961,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         fallback_ratio,
                         forest_cut_factor,
                         hnsw_build,
+                        row_mst_neighbor_mode,
+                        row_mst_window,
                         args.disable_mst_graph_cache,
                         cluster_encoding,
                         args.column_template_count,
@@ -2904,6 +2976,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.set_seed,
                         *gene_reorder_method,
                         args.gene_svd_fast,
+                        args.joint_svd_fast,
                         args.gene_blocks,
                         args.output_compression,
                     )?;
@@ -2945,64 +3018,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     anyhow::anyhow!("Failed to build selected setting q={}", target_quantizers)
                 })?;
 
-            info!("Rate-distortion sweep summary:");
-            for metric in &metrics {
-                info!(
-                    "  q={} (used={}): rate={:.4}, mse={:.6}, rmse={:.6}, compressed≈{} bytes",
-                    metric.quantizers_requested,
-                    metric.quantizers_used,
-                    metric.rate_bits_per_value,
-                    metric.mse,
-                    metric.rmse,
-                    metric.gzip_bytes_estimate
-                );
-            }
+                info!("Rate-distortion sweep summary:");
+                for metric in &metrics {
+                    info!(
+                        "  q={} (used={}): rate={:.4}, mse={:.6}, rmse={:.6}, compressed≈{} bytes",
+                        metric.quantizers_requested,
+                        metric.quantizers_used,
+                        metric.rate_bits_per_value,
+                        metric.mse,
+                        metric.rmse,
+                        metric.gzip_bytes_estimate
+                    );
+                }
 
-            let actual_gzip_bytes = if args.no_output {
-                // Keep size metrics available while skipping disk writes.
-                let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
-                compress_payload_bytes(&payload, args.output_compression)?.len()
-            } else {
-                let mut output = args
-                    .output
-                    .clone()
-                    .unwrap_or_else(|| {
+                let actual_gzip_bytes = if args.no_output {
+                    // Keep size metrics available while skipping disk writes.
+                    let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
+                    compress_payload_bytes(&payload, args.output_compression)?.len()
+                } else {
+                    let mut output = args.output.clone().unwrap_or_else(|| {
                         PathBuf::from(format!(
                             "output.bin.{}",
                             args.output_compression.extension()
                         ))
                     });
-                if sweep_configs.len() > 1 {
-                    output = output_path_with_label_suffix(&output, config_label);
-                }
-                let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
-                let compressed = compress_payload_bytes(&payload, args.output_compression)?;
-                let file = File::create(&output)?;
-                let mut writer = BufWriter::new(file);
-                writer.write_all(&compressed)?;
-                writer.flush()?;
-                info!("Saved encoded payload to {}", output.display());
-                std::fs::metadata(&output)?.len() as usize
-            };
-            let total_entries = (points.len() * csr.cols()).max(1);
-            let actual_rate = (actual_gzip_bytes as f64 * 8.0) / total_entries as f64;
+                    if sweep_configs.len() > 1 {
+                        output = output_path_with_label_suffix(&output, config_label);
+                    }
+                    let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
+                    let compressed = compress_payload_bytes(&payload, args.output_compression)?;
+                    let file = File::create(&output)?;
+                    let mut writer = BufWriter::new(file);
+                    writer.write_all(&compressed)?;
+                    writer.flush()?;
+                    info!("Saved encoded payload to {}", output.display());
+                    std::fs::metadata(&output)?.len() as usize
+                };
+                let total_entries = (points.len() * csr.cols()).max(1);
+                let actual_rate = (actual_gzip_bytes as f64 * 8.0) / total_entries as f64;
 
-            let mut bytes_parent = 0usize;
-            let mut bytes_root_indices = 0usize;
-            let mut bytes_root_vals = 0usize;
-            let mut bytes_indices = 0usize;
-            let mut bytes_delta_vals = 0usize;
-            let mut bytes_num_genes = 0usize;
+                let mut bytes_parent = 0usize;
+                let mut bytes_root_indices = 0usize;
+                let mut bytes_root_vals = 0usize;
+                let mut bytes_indices = 0usize;
+                let mut bytes_delta_vals = 0usize;
+                let mut bytes_num_genes = 0usize;
 
-            for (block_idx, block) in selected.encoded_blocks.iter().enumerate() {
-                let (p, ri, rv, i, dv, ng) = block.bytes_breakdown();
-                bytes_parent += p;
-                bytes_root_indices += ri;
-                bytes_root_vals += rv;
-                bytes_indices += i;
-                bytes_delta_vals += dv;
-                bytes_num_genes += ng;
-                match block {
+                for (block_idx, block) in selected.encoded_blocks.iter().enumerate() {
+                    let (p, ri, rv, i, dv, ng) = block.bytes_breakdown();
+                    bytes_parent += p;
+                    bytes_root_indices += ri;
+                    bytes_root_vals += rv;
+                    bytes_indices += i;
+                    bytes_delta_vals += dv;
+                    bytes_num_genes += ng;
+                    match block {
                     EncodedClusterBlock::RowMst(_) => info!(
                         "  block[{}] type=row_mst: parent={} root_indices={} root_vals={} op_indices={} op_vals={} num_genes_meta={} total={}",
                         block_idx,
@@ -3025,34 +3095,34 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         p + ri + rv + i + dv + ng
                     ),
                 }
-            }
+                }
 
-            let topology_bytes = bytes_parent;
-            let value_bytes =
-                bytes_root_indices + bytes_root_vals + bytes_indices + bytes_delta_vals;
-            let mst_payload_bytes = topology_bytes + value_bytes + bytes_num_genes;
-            let gene_order_bytes = csr.cols() * std::mem::size_of::<u32>();
-            let payload_with_col_order = mst_payload_bytes + gene_order_bytes;
+                let topology_bytes = bytes_parent;
+                let value_bytes =
+                    bytes_root_indices + bytes_root_vals + bytes_indices + bytes_delta_vals;
+                let mst_payload_bytes = topology_bytes + value_bytes + bytes_num_genes;
+                let gene_order_bytes = csr.cols() * std::mem::size_of::<u32>();
+                let payload_with_col_order = mst_payload_bytes + gene_order_bytes;
 
-            if args.no_output {
-                info!("--no-output enabled: skipped writing compressed payload file");
-            }
-            info!(
-                "Selected setting: q={} (used={}), bins={}, clusters={}",
-                selected.quantizers_requested,
-                selected.quantizers_used,
-                selected.quantizer_bins,
-                selected.cluster_sizes.len()
-            );
-            info!(
+                if args.no_output {
+                    info!("--no-output enabled: skipped writing compressed payload file");
+                }
+                info!(
+                    "Selected setting: q={} (used={}), bins={}, clusters={}",
+                    selected.quantizers_requested,
+                    selected.quantizers_used,
+                    selected.quantizer_bins,
+                    selected.cluster_sizes.len()
+                );
+                info!(
                 "Size: mst_uncompressed={} bytes, compressed_estimate={} bytes, compressed_actual={} bytes",
                 selected.total_mst_bytes, selected.gzip_bytes_estimate, actual_gzip_bytes
             );
-            info!(
-                "Distortion: mse={:.6}, rmse={:.6}, actual_rate={:.4} bits/value",
-                selected.mse, selected.rmse, actual_rate
-            );
-            info!(
+                info!(
+                    "Distortion: mse={:.6}, rmse={:.6}, actual_rate={:.4} bits/value",
+                    selected.mse, selected.rmse, actual_rate
+                );
+                info!(
                 "MST breakdown: topology(parent_offset)={} bytes, values(root+ops)={} bytes, metadata(num_genes)={} bytes, gene_order_if_serialized={} bytes, total={} bytes",
                 topology_bytes,
                 value_bytes,
@@ -3060,52 +3130,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 gene_order_bytes,
                 payload_with_col_order
             );
-            info!(
-                "  values breakdown: root_indices={} root_vals={} op_indices={} op_vals={}",
-                bytes_root_indices, bytes_root_vals, bytes_indices, bytes_delta_vals
-            );
-            if let Some(stats_path) = args.stats_csv.as_ref() {
-                let input_matrix_bytes = std::fs::metadata(&args.input)
-                    .map(|m| m.len() as usize)
-                    .unwrap_or(0);
-                let input_positions_bytes = args
-                    .input_pos
-                    .as_ref()
-                    .and_then(|p| std::fs::metadata(p).ok())
-                    .map(|m| m.len() as usize)
-                    .unwrap_or(0);
-                let stats_label = stats_path
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .map(str::to_owned)
-                    .unwrap_or_else(|| infer_stats_label(&args.input));
-                append_build_stats_csv(
-                    stats_path,
-                    &stats_label,
-                    config_label,
-                    &gene_method_label,
-                    input_matrix_bytes,
-                    input_positions_bytes,
-                    selected.total_mst_bytes,
-                    actual_gzip_bytes,
-                    points.len() * csr.cols(),
-                    csr.nnz(),
-                    actual_rate,
-                    topology_bytes,
-                    value_bytes,
-                    bytes_num_genes,
-                    gene_order_bytes,
-                    bytes_root_indices,
-                    bytes_root_vals,
-                    bytes_indices,
-                    bytes_delta_vals,
-                )?;
-                info!("Appended build stats CSV row to {}", stats_path.display());
-            }
-            if args.report_index_bounds {
-                let bounds_report = compute_index_bounds_report(&selected.encoded_blocks);
-                log_index_bounds_report(&bounds_report, csr.nnz());
-            }
+                info!(
+                    "  values breakdown: root_indices={} root_vals={} op_indices={} op_vals={}",
+                    bytes_root_indices, bytes_root_vals, bytes_indices, bytes_delta_vals
+                );
+                if let Some(stats_path) = args.stats_csv.as_ref() {
+                    let input_matrix_bytes = std::fs::metadata(&args.input)
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0);
+                    let input_positions_bytes = args
+                        .input_pos
+                        .as_ref()
+                        .and_then(|p| std::fs::metadata(p).ok())
+                        .map(|m| m.len() as usize)
+                        .unwrap_or(0);
+                    let stats_label = stats_path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_owned)
+                        .unwrap_or_else(|| infer_stats_label(&args.input));
+                    append_build_stats_csv(
+                        stats_path,
+                        &stats_label,
+                        config_label,
+                        &gene_method_label,
+                        input_matrix_bytes,
+                        input_positions_bytes,
+                        selected.total_mst_bytes,
+                        actual_gzip_bytes,
+                        points.len() * csr.cols(),
+                        csr.nnz(),
+                        actual_rate,
+                        topology_bytes,
+                        value_bytes,
+                        bytes_num_genes,
+                        gene_order_bytes,
+                        bytes_root_indices,
+                        bytes_root_vals,
+                        bytes_indices,
+                        bytes_delta_vals,
+                    )?;
+                    info!("Appended build stats CSV row to {}", stats_path.display());
+                }
+                if args.report_index_bounds {
+                    let bounds_report = compute_index_bounds_report(&selected.encoded_blocks);
+                    log_index_bounds_report(&bounds_report, csr.nnz());
+                }
             }
         }
         Commands::RoundtripCheck(args) => {
@@ -3207,6 +3277,8 @@ mod tests {
             Some(1.0),
             None,
             HnswBuildConfig::default(),
+            RowMstNeighborMode::Hnsw,
+            8,
             false,
             ClusterEncodingArg::Hybrid,
             0,
@@ -3219,6 +3291,7 @@ mod tests {
             TensorGridParams::default(),
             None,
             GeneReorderMethod::Projection,
+            false,
             false,
             1,
             PayloadCompressionArg::Zstd,
@@ -3257,6 +3330,8 @@ mod tests {
             Some(1.0),
             None,
             HnswBuildConfig::default(),
+            RowMstNeighborMode::Hnsw,
+            8,
             false,
             ClusterEncodingArg::Hybrid,
             0,
@@ -3270,11 +3345,11 @@ mod tests {
             Some(42),
             GeneReorderMethod::Projection,
             false,
+            false,
             1,
             PayloadCompressionArg::Zstd,
         )
         .expect("svd-joint seriation path");
         assert_eq!(result.cluster_sizes.iter().sum::<usize>(), n_cells);
     }
-
 }

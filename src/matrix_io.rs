@@ -116,7 +116,6 @@ fn load_positions_from_parquet(
     pos_x_col: usize,
     pos_y_col: usize,
 ) -> anyhow::Result<HashMap<String, (f64, f64)>> {
-
     let pos_file = std::fs::File::open(pos_path)?;
     let reader = SerializedFileReader::new(pos_file)?;
     let mut iter = reader.get_row_iter(None)?;

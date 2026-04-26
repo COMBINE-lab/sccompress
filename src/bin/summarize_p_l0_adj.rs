@@ -148,18 +148,14 @@ fn main() -> Result<()> {
 
     let mut wtr = csv::Writer::from_path(&args.output)
         .with_context(|| format!("failed to create output: {}", args.output.display()))?;
-    wtr.write_record(["filename", "spatial_l0", "spatial_l0 rate","exprs_l0"])?;
+    wtr.write_record(["filename", "spatial_l0", "spatial_l0 rate", "exprs_l0"])?;
     for (name, (spatial, exprs)) in grouped {
-        let spatial_txt = spatial
-            .map(|(c, t)| format!("{c}/{t}"))
-            .unwrap_or_default();
-        let exprs_txt = exprs
-            .map(|(c, t)| format!("{c}/{t}"))
-            .unwrap_or_default();
+        let spatial_txt = spatial.map(|(c, t)| format!("{c}/{t}")).unwrap_or_default();
+        let exprs_txt = exprs.map(|(c, t)| format!("{c}/{t}")).unwrap_or_default();
         let spatial_rate_txt = spatial
             .map(|(c, t)| format!("{:.2}", c as f64 / t as f64))
             .unwrap_or_default();
-        wtr.write_record([name, spatial_txt,spatial_rate_txt,exprs_txt])?;
+        wtr.write_record([name, spatial_txt, spatial_rate_txt, exprs_txt])?;
     }
     wtr.flush()?;
 

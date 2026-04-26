@@ -4,7 +4,7 @@ use linfa::DatasetBase;
 use linfa_clustering::KMeans;
 use nalgebra::DMatrix;
 use ndarray::Array2;
-use rand_xoshiro::rand_core::SeedableRng;
+use rand_xoshiro::rand_core::{RngCore, SeedableRng};
 use rand_xoshiro::Xoshiro256Plus;
 use rayon::prelude::*;
 use sprs::CsMat;
@@ -155,6 +155,75 @@ fn labels_from_boundaries(order: &[usize], boundaries: &[usize], k: usize) -> Ve
     labels
 }
 
+fn orthonormalize_columns(y: &DMatrix<f64>) -> DMatrix<f64> {
+    let nr = y.nrows();
+    let l = y.ncols();
+    let mut q = DMatrix::zeros(nr, l);
+    for j in 0..l {
+        let mut v: Vec<f64> = (0..nr).map(|i| y[(i, j)]).collect();
+        for prev in 0..j {
+            let mut dot = 0.0;
+            for i in 0..nr {
+                dot += v[i] * q[(i, prev)];
+            }
+            for i in 0..nr {
+                v[i] -= dot * q[(i, prev)];
+            }
+        }
+        let norm = v.iter().map(|x| x * x).sum::<f64>().sqrt();
+        if norm > 1e-14 {
+            for i in 0..nr {
+                q[(i, j)] = v[i] / norm;
+            }
+        }
+    }
+    q
+}
+
+struct JointSvdFactors {
+    u: DMatrix<f64>,
+    singular_values: Vec<f64>,
+    v_t: DMatrix<f64>,
+}
+
+fn randomized_joint_svd_top_k(a: &DMatrix<f64>, k: usize, seed: u64) -> Option<JointSvdFactors> {
+    let nr = a.nrows();
+    let nc = a.ncols();
+    if k == 0 || nr == 0 || nc == 0 {
+        return None;
+    }
+    let oversample = 4usize;
+    let l = (k + oversample).min(nr).min(nc).max(k.min(nr).min(nc));
+    let mut rng = Xoshiro256Plus::seed_from_u64(seed);
+    let omega = DMatrix::from_fn(nc, l, |_, _| {
+        let u = rng.next_u64();
+        (u as f64 / (u64::MAX as f64)) * 2.0 - 1.0
+    });
+
+    // One power iteration: A * (A^T * (A * Omega)).
+    let y0 = a * &omega;
+    let at_y0 = a.transpose() * &y0;
+    let y = a * &at_y0;
+    let q = orthonormalize_columns(&y);
+    let w = q.transpose() * a;
+    let svd = w.svd(true, true);
+    let u_small = svd.u?;
+    let v_t = svd.v_t?;
+    let u = q * u_small;
+    let nkeep = k
+        .min(u.ncols())
+        .min(v_t.nrows())
+        .min(svd.singular_values.len());
+    if nkeep == 0 {
+        return None;
+    }
+    Some(JointSvdFactors {
+        u: u.columns(0, nkeep).into_owned(),
+        singular_values: svd.singular_values.rows(0, nkeep).iter().copied().collect(),
+        v_t: v_t.rows(0, nkeep).into_owned(),
+    })
+}
+
 fn equal_cut_labels(order: &[usize], k: usize) -> Vec<usize> {
     let n = order.len();
     let block_size = n / k;
@@ -184,12 +253,19 @@ pub(crate) fn cluster_cells(
     let _ = spatial;
     let _ = tensor_grid;
     match method {
-        CellClusterMethodArg::Kmeans => cluster_cells_with_kmeans(features, num_clusters, cluster_seed),
-        CellClusterMethodArg::SvdJoint => cluster_cells_with_kmeans(features, num_clusters, cluster_seed),
+        CellClusterMethodArg::Kmeans => {
+            cluster_cells_with_kmeans(features, num_clusters, cluster_seed)
+        }
+        CellClusterMethodArg::SvdJoint => {
+            cluster_cells_with_kmeans(features, num_clusters, cluster_seed)
+        }
     }
 }
 
-pub(crate) fn group_points_by_cluster(assignments: &[usize], num_clusters: usize) -> Vec<Vec<usize>> {
+pub(crate) fn group_points_by_cluster(
+    assignments: &[usize],
+    num_clusters: usize,
+) -> Vec<Vec<usize>> {
     let mut clusters = vec![Vec::new(); num_clusters];
     for (point_idx, &cluster_id) in assignments.iter().enumerate() {
         if cluster_id < num_clusters {
@@ -236,7 +312,9 @@ pub(crate) fn split_oversized_clusters(
             .min(cluster.len());
         info!(
             "Re-clustering oversized cluster: size={} target_subclusters={} max_cluster_size={}",
-            cluster.len(), split_k, max_cluster_size
+            cluster.len(),
+            split_k,
+            max_cluster_size
         );
         let subfeatures = slice_feature_rows(features, &cluster);
         let subpoints: Vec<Point> = cluster.iter().map(|&i| points[i].clone()).collect();
@@ -251,7 +329,10 @@ pub(crate) fn split_oversized_clusters(
         ) {
             Ok(a) => a,
             Err(err) => {
-                warn!("Sub-clustering failed ({}). Falling back to deterministic chunk split.", err);
+                warn!(
+                    "Sub-clustering failed ({}). Falling back to deterministic chunk split.",
+                    err
+                );
                 let mut offset = 0usize;
                 while offset < cluster.len() {
                     let end = (offset + max_cluster_size).min(cluster.len());
@@ -264,7 +345,10 @@ pub(crate) fn split_oversized_clusters(
         let local_clusters = group_points_by_cluster(&sub_assignments, split_k);
         let max_local_size = local_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
         if local_clusters.len() <= 1 || max_local_size == cluster.len() {
-            warn!("Sub-clustering made no progress (size={}): using deterministic chunk split.", cluster.len());
+            warn!(
+                "Sub-clustering made no progress (size={}): using deterministic chunk split.",
+                cluster.len()
+            );
             let mut offset = 0usize;
             while offset < cluster.len() {
                 let end = (offset + max_cluster_size).min(cluster.len());
@@ -274,7 +358,10 @@ pub(crate) fn split_oversized_clusters(
             continue;
         }
         for local_cluster in local_clusters {
-            let mapped: Vec<usize> = local_cluster.into_iter().map(|local_idx| cluster[local_idx]).collect();
+            let mapped: Vec<usize> = local_cluster
+                .into_iter()
+                .map(|local_idx| cluster[local_idx])
+                .collect();
             if mapped.len() > max_cluster_size {
                 pending.push(mapped);
             } else {
@@ -304,8 +391,12 @@ pub(crate) fn reorder_rows_within_clusters(
     features: &Array2<f64>,
 ) -> Vec<Vec<usize>> {
     let ncols = features.ncols();
-    let w1: Vec<f64> = (0..ncols).map(|c| projection_weight(c, 0x1234_5678_9ABC_DEF0)).collect();
-    let w2: Vec<f64> = (0..ncols).map(|c| projection_weight(c, 0x0FED_CBA9_8765_4321)).collect();
+    let w1: Vec<f64> = (0..ncols)
+        .map(|c| projection_weight(c, 0x1234_5678_9ABC_DEF0))
+        .collect();
+    let w2: Vec<f64> = (0..ncols)
+        .map(|c| projection_weight(c, 0x0FED_CBA9_8765_4321))
+        .collect();
     clusters
         .par_iter()
         .map(|cluster| {
@@ -336,11 +427,16 @@ pub(crate) fn joint_svd_seriation(
     data: &CsMat<u16>,
     num_clusters: usize,
     cluster_seed: Option<u64>,
+    joint_svd_fast: bool,
 ) -> anyhow::Result<(Vec<usize>, Vec<u32>, Vec<u32>)> {
     let n_cells = points.len();
     let n_genes = data.cols();
     if n_cells == 0 {
-        return Ok((Vec::new(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
+        return Ok((
+            Vec::new(),
+            (0..n_genes as u32).collect(),
+            (0..n_genes as u32).collect(),
+        ));
     }
     let k = num_clusters.max(1).min(n_cells);
     let mut col_nnz = vec![0u64; n_genes];
@@ -357,7 +453,11 @@ pub(crate) fn joint_svd_seriation(
     }
     let active_genes: Vec<usize> = (0..n_genes).filter(|&g| col_nnz[g] > 0).collect();
     if active_genes.len() <= 2 {
-        return Ok(((0..n_cells).map(|i| i % k).collect(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect()));
+        return Ok((
+            (0..n_cells).map(|i| i % k).collect(),
+            (0..n_genes as u32).collect(),
+            (0..n_genes as u32).collect(),
+        ));
     }
     let max_svd_rows = 4000usize;
     let max_svd_cols = 2000usize;
@@ -375,18 +475,25 @@ pub(crate) fn joint_svd_seriation(
                 })
                 .collect();
             ranked_rows.sort_unstable();
-            let mut sample: Vec<usize> = ranked_rows.into_iter().take(max_svd_rows).map(|(_, row)| row).collect();
+            let mut sample: Vec<usize> = ranked_rows
+                .into_iter()
+                .take(max_svd_rows)
+                .map(|(_, row)| row)
+                .collect();
             sample.sort_unstable();
             sample
         } else {
             let step = n_cells as f64 / max_svd_rows as f64;
-            (0..max_svd_rows).map(|i| (i as f64 * step) as usize).collect()
+            (0..max_svd_rows)
+                .map(|i| (i as f64 * step) as usize)
+                .collect()
         }
     } else {
         (0..n_cells).collect()
     };
     let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
-        let mut by_freq: Vec<(usize, u64)> = active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
+        let mut by_freq: Vec<(usize, u64)> =
+            active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
         by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
         by_freq.truncate(max_svd_cols);
         by_freq.sort_unstable_by_key(|&(g, _)| g);
@@ -401,7 +508,11 @@ pub(crate) fn joint_svd_seriation(
     let nr = sampled_rows.len();
     let nc = active_cols.len();
     let mut dense = vec![0.0f64; nr * nc];
-    let sampled_set: HashMap<usize, usize> = sampled_rows.iter().enumerate().map(|(i, &r)| (r, i)).collect();
+    let sampled_set: HashMap<usize, usize> = sampled_rows
+        .iter()
+        .enumerate()
+        .map(|(i, &r)| (r, i))
+        .collect();
     for &(ci, gene_idx, value) in &triplets {
         if let Some(&local_row) = sampled_set.get(&ci) {
             if let Some(&local_col) = col_local.get(&gene_idx) {
@@ -410,13 +521,62 @@ pub(crate) fn joint_svd_seriation(
         }
     }
     let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let svd = mat.svd(true, true);
-    let (u, v_t) = match (svd.u, svd.v_t) {
-        (Some(u), Some(vt)) => (u, vt),
-        _ => return Ok(((0..n_cells).map(|i| i % k).collect(), (0..n_genes as u32).collect(), (0..n_genes as u32).collect())),
+    let svd_seed = cluster_seed
+        .unwrap_or(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(0x517C_C1B7_2722_0A95);
+    let target_rank = k.min(nr).min(nc).max(1);
+    let (u, sigma, v_t, svd_mode) = if joint_svd_fast {
+        match randomized_joint_svd_top_k(&mat, target_rank, svd_seed) {
+            Some(factors)
+                if factors.u.iter().all(|x| x.is_finite())
+                    && factors.v_t.iter().all(|x| x.is_finite()) =>
+            {
+                (
+                    factors.u,
+                    factors.singular_values,
+                    factors.v_t,
+                    "randomized",
+                )
+            }
+            _ => {
+                warn!("Fast joint SVD failed or produced non-finite values; using exact SVD");
+                let svd = mat.svd(true, true);
+                match (svd.u, svd.v_t) {
+                    (Some(u), Some(vt)) => (
+                        u,
+                        svd.singular_values.iter().copied().collect(),
+                        vt,
+                        "exact-fallback",
+                    ),
+                    _ => {
+                        return Ok((
+                            (0..n_cells).map(|i| i % k).collect(),
+                            (0..n_genes as u32).collect(),
+                            (0..n_genes as u32).collect(),
+                        ))
+                    }
+                }
+            }
+        }
+    } else {
+        let svd = mat.svd(true, true);
+        match (svd.u, svd.v_t) {
+            (Some(u), Some(vt)) => (
+                u,
+                svd.singular_values.iter().copied().collect(),
+                vt,
+                "exact",
+            ),
+            _ => {
+                return Ok((
+                    (0..n_cells).map(|i| i % k).collect(),
+                    (0..n_genes as u32).collect(),
+                    (0..n_genes as u32).collect(),
+                ))
+            }
+        }
     };
     let n_comp = k.min(u.ncols()).max(1);
-    let sigma = &svd.singular_values;
     let mut cell_emb: Vec<Vec<f64>> = vec![vec![0.0f64; n_comp]; n_cells];
     for ci in 0..n_cells {
         if let Some(&lr) = sampled_set.get(&ci) {
@@ -427,7 +587,11 @@ pub(crate) fn joint_svd_seriation(
             let point = &points[ci];
             if let Some(row) = data.outer_view(point.row_index) {
                 for j in 0..n_comp {
-                    let sig_inv = if sigma[j] > 1e-12 { 1.0 / sigma[j] } else { 0.0 };
+                    let sig_inv = if sigma[j] > 1e-12 {
+                        1.0 / sigma[j]
+                    } else {
+                        0.0
+                    };
                     let mut dot = 0.0f64;
                     for (g, &v) in row.iter() {
                         if v != 0 {
@@ -469,8 +633,8 @@ pub(crate) fn joint_svd_seriation(
         gene_new_to_old.push(old_idx as u32);
     }
     info!(
-        "Joint SVD seriation: {} cells -> {} clusters (raw-count SVD, lexicographic seriation + equal cuts), {} genes reordered ({} active in SVD)",
-        n_cells, k, n_genes, nc
+        "Joint SVD seriation: {} cells -> {} clusters ({} raw-count SVD, rank={}, lexicographic seriation + equal cuts), {} genes reordered ({} active in SVD)",
+        n_cells, k, svd_mode, n_comp, n_genes, nc
     );
     Ok((cell_labels, gene_new_to_old, gene_old_to_new))
 }

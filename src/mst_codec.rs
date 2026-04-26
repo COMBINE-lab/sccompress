@@ -28,6 +28,12 @@ impl Default for HnswBuildConfig {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum RowMstNeighborMode {
+    Hnsw,
+    LocalWindow,
+}
+
 #[derive(Clone, Debug)]
 pub struct PrecomputedMstGraph {
     num_genes: u32,
@@ -1506,6 +1512,8 @@ fn build_mst_prim(
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
     hnsw_build: HnswBuildConfig,
+    row_mst_neighbor_mode: RowMstNeighborMode,
+    row_mst_window: usize,
 ) -> (usize, Vec<u32>) {
     let n = expressions.len();
     if n == 0 {
@@ -1518,7 +1526,24 @@ fn build_mst_prim(
     let mut graph = UnGraph::<usize, u64>::new_undirected();
     let nodes: Vec<_> = (0..n).map(|i| graph.add_node(i)).collect();
 
-    if n >= 64 {
+    if matches!(row_mst_neighbor_mode, RowMstNeighborMode::LocalWindow) {
+        let window = row_mst_window.max(1).min(n.saturating_sub(1));
+        for i in 0..n {
+            let upper = (i + window + 1).min(n);
+            for j in (i + 1)..upper {
+                let weight = edge_weight(
+                    metric,
+                    &expressions[i],
+                    &expressions[j],
+                    mst_weight_mode,
+                    index_codec,
+                    full_row_fallback_ratio,
+                    None,
+                );
+                graph.update_edge(nodes[i], nodes[j], weight);
+            }
+        }
+    } else if n >= 64 {
         let max_nb_connection = hnsw_build.max_nb_connection.max(1);
         let ef_construction = hnsw_build.ef_construction.max(1);
         let nb_layers = 16;
@@ -2211,6 +2236,8 @@ pub fn encode_subarray_mst_with_metric(
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
     hnsw_build: HnswBuildConfig,
+    row_mst_neighbor_mode: RowMstNeighborMode,
+    row_mst_window: usize,
     row_template_adaptive: bool,
     row_template_max: usize,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
@@ -2224,6 +2251,8 @@ pub fn encode_subarray_mst_with_metric(
         full_row_fallback_ratio,
         forest_cut_factor,
         hnsw_build,
+        row_mst_neighbor_mode,
+        row_mst_window,
     )?;
     encode_subarray_mst_from_precomputed(
         &precomputed,
@@ -2245,6 +2274,8 @@ pub fn precompute_subarray_mst_graph(
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
     hnsw_build: HnswBuildConfig,
+    row_mst_neighbor_mode: RowMstNeighborMode,
+    row_mst_window: usize,
 ) -> Option<PrecomputedMstGraph> {
     if points.is_empty() {
         return None;
@@ -2264,6 +2295,8 @@ pub fn precompute_subarray_mst_graph(
         full_row_fallback_ratio,
         forest_cut_factor,
         hnsw_build,
+        row_mst_neighbor_mode,
+        row_mst_window,
     );
     Some(PrecomputedMstGraph {
         num_genes: data.cols() as u32,
@@ -2299,9 +2332,11 @@ pub fn encode_subarray_mst_from_precomputed(
 
     let mut child_modes_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
     let mut child_full_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
-    let mut child_remove_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
+    let mut child_remove_counts_raw =
+        Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
     let mut child_add_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
-    let mut child_update_counts_raw = Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
+    let mut child_update_counts_raw =
+        Vec::<u32>::with_capacity(expressions.len().saturating_sub(1));
     let mut row_template_counts_raw = Vec::<u32>::new();
 
     let mut row_template_first_genes_raw = Vec::<u32>::new();
@@ -2615,6 +2650,8 @@ pub fn encode_subarray_mst(
         Some(1.0),
         None,
         HnswBuildConfig::default(),
+        RowMstNeighborMode::Hnsw,
+        8,
         false,
         0,
     )
@@ -3062,5 +3099,4 @@ mod tests {
 
         assert_eq!(sparse, vec![(0, 5), (1, 11)]);
     }
-
 }

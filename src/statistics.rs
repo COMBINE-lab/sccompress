@@ -1,22 +1,22 @@
-use ndarray::{Array1, Array2, Axis};
-use rayon::prelude::*;
-use std::fs::File;
-use std::collections::HashMap;
-use csv::ReaderBuilder;
-use rand::seq::IndexedRandom;
-use std::path::{Path, PathBuf};
-use clap::{ArgAction, Parser, ValueEnum};
 use anyhow::Result;
-use hdf5::File as Hdf5File;
+use clap::{ArgAction, Parser, ValueEnum};
+use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;
+use hdf5::File as Hdf5File;
+use hnsw_rs::prelude::*;
+use ndarray::{Array1, Array2, Axis};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
-use hnsw_rs::prelude::*;
+use rand::seq::IndexedRandom;
+use rayon::prelude::*;
+use std::collections::HashMap;
+use std::fs::File;
 use std::io::BufWriter;
+use std::path::{Path, PathBuf};
 use tracing::info;
 // use efficient_pca::PCA;
-use hypors::mann_whitney;
 use hypors::common::TailType;
+use hypors::mann_whitney;
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -128,26 +128,35 @@ enum Metric {
 
 /// Compute distances from an anchor point to each row of a matrix
 fn compute_distances(anchor: &[f64], matrix: &Array2<f64>, metric: Metric) -> Vec<f64> {
-    matrix.axis_iter(Axis(0)).map(|row| {
-        let b = row.as_slice().unwrap();
-        match metric {
-            Metric::Cosine => {
-                let dot: f64 = anchor.iter().zip(b).map(|(a, b)| a * b).sum();
-                let norm_a: f64 = anchor.iter().map(|a| a * a).sum::<f64>().sqrt();
-                let norm_b: f64 = b.iter().map(|b| b * b).sum::<f64>().sqrt();
-                if norm_a == 0.0 || norm_b == 0.0 { 1.0 }
-                else { 1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0) }
-            }
-            Metric::L2 => {
-                anchor.iter().zip(b).map(|(a, b)| (a - b).powi(2)).sum::<f64>().sqrt()
-            }
-            Metric::L0 => {
-                anchor.iter().zip(b)
+    matrix
+        .axis_iter(Axis(0))
+        .map(|row| {
+            let b = row.as_slice().unwrap();
+            match metric {
+                Metric::Cosine => {
+                    let dot: f64 = anchor.iter().zip(b).map(|(a, b)| a * b).sum();
+                    let norm_a: f64 = anchor.iter().map(|a| a * a).sum::<f64>().sqrt();
+                    let norm_b: f64 = b.iter().map(|b| b * b).sum::<f64>().sqrt();
+                    if norm_a == 0.0 || norm_b == 0.0 {
+                        1.0
+                    } else {
+                        1.0 - (dot / (norm_a * norm_b)).clamp(-1.0, 1.0)
+                    }
+                }
+                Metric::L2 => anchor
+                    .iter()
+                    .zip(b)
+                    .map(|(a, b)| (a - b).powi(2))
+                    .sum::<f64>()
+                    .sqrt(),
+                Metric::L0 => anchor
+                    .iter()
+                    .zip(b)
                     .filter(|(&a, &b)| (a > 0.0) != (b > 0.0))
-                    .count() as f64
+                    .count() as f64,
             }
-        }
-    }).collect()
+        })
+        .collect()
 }
 
 /// Print neighbor indices for `anchor`, up to `max_show`, with spatial xy L2 and raw expression L0 vs anchor.
@@ -188,7 +197,12 @@ fn print_neighbor_preview(
 
 /// For a given anchor cell, compute distances to its neighbors and to k random non-neighbor cells.
 /// Returns (observed_distances, random_distances).
-fn random_cell_distance(anchor_idx: usize, data: &Array2<f64>, nbrs: &[usize], metric: Metric) -> (Vec<f64>, Vec<f64>) {
+fn random_cell_distance(
+    anchor_idx: usize,
+    data: &Array2<f64>,
+    nbrs: &[usize],
+    metric: Metric,
+) -> (Vec<f64>, Vec<f64>) {
     let anchor = data.row(anchor_idx).to_vec();
 
     // Observed: distances to actual neighbors
@@ -261,12 +275,15 @@ fn permutation_test_cell_distance(
     // Empirical p-value: fraction of permuted means <= observed mean
     // (using one-sided test: are neighbors closer than random)
     let p_value = {
-        let count = random_means.iter().filter(|&&rm| rm <= mean_obs + 1e-12).count();
+        let count = random_means
+            .iter()
+            .filter(|&&rm| rm <= mean_obs + 1e-12)
+            .count();
         (count as f64 + 1.0) / (n_permutations as f64 + 1.0) // add-one smoothing
     };
     //println!("p_value: {}", p_value);
 
-   /* 
+    /*
     // Also include the mean of all random means for interpretability
     let mean_rand_overall = if !random_means.is_empty() {
         random_means.iter().sum::<f64>() / random_means.len() as f64
@@ -274,7 +291,7 @@ fn permutation_test_cell_distance(
         0.0
     };
     */
-   // println!("idx: {}, mean_obs: {}, p_value: {}", anchor_idx, mean_obs, p_value);
+    // println!("idx: {}, mean_obs: {}, p_value: {}", anchor_idx, mean_obs, p_value);
     (mean_obs, random_means, p_value)
 }
 
@@ -287,11 +304,22 @@ pub fn mann_whitney_wilcoxon(sample1: &[f64], sample2: &[f64]) -> Option<(f64, f
     }
     // Use mann_whitney::u_test from the mann_whitney crate
     // (assume import: use mann_whitney::u_test;)
-    let result = mann_whitney::u_test(sample1.iter().copied(), sample2.iter().copied(), 0.05, TailType::Left).unwrap();
+    let result = mann_whitney::u_test(
+        sample1.iter().copied(),
+        sample2.iter().copied(),
+        0.05,
+        TailType::Left,
+    )
+    .unwrap();
     Some((result.test_statistic as f64, result.p_value))
 }
 
-fn load_from_csv(path: &Path, x_col: usize, y_col: usize, gene_start: usize) -> Result<(Array2<f64>, Array2<f64>)> {
+fn load_from_csv(
+    path: &Path,
+    x_col: usize,
+    y_col: usize,
+    gene_start: usize,
+) -> Result<(Array2<f64>, Array2<f64>)> {
     let file = File::open(path)?;
     let mut rdr = ReaderBuilder::new().has_headers(true).from_reader(file);
     let mut expr_vec: Vec<Vec<f64>> = vec![];
@@ -299,17 +327,28 @@ fn load_from_csv(path: &Path, x_col: usize, y_col: usize, gene_start: usize) -> 
 
     for result in rdr.records() {
         let record = result?;
-        let x: f64 = record.get(x_col).ok_or_else(|| anyhow::anyhow!("X column index {} out of bounds", x_col))?.parse()?;
-        let y: f64 = record.get(y_col).ok_or_else(|| anyhow::anyhow!("Y column index {} out of bounds", y_col))?.parse()?;
+        let x: f64 = record
+            .get(x_col)
+            .ok_or_else(|| anyhow::anyhow!("X column index {} out of bounds", x_col))?
+            .parse()?;
+        let y: f64 = record
+            .get(y_col)
+            .ok_or_else(|| anyhow::anyhow!("Y column index {} out of bounds", y_col))?
+            .parse()?;
         coords_vec.push([x, y]);
 
-        let genes: Vec<f64> = record.iter().skip(gene_start).map(|s| s.parse::<f64>().unwrap_or(0.0)).collect();
+        let genes: Vec<f64> = record
+            .iter()
+            .skip(gene_start)
+            .map(|s| s.parse::<f64>().unwrap_or(0.0))
+            .collect();
         expr_vec.push(genes);
     }
 
     let n_cells = expr_vec.len();
     let n_genes = expr_vec[0].len();
-    let data = Array2::from_shape_vec((n_cells, n_genes), expr_vec.into_iter().flatten().collect())?;
+    let data =
+        Array2::from_shape_vec((n_cells, n_genes), expr_vec.into_iter().flatten().collect())?;
     let coords = Array2::from_shape_vec((n_cells, 2), coords_vec.into_iter().flatten().collect())?;
     Ok((data, coords))
 }
@@ -319,30 +358,114 @@ fn read_strings_dynamic(file: &Hdf5File, path: &str) -> Result<Vec<String>> {
     let dataset = file.dataset(path)?;
     let dtype = dataset.dtype()?;
     let dsize = dtype.size();
-    
+
     // Try Variable Length Unicode
     if let Ok(v) = dataset.read_1d::<hdf5::types::VarLenUnicode>() {
         return Ok(v.iter().map(|s| s.to_string()).collect());
     }
-    
+
     // Use the exact size match for FixedAscii to prevent truncation
     // Supporting sizes commonly found in 10x/Visium HD files
     match dsize {
-        6  => if let Ok(v) = dataset.read_1d::<FixedAscii<6>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        7  => if let Ok(v) = dataset.read_1d::<FixedAscii<7>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        10 => if let Ok(v) = dataset.read_1d::<FixedAscii<10>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        11 => if let Ok(v) = dataset.read_1d::<FixedAscii<11>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        15 => if let Ok(v) = dataset.read_1d::<FixedAscii<15>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        16 => if let Ok(v) = dataset.read_1d::<FixedAscii<16>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        18 => if let Ok(v) = dataset.read_1d::<FixedAscii<18>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        21 => if let Ok(v) = dataset.read_1d::<FixedAscii<21>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        23 => if let Ok(v) = dataset.read_1d::<FixedAscii<23>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        25 => if let Ok(v) = dataset.read_1d::<FixedAscii<25>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        32 => if let Ok(v) = dataset.read_1d::<FixedAscii<32>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
-        64 => if let Ok(v) = dataset.read_1d::<FixedAscii<64>>() { return Ok(v.iter().map(|s| s.as_str().trim_end_matches('\0').to_string()).collect()); },
+        6 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<6>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        7 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<7>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        10 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<10>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        11 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<11>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        15 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<15>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        16 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<16>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        18 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<18>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        21 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<21>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        23 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<23>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        25 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<25>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        32 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<32>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
+        64 => {
+            if let Ok(v) = dataset.read_1d::<FixedAscii<64>>() {
+                return Ok(v
+                    .iter()
+                    .map(|s| s.as_str().trim_end_matches('\0').to_string())
+                    .collect());
+            }
+        }
         _ => {}
     }
-    
+
     // Fallback: Read as raw bytes and try to guess the length
     let bytes = dataset.read_1d::<u8>()?.to_vec();
     let shape = dataset.shape();
@@ -353,12 +476,14 @@ fn read_strings_dynamic(file: &Hdf5File, path: &str) -> Result<Vec<String>> {
         for i in 0..num_strings {
             let start = i * len;
             let end = start + len;
-            let s = String::from_utf8_lossy(&bytes[start..end]).trim_matches('\0').to_string();
+            let s = String::from_utf8_lossy(&bytes[start..end])
+                .trim_matches('\0')
+                .to_string();
             strings.push(s);
         }
         return Ok(strings);
     }
-    
+
     anyhow::bail!("Unsupported string format for dataset: {}", path)
 }
 
@@ -439,7 +564,10 @@ fn load_positions_from_parquet(
         if let Ok(v) = row.get_uint(idx) {
             return Ok(v as f64);
         }
-        anyhow::bail!("Parquet column {} is not a numeric type convertible to f64", idx);
+        anyhow::bail!(
+            "Parquet column {} is not a numeric type convertible to f64",
+            idx
+        );
     }
 
     let pos_file = std::fs::File::open(pos_path)?;
@@ -563,7 +691,8 @@ struct DistL0;
 
 impl Distance<f64> for DistL0 {
     fn eval(&self, a: &[f64], b: &[f64]) -> f32 {
-        a.iter().zip(b.iter())
+        a.iter()
+            .zip(b.iter())
             .filter(|(&ai, &bi)| (ai > 0.0) != (bi > 0.0))
             .count() as f32
     }
@@ -571,7 +700,7 @@ impl Distance<f64> for DistL0 {
 
 fn find_neighbors(data: &Array2<f64>, k: usize, metric: Metric) -> Vec<Vec<usize>> {
     let n = data.nrows();
-    
+
     // HNSW configuration
     let max_nb_connection = 16;
     let nb_elements = n;
@@ -581,53 +710,92 @@ fn find_neighbors(data: &Array2<f64>, k: usize, metric: Metric) -> Vec<Vec<usize
 
     match metric {
         Metric::Cosine => {
-            let hnsw = Hnsw::<f64, DistCosine>::new(max_nb_connection, nb_elements, nb_layers, ef_construction, DistCosine);
+            let hnsw = Hnsw::<f64, DistCosine>::new(
+                max_nb_connection,
+                nb_elements,
+                nb_layers,
+                ef_construction,
+                DistCosine,
+            );
             // Parallel insertion
-            data.axis_iter(Axis(0)).enumerate().collect::<Vec<_>>().par_iter().for_each(|(i, row)| {
-                hnsw.insert((row.as_slice().unwrap(), *i));
-            });
-            
-            (0..n).into_par_iter().map(|i| {
-                let row = data.row(i);
-                hnsw.search(row.as_slice().unwrap(), k, ef_search)
-                    .into_iter()
-                    .filter(|nb| nb.d_id != i) // Exclude self
-                    .take(k)
-                    .map(|nb| nb.d_id)
-                    .collect()
-            }).collect()
-        },
+            data.axis_iter(Axis(0))
+                .enumerate()
+                .collect::<Vec<_>>()
+                .par_iter()
+                .for_each(|(i, row)| {
+                    hnsw.insert((row.as_slice().unwrap(), *i));
+                });
+
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let row = data.row(i);
+                    hnsw.search(row.as_slice().unwrap(), k, ef_search)
+                        .into_iter()
+                        .filter(|nb| nb.d_id != i) // Exclude self
+                        .take(k)
+                        .map(|nb| nb.d_id)
+                        .collect()
+                })
+                .collect()
+        }
         Metric::L2 => {
-            let hnsw = Hnsw::<f64, DistL2>::new(max_nb_connection, nb_elements, nb_layers, ef_construction, DistL2);
-            data.axis_iter(Axis(0)).enumerate().collect::<Vec<_>>().par_iter().for_each(|(i, row)| {
-                hnsw.insert((row.as_slice().unwrap(), *i));
-            });
-            
-            (0..n).into_par_iter().map(|i| {
-                let row = data.row(i);
-                hnsw.search(row.as_slice().unwrap(), k, ef_search)
-                    .into_iter()
-                    .filter(|nb| nb.d_id != i)
-                    .take(k)
-                    .map(|nb| nb.d_id)
-                    .collect()
-            }).collect()
+            let hnsw = Hnsw::<f64, DistL2>::new(
+                max_nb_connection,
+                nb_elements,
+                nb_layers,
+                ef_construction,
+                DistL2,
+            );
+            data.axis_iter(Axis(0))
+                .enumerate()
+                .collect::<Vec<_>>()
+                .par_iter()
+                .for_each(|(i, row)| {
+                    hnsw.insert((row.as_slice().unwrap(), *i));
+                });
+
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let row = data.row(i);
+                    hnsw.search(row.as_slice().unwrap(), k, ef_search)
+                        .into_iter()
+                        .filter(|nb| nb.d_id != i)
+                        .take(k)
+                        .map(|nb| nb.d_id)
+                        .collect()
+                })
+                .collect()
         }
         Metric::L0 => {
-            let hnsw = Hnsw::<f64, DistL0>::new(max_nb_connection, nb_elements, nb_layers, ef_construction, DistL0);
-            data.axis_iter(Axis(0)).enumerate().collect::<Vec<_>>().par_iter().for_each(|(i, row)| {
-                hnsw.insert((row.as_slice().unwrap(), *i));
-            });
+            let hnsw = Hnsw::<f64, DistL0>::new(
+                max_nb_connection,
+                nb_elements,
+                nb_layers,
+                ef_construction,
+                DistL0,
+            );
+            data.axis_iter(Axis(0))
+                .enumerate()
+                .collect::<Vec<_>>()
+                .par_iter()
+                .for_each(|(i, row)| {
+                    hnsw.insert((row.as_slice().unwrap(), *i));
+                });
 
-            (0..n).into_par_iter().map(|i| {
-                let row = data.row(i);
-                hnsw.search(row.as_slice().unwrap(), k, ef_search)
-                    .into_iter()
-                    .filter(|nb| nb.d_id != i)
-                    .take(k)
-                    .map(|nb| nb.d_id)
-                    .collect()
-            }).collect()
+            (0..n)
+                .into_par_iter()
+                .map(|i| {
+                    let row = data.row(i);
+                    hnsw.search(row.as_slice().unwrap(), k, ef_search)
+                        .into_iter()
+                        .filter(|nb| nb.d_id != i)
+                        .take(k)
+                        .map(|nb| nb.d_id)
+                        .collect()
+                })
+                .collect()
         }
     }
 }
@@ -663,7 +831,7 @@ fn pca_project(data: Array2<f64>, n_components: usize) -> Array2<f64> {
     let (n, p) = (data.nrows(), data.ncols());
     let k = n_components.min(n).min(p);
     let mut projected = Array2::<f64>::zeros((n, k));
-    let mut residual = data;  // take ownership, no clone
+    let mut residual = data; // take ownership, no clone
 
     for comp in 0..k {
         // Initialize v deterministically (avoid rand dependency for reproducibility)
@@ -679,11 +847,15 @@ fn pca_project(data: Array2<f64>, n_components: usize) -> Array2<f64> {
             let u = residual.dot(&v);
             let v_new = residual.t().dot(&u);
             let new_norm = v_new.dot(&v_new).sqrt();
-            if new_norm < 1e-15 { break; }
+            if new_norm < 1e-15 {
+                break;
+            }
             let v_next: Array1<f64> = &v_new / new_norm;
             let diff = (&v_next - &v).mapv(|x| x * x).sum().sqrt();
             v = v_next;
-            if diff < 1e-10 { break; }
+            if diff < 1e-10 {
+                break;
+            }
         }
 
         // Project data onto this component
@@ -692,13 +864,13 @@ fn pca_project(data: Array2<f64>, n_components: usize) -> Array2<f64> {
 
         // Deflate: remove this component from residual
         let scores_col: ndarray::ArrayView2<f64> = scores.view().insert_axis(Axis(1)); // (n, 1)
-        let v_row: ndarray::ArrayView2<f64> = v.view().insert_axis(Axis(0));           // (1, p)
+        let v_row: ndarray::ArrayView2<f64> = v.view().insert_axis(Axis(0)); // (1, p)
         residual -= &scores_col.dot(&v_row);
     }
 
     projected
 }
- 
+
 /*
 fn pca_project(data: Array2<f64>, n_components: usize) -> Array2<f64> {
     let mut pca = PCA::new();
@@ -724,7 +896,9 @@ fn write_results_to_csv<P: AsRef<std::path::Path>>(
     let mut header = vec!["cell".to_string(), "neighbor_by".to_string()];
     for (label, _) in metric_results {
         header.push(format!("mean_obs_{}", label));
-        for j in 0..n_perm { header.push(format!("{}_val_{}", label, j)); }
+        for j in 0..n_perm {
+            header.push(format!("{}_val_{}", label, j));
+        }
         header.push(format!("{}_p", label));
     }
     wtr.write_record(&header)?;
@@ -756,19 +930,26 @@ fn write_results_to_csv_utest<P: AsRef<std::path::Path>>(
     let mut wtr = csv::Writer::from_writer(buf);
 
     // Per-metric max obs/rand lengths
-    let metric_dims: Vec<(usize, usize)> = metric_results.iter().map(|(_, res)| {
-        let max_obs = res.iter().map(|(_, o, _)| o.len()).max().unwrap_or(0);
-        let max_rand = res.iter().map(|(_, _, r)| r.len()).max().unwrap_or(0);
-        (max_obs, max_rand)
-    }).collect();
+    let metric_dims: Vec<(usize, usize)> = metric_results
+        .iter()
+        .map(|(_, res)| {
+            let max_obs = res.iter().map(|(_, o, _)| o.len()).max().unwrap_or(0);
+            let max_rand = res.iter().map(|(_, _, r)| r.len()).max().unwrap_or(0);
+            (max_obs, max_rand)
+        })
+        .collect();
 
     let mut header = vec!["cell".to_string(), "neighbor_by".to_string()];
     for (idx, (label, _)) in metric_results.iter().enumerate() {
         header.push(format!("ustat_{}", label));
         header.push(format!("p_{}", label));
         let (max_obs, max_rand) = metric_dims[idx];
-        for j in 0..max_obs { header.push(format!("{}_obs_{}", label, j)); }
-        for j in 0..max_rand { header.push(format!("{}_rand_{}", label, j)); }
+        for j in 0..max_obs {
+            header.push(format!("{}_obs_{}", label, j));
+        }
+        for j in 0..max_rand {
+            header.push(format!("{}_rand_{}", label, j));
+        }
     }
     wtr.write_record(&header)?;
 
@@ -791,7 +972,7 @@ fn write_results_to_csv_utest<P: AsRef<std::path::Path>>(
     wtr.flush()?;
     Ok(())
 }
-    
+
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -865,51 +1046,79 @@ fn main() -> Result<()> {
         }
     };
 
-     // ── Raw mode: only run raw tests, no PCA ────────────────────────
-     info!("Running per-cell tests (k={})...", args.k);
+    // ── Raw mode: only run raw tests, no PCA ────────────────────────
+    info!("Running per-cell tests (k={})...", args.k);
 
     match test_type {
         TestType::Permutation => {
             match args.neighbor_by {
                 NeighborBy::SpatialL0 => {
                     println!("Running permutation test (L0 only, spatial neighbors)...");
-                    let results_raw_l0: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_raw_l0: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &data_raw, &neighbors[i], Metric::L0, args.n_perm)
-                        }).collect();
-                    let metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> = vec![
-                        ("l0", &results_raw_l0),
-                    ];
+                            permutation_test_cell_distance(
+                                i,
+                                &data_raw,
+                                &neighbors[i],
+                                Metric::L0,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
+                    let metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> =
+                        vec![("l0", &results_raw_l0)];
                     write_results_to_csv(&args.output, n_cells, nbr_label, args.n_perm, &metrics)?;
                 }
                 NeighborBy::ExpressionL0 => {
                     println!("Running permutation test (L0, expression neighbors)...");
-                    let results_raw_l0: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_raw_l0: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &data_raw, &neighbors[i], Metric::L0, args.n_perm)
-                        }).collect();
-                    let metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> = vec![
-                        ("l0", &results_raw_l0),
-                    ];
+                            permutation_test_cell_distance(
+                                i,
+                                &data_raw,
+                                &neighbors[i],
+                                Metric::L0,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
+                    let metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> =
+                        vec![("l0", &results_raw_l0)];
                     write_results_to_csv(&args.output, n_cells, nbr_label, args.n_perm, &metrics)?;
                 }
                 _ => {
                     println!("Running permutation test");
                     println!("  -> {} neighbors → raw cosine...", nbr_label);
-                    let results_raw_cos: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_raw_cos: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &data_raw, &neighbors[i], Metric::Cosine, args.n_perm)
-                        }).collect();
+                            permutation_test_cell_distance(
+                                i,
+                                &data_raw,
+                                &neighbors[i],
+                                Metric::Cosine,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
                     println!("  -> {} neighbors → raw L2...", nbr_label);
-                    let results_raw_l2: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_raw_l2: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &data_raw, &neighbors[i], Metric::L2, args.n_perm)
-                        }).collect();
+                            permutation_test_cell_distance(
+                                i,
+                                &data_raw,
+                                &neighbors[i],
+                                Metric::L2,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
 
-                    let mut metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> = vec![
-                        ("cos", &results_raw_cos),
-                        ("l2", &results_raw_l2),
-                    ];
+                    let mut metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> =
+                        vec![("cos", &results_raw_cos), ("l2", &results_raw_l2)];
 
                     // Spatial → also test L0 on expression; Expression → also test L2 on XY coords
                     let results_extra: Vec<(f64, Vec<f64>, f64)>;
@@ -917,15 +1126,33 @@ fn main() -> Result<()> {
                     match args.neighbor_by {
                         NeighborBy::Spatial => {
                             println!("  -> {} neighbors → raw L0...", nbr_label);
-                            results_extra = (0..n_cells).into_par_iter()
-                                .map(|i| permutation_test_cell_distance(i, &data_raw, &neighbors[i], Metric::L0, args.n_perm))
+                            results_extra = (0..n_cells)
+                                .into_par_iter()
+                                .map(|i| {
+                                    permutation_test_cell_distance(
+                                        i,
+                                        &data_raw,
+                                        &neighbors[i],
+                                        Metric::L0,
+                                        args.n_perm,
+                                    )
+                                })
                                 .collect();
                             extra_label = "l0";
                         }
                         NeighborBy::Expression => {
                             println!("  -> {} neighbors → XY L2...", nbr_label);
-                            results_extra = (0..n_cells).into_par_iter()
-                                .map(|i| permutation_test_cell_distance(i, &coords, &neighbors[i], Metric::L2, args.n_perm))
+                            results_extra = (0..n_cells)
+                                .into_par_iter()
+                                .map(|i| {
+                                    permutation_test_cell_distance(
+                                        i,
+                                        &coords,
+                                        &neighbors[i],
+                                        Metric::L2,
+                                        args.n_perm,
+                                    )
+                                })
                                 .collect();
                             extra_label = "xyL2";
                         }
@@ -941,75 +1168,99 @@ fn main() -> Result<()> {
             match args.neighbor_by {
                 NeighborBy::SpatialL0 => {
                     println!("Running mean Wilcoxon test (L0 only, spatial neighbors)...");
-                    let l0_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> =
-                        (0..n_cells).into_par_iter()
-                            .map(|i| {
-                                let (obs, rand_d) = random_cell_distance(i, &data_raw, &neighbors[i], Metric::L0);
-                                let utest = mann_whitney_wilcoxon(&obs, &rand_d);
-                                (utest, obs, rand_d)
-                            }).collect();
-                    let metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> = vec![
-                        ("l0", &l0_results),
-                    ];
+                    let l0_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
+                        .map(|i| {
+                            let (obs, rand_d) =
+                                random_cell_distance(i, &data_raw, &neighbors[i], Metric::L0);
+                            let utest = mann_whitney_wilcoxon(&obs, &rand_d);
+                            (utest, obs, rand_d)
+                        })
+                        .collect();
+                    let metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> =
+                        vec![("l0", &l0_results)];
                     write_results_to_csv_utest(&args.output, n_cells, nbr_label, &metrics)?;
-                    println!("Results saved to {} ({} cells, raw only)", args.output.display(), n_cells);
+                    println!(
+                        "Results saved to {} ({} cells, raw only)",
+                        args.output.display(),
+                        n_cells
+                    );
                 }
                 NeighborBy::ExpressionL0 => {
                     println!("Running mean Wilcoxon test (L0, expression neighbors)...");
-                    let l0_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> =
-                        (0..n_cells).into_par_iter()
-                            .map(|i| {
-                                let (obs, rand_d) = random_cell_distance(i, &data_raw, &neighbors[i], Metric::L0);
-                                let utest = mann_whitney_wilcoxon(&obs, &rand_d);
-                                (utest, obs, rand_d)
-                            }).collect();
-                    let metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> = vec![
-                        ("l0", &l0_results),
-                    ];
+                    let l0_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
+                        .map(|i| {
+                            let (obs, rand_d) =
+                                random_cell_distance(i, &data_raw, &neighbors[i], Metric::L0);
+                            let utest = mann_whitney_wilcoxon(&obs, &rand_d);
+                            (utest, obs, rand_d)
+                        })
+                        .collect();
+                    let metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> =
+                        vec![("l0", &l0_results)];
                     write_results_to_csv_utest(&args.output, n_cells, nbr_label, &metrics)?;
-                    println!("Results saved to {} ({} cells, raw only)", args.output.display(), n_cells);
+                    println!(
+                        "Results saved to {} ({} cells, raw only)",
+                        args.output.display(),
+                        n_cells
+                    );
                 }
                 _ => {
                     println!("Running mean Wilcoxon test");
-                    let cos_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells).into_par_iter()
+                    let cos_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            let (obs, rand_d) = random_cell_distance(i, &data_raw, &neighbors[i], Metric::Cosine);
+                            let (obs, rand_d) =
+                                random_cell_distance(i, &data_raw, &neighbors[i], Metric::Cosine);
                             let utest = mann_whitney_wilcoxon(&obs, &rand_d);
                             (utest, obs, rand_d)
-                        }).collect();
-                    let l2_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells).into_par_iter()
+                        })
+                        .collect();
+                    let l2_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            let (obs, rand_d) = random_cell_distance(i, &data_raw, &neighbors[i], Metric::L2);
+                            let (obs, rand_d) =
+                                random_cell_distance(i, &data_raw, &neighbors[i], Metric::L2);
                             let utest = mann_whitney_wilcoxon(&obs, &rand_d);
                             (utest, obs, rand_d)
-                        }).collect();
+                        })
+                        .collect();
 
-                    let mut metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> = vec![
-                        ("cos", &cos_results),
-                        ("l2", &l2_results),
-                    ];
+                    let mut metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> =
+                        vec![("cos", &cos_results), ("l2", &l2_results)];
 
                     let extra_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)>;
                     let extra_label: &str;
                     match args.neighbor_by {
                         NeighborBy::Spatial => {
                             println!("  -> L0 on expression...");
-                            extra_results = (0..n_cells).into_par_iter()
+                            extra_results = (0..n_cells)
+                                .into_par_iter()
                                 .map(|i| {
-                                    let (obs, rand_d) = random_cell_distance(i, &data_raw, &neighbors[i], Metric::L0);
+                                    let (obs, rand_d) = random_cell_distance(
+                                        i,
+                                        &data_raw,
+                                        &neighbors[i],
+                                        Metric::L0,
+                                    );
                                     let utest = mann_whitney_wilcoxon(&obs, &rand_d);
                                     (utest, obs, rand_d)
-                                }).collect();
+                                })
+                                .collect();
                             extra_label = "l0";
                         }
                         NeighborBy::Expression => {
                             println!("  -> L2 on XY coords...");
-                            extra_results = (0..n_cells).into_par_iter()
+                            extra_results = (0..n_cells)
+                                .into_par_iter()
                                 .map(|i| {
-                                    let (obs, rand_d) = random_cell_distance(i, &coords, &neighbors[i], Metric::L2);
+                                    let (obs, rand_d) =
+                                        random_cell_distance(i, &coords, &neighbors[i], Metric::L2);
                                     let utest = mann_whitney_wilcoxon(&obs, &rand_d);
                                     (utest, obs, rand_d)
-                                }).collect();
+                                })
+                                .collect();
                             extra_label = "xyL2";
                         }
                         NeighborBy::SpatialL0 | NeighborBy::ExpressionL0 => unreachable!(), // handled above
@@ -1017,14 +1268,22 @@ fn main() -> Result<()> {
                     metrics.push((extra_label, &extra_results));
 
                     write_results_to_csv_utest(&args.output, n_cells, nbr_label, &metrics)?;
-                    println!("Results saved to {} ({} cells, raw only)", args.output.display(), n_cells);
+                    println!(
+                        "Results saved to {} ({} cells, raw only)",
+                        args.output.display(),
+                        n_cells
+                    );
                 }
             }
         }
     }
-    println!("Results saved to {} ({} cells, raw only)", args.output.display(), n_cells);
+    println!(
+        "Results saved to {} ({} cells, raw only)",
+        args.output.display(),
+        n_cells
+    );
 
-    if args.pca_dims > 0 && args.pca{
+    if args.pca_dims > 0 && args.pca {
         // ── PCA mode: only run PCA tests, skip raw ──────────────────────
         println!("Performing PCA ({} dimensions)...", args.pca_dims);
 
@@ -1053,7 +1312,7 @@ fn main() -> Result<()> {
         for j in 0..n_g {
             gene_var[j] /= n_f - 1.0;
         }
-        
+
         // Filter zero-variance genes
         let mut keep_cols: Vec<usize> = (0..n_g).filter(|&j| gene_var[j] > 1e-12).collect();
         println!("  {}/{} genes have non-zero variance", keep_cols.len(), n_g);
@@ -1065,8 +1324,11 @@ fn main() -> Result<()> {
             keep_cols.sort(); // restore column order
         }
         let n_kept = keep_cols.len();
-        println!("  Using top {} genes for PCA ({:.1} MB matrix)",
-            n_kept, (n_cells * n_kept * 8) as f64 / 1e6);
+        println!(
+            "  Using top {} genes for PCA ({:.1} MB matrix)",
+            n_kept,
+            (n_cells * n_kept * 8) as f64 / 1e6
+        );
 
         // Build centered+scaled matrix
         let std_devs: Vec<f64> = keep_cols.iter().map(|&j| gene_var[j].sqrt()).collect();
@@ -1083,17 +1345,29 @@ fn main() -> Result<()> {
         // Drop data_raw BEFORE SVD to free memory
         let raw_bytes = n_cells * n_genes * 8;
         drop(data_raw);
-        info!("  Freed raw data ({:.1} MB) before SVD", raw_bytes as f64 / 1e6);
+        info!(
+            "  Freed raw data ({:.1} MB) before SVD",
+            raw_bytes as f64 / 1e6
+        );
 
         // PCA via power-iteration SVD (data_scaled is already restricted to top HVGs)
         let pca = pca_project(data_scaled, args.pca_dims);
-        println!("  PCA output: {} cells × {} components", pca.nrows(), pca.ncols());
+        println!(
+            "  PCA output: {} cells × {} components",
+            pca.nrows(),
+            pca.ncols()
+        );
 
         // Save per-cell results with "pca_" prefix in filename
-        let orig_file_name = args.output.file_name()
+        let orig_file_name = args
+            .output
+            .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("pca_results.csv");
-        let parent = args.output.parent().unwrap_or_else(|| std::path::Path::new(""));
+        let parent = args
+            .output
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(""));
 
         // Build new filename with "pca_" prefix
         let pca_file_name = format!("pca_{}", orig_file_name);
@@ -1103,31 +1377,58 @@ fn main() -> Result<()> {
             TestType::Permutation => {
                 if args.neighbor_by == NeighborBy::SpatialL0 {
                     println!("Running PCA permutation test (L0 only, spatial neighbors)...");
-                    let results_pca_l0: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_pca_l0: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &pca, &neighbors[i], Metric::L0, args.n_perm)
-                        }).collect();
-                    let metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> = vec![
-                        ("l0", &results_pca_l0),
-                    ];
-                    write_results_to_csv(&pca_full_path, n_cells, nbr_label, args.n_perm, &metrics)?;
+                            permutation_test_cell_distance(
+                                i,
+                                &pca,
+                                &neighbors[i],
+                                Metric::L0,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
+                    let metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> =
+                        vec![("l0", &results_pca_l0)];
+                    write_results_to_csv(
+                        &pca_full_path,
+                        n_cells,
+                        nbr_label,
+                        args.n_perm,
+                        &metrics,
+                    )?;
                 } else {
                     println!("Running PCA permutation test");
                     println!("  -> {} neighbors → PCA cosine...", nbr_label);
-                    let results_pca_cos: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_pca_cos: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &pca, &neighbors[i], Metric::Cosine, args.n_perm)
-                        }).collect();
+                            permutation_test_cell_distance(
+                                i,
+                                &pca,
+                                &neighbors[i],
+                                Metric::Cosine,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
                     println!("  -> {} neighbors → PCA L2...", nbr_label);
-                    let results_pca_l2: Vec<(f64, Vec<f64>, f64)> = (0..n_cells).into_par_iter()
+                    let results_pca_l2: Vec<(f64, Vec<f64>, f64)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            permutation_test_cell_distance(i, &pca, &neighbors[i], Metric::L2, args.n_perm)
-                        }).collect();
+                            permutation_test_cell_distance(
+                                i,
+                                &pca,
+                                &neighbors[i],
+                                Metric::L2,
+                                args.n_perm,
+                            )
+                        })
+                        .collect();
 
-                    let mut metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> = vec![
-                        ("cos", &results_pca_cos),
-                        ("l2", &results_pca_l2),
-                    ];
+                    let mut metrics: Vec<(&str, &[(f64, Vec<f64>, f64)])> =
+                        vec![("cos", &results_pca_cos), ("l2", &results_pca_l2)];
 
                     let results_extra: Vec<(f64, Vec<f64>, f64)>;
                     let extra_label: &str;
@@ -1139,8 +1440,17 @@ fn main() -> Result<()> {
                         }
                         NeighborBy::Expression | NeighborBy::ExpressionL0 => {
                             println!("  -> {} neighbors → XY L2...", nbr_label);
-                            results_extra = (0..n_cells).into_par_iter()
-                                .map(|i| permutation_test_cell_distance(i, &coords, &neighbors[i], Metric::L2, args.n_perm))
+                            results_extra = (0..n_cells)
+                                .into_par_iter()
+                                .map(|i| {
+                                    permutation_test_cell_distance(
+                                        i,
+                                        &coords,
+                                        &neighbors[i],
+                                        Metric::L2,
+                                        args.n_perm,
+                                    )
+                                })
                                 .collect();
                             extra_label = "xyL2";
                         }
@@ -1150,42 +1460,58 @@ fn main() -> Result<()> {
                         metrics.push((extra_label, &results_extra));
                     }
 
-                    write_results_to_csv(&pca_full_path, n_cells, nbr_label, args.n_perm, &metrics)?;
+                    write_results_to_csv(
+                        &pca_full_path,
+                        n_cells,
+                        nbr_label,
+                        args.n_perm,
+                        &metrics,
+                    )?;
                 }
-                println!("Results saved to {} ({} cells, PCA)", pca_full_path.display(), n_cells);
+                println!(
+                    "Results saved to {} ({} cells, PCA)",
+                    pca_full_path.display(),
+                    n_cells
+                );
             }
             TestType::MeanWilcoxon => {
                 if args.neighbor_by == NeighborBy::SpatialL0 {
                     println!("Running PCA mean Wilcoxon test (L0 only, spatial neighbors)...");
-                    let l0_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells).into_par_iter()
+                    let l0_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            let (obs, rand_d) = random_cell_distance(i, &pca, &neighbors[i], Metric::L0);
+                            let (obs, rand_d) =
+                                random_cell_distance(i, &pca, &neighbors[i], Metric::L0);
                             let utest = mann_whitney_wilcoxon(&obs, &rand_d);
                             (utest, obs, rand_d)
-                        }).collect();
-                    let metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> = vec![
-                        ("l0", &l0_results),
-                    ];
+                        })
+                        .collect();
+                    let metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> =
+                        vec![("l0", &l0_results)];
                     write_results_to_csv_utest(&pca_full_path, n_cells, nbr_label, &metrics)?;
                 } else {
                     println!("Running PCA mean Wilcoxon test");
-                    let cos_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells).into_par_iter()
+                    let cos_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            let (obs_cos, rand_cos) = random_cell_distance(i, &pca, &neighbors[i], Metric::Cosine);
+                            let (obs_cos, rand_cos) =
+                                random_cell_distance(i, &pca, &neighbors[i], Metric::Cosine);
                             let utest = mann_whitney_wilcoxon(&obs_cos, &rand_cos);
                             (utest, obs_cos, rand_cos)
-                        }).collect();
-                    let l2_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells).into_par_iter()
+                        })
+                        .collect();
+                    let l2_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)> = (0..n_cells)
+                        .into_par_iter()
                         .map(|i| {
-                            let (obs_l2, rand_l2) = random_cell_distance(i, &pca, &neighbors[i], Metric::L2);
+                            let (obs_l2, rand_l2) =
+                                random_cell_distance(i, &pca, &neighbors[i], Metric::L2);
                             let utest = mann_whitney_wilcoxon(&obs_l2, &rand_l2);
                             (utest, obs_l2, rand_l2)
-                        }).collect();
+                        })
+                        .collect();
 
-                    let mut metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> = vec![
-                        ("cos", &cos_results),
-                        ("l2", &l2_results),
-                    ];
+                    let mut metrics: Vec<(&str, &[(Option<(f64, f64)>, Vec<f64>, Vec<f64>)])> =
+                        vec![("cos", &cos_results), ("l2", &l2_results)];
 
                     let extra_results: Vec<(Option<(f64, f64)>, Vec<f64>, Vec<f64>)>;
                     let extra_label: &str;
@@ -1196,12 +1522,15 @@ fn main() -> Result<()> {
                         }
                         NeighborBy::Expression | NeighborBy::ExpressionL0 => {
                             println!("  -> L2 on XY coords...");
-                            extra_results = (0..n_cells).into_par_iter()
+                            extra_results = (0..n_cells)
+                                .into_par_iter()
                                 .map(|i| {
-                                    let (obs, rand_d) = random_cell_distance(i, &coords, &neighbors[i], Metric::L2);
+                                    let (obs, rand_d) =
+                                        random_cell_distance(i, &coords, &neighbors[i], Metric::L2);
                                     let utest = mann_whitney_wilcoxon(&obs, &rand_d);
                                     (utest, obs, rand_d)
-                                }).collect();
+                                })
+                                .collect();
                             extra_label = "xyL2";
                         }
                         NeighborBy::SpatialL0 => unreachable!(), // handled above
@@ -1212,12 +1541,15 @@ fn main() -> Result<()> {
 
                     write_results_to_csv_utest(&pca_full_path, n_cells, nbr_label, &metrics)?;
                 }
-                println!("Results saved to {} ({} cells, PCA)", pca_full_path.display(), n_cells);
+                println!(
+                    "Results saved to {} ({} cells, PCA)",
+                    pca_full_path.display(),
+                    n_cells
+                );
             }
         }
     }
     Ok(())
-
 }
 
 #[cfg(test)]
@@ -1227,11 +1559,13 @@ mod tests {
 
     #[test]
     fn xenium_cells_parquet_schema_matches_resolve_position_columns() {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(
-            "test_data/Xenium_V1_FFPE_Human_Brain_Healthy_With_Addon_outs/cells.parquet",
-        );
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("test_data/Xenium_V1_FFPE_Human_Brain_Healthy_With_Addon_outs/cells.parquet");
         if !path.exists() {
-            eprintln!("skip xenium_cells_parquet_schema_matches_resolve_position_columns: missing {}", path.display());
+            eprintln!(
+                "skip xenium_cells_parquet_schema_matches_resolve_position_columns: missing {}",
+                path.display()
+            );
             return;
         }
         let f = File::open(&path).expect("open cells.parquet");
@@ -1242,7 +1576,11 @@ mod tests {
         assert_eq!(descr.column(2).name(), "y_centroid");
 
         let (x_col, y_col) = resolve_position_columns(Some(Platform::Xenium), None, None);
-        assert_eq!((x_col, y_col), (1, 2), "Xenium preset must index x_centroid/y_centroid");
+        assert_eq!(
+            (x_col, y_col),
+            (1, 2),
+            "Xenium preset must index x_centroid/y_centroid"
+        );
     }
 
     #[test]
