@@ -45,7 +45,7 @@ use linfa::prelude::{Fit, Predict};
 use linfa::DatasetBase;
 use linfa_clustering::KMeans;
 use nalgebra::DMatrix;
-use rand_xoshiro::rand_core::{RngCore, SeedableRng};
+use rand_xoshiro::rand_core::SeedableRng;
 use rand_xoshiro::Xoshiro256Plus;
 
 #[global_allocator]
@@ -343,61 +343,6 @@ fn compute_gene_permutation_from_row_stream(
     ))
 }
 
-/// Thin orthonormal basis for the column space of `y` (modified Gram–Schmidt).
-fn orthonormalize_columns(y: &DMatrix<f64>) -> DMatrix<f64> {
-    let nr = y.nrows();
-    let l = y.ncols();
-    let mut q = DMatrix::zeros(nr, l);
-    for j in 0..l {
-        let mut v: Vec<f64> = (0..nr).map(|i| y[(i, j)]).collect();
-        for k in 0..j {
-            let mut dot = 0.0f64;
-            for i in 0..nr {
-                dot += v[i] * q[(i, k)];
-            }
-            for i in 0..nr {
-                v[i] -= dot * q[(i, k)];
-            }
-        }
-        let norm: f64 = v.iter().map(|x| x * x).sum::<f64>().sqrt();
-        if norm > 1e-14 {
-            for i in 0..nr {
-                q[(i, j)] = v[i] / norm;
-            }
-        }
-    }
-    q
-}
-
-/// Randomized range finder + small SVD: approximate first `k` rows of `V^T`
-/// for `a` (same layout as `DMatrix::svd(..., v_t)`).
-fn approx_v_t_top_k(a: &DMatrix<f64>, k: usize, seed: u64) -> Option<DMatrix<f64>> {
-    let nr = a.nrows();
-    let nc = a.ncols();
-    if k == 0 || nc == 0 || nr == 0 {
-        return None;
-    }
-    let oversample = 4usize;
-    let l = (k + oversample).min(nc).max(k);
-    let mut rng = Xoshiro256Plus::seed_from_u64(seed);
-    let omega = DMatrix::from_fn(nc, l, |_, _| {
-        let u = rng.next_u64();
-        (u as f64 / (u64::MAX as f64)) * 2.0 - 1.0
-    });
-    let y0 = a * &omega;
-    let at_y0 = a.transpose() * &y0;
-    let y = a * &at_y0;
-    let q = orthonormalize_columns(&y);
-    let w = q.transpose() * a;
-    let svd = w.svd(false, true);
-    let v_t = svd.v_t?;
-    let nkeep = k.min(v_t.nrows());
-    if nkeep == 0 {
-        return None;
-    }
-    Some(v_t.rows(0, nkeep).into_owned())
-}
-
 /// SVD-based gene reordering: build a sparse cell×gene matrix from the cluster
 /// row stream, compute a truncated SVD, and sort genes by their coordinates in
 /// the first two right singular vectors (v₁, v₂).  Genes with similar cell
@@ -407,8 +352,6 @@ fn compute_gene_permutation_svd(
     points: &[Point],
     data: &CsMat<u16>,
     row_stream_point_indices: &[usize],
-    gene_svd_fast: bool,
-    svd_seed: u64,
 ) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
     let ncols = data.cols();
     if ncols == 0 {
@@ -503,37 +446,16 @@ fn compute_gene_permutation_svd(
     }
 
     let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let v_t = if gene_svd_fast {
-        match approx_v_t_top_k(&mat, 2, svd_seed) {
-            Some(vt) if vt.nrows() >= 1 && vt.iter().all(|x| x.is_finite()) => vt,
-            _ => {
-                warn!("SVD gene reorder: randomized top-2 failed or non-finite; using exact SVD");
-                let svd = mat.svd(false, true);
-                match svd.v_t {
-                    Some(vt) => vt,
-                    None => {
-                        info!("SVD gene reorder: V^T not available, falling back to projection method");
-                        return compute_gene_permutation_from_row_stream(
-                            points,
-                            data,
-                            row_stream_point_indices,
-                        );
-                    }
-                }
-            }
-        }
-    } else {
-        let svd = mat.svd(false, true);
-        match svd.v_t {
-            Some(vt) => vt,
-            None => {
-                info!("SVD gene reorder: V^T not available, falling back to projection method");
-                return compute_gene_permutation_from_row_stream(
-                    points,
-                    data,
-                    row_stream_point_indices,
-                );
-            }
+    let svd = mat.svd(false, true);
+    let v_t = match svd.v_t {
+        Some(vt) => vt,
+        None => {
+            info!("SVD gene reorder: V^T not available, falling back to projection method");
+            return compute_gene_permutation_from_row_stream(
+                points,
+                data,
+                row_stream_point_indices,
+            );
         }
     };
 
@@ -567,11 +489,10 @@ fn compute_gene_permutation_svd(
     }
 
     info!(
-        "SVD gene reorder: {} genes reordered ({} active in SVD, {} total) fast_top2={}",
+        "SVD gene reorder: {} genes reordered ({} active in SVD, {} total)",
         active_cols.len(),
         nc,
-        ncols,
-        gene_svd_fast
+        ncols
     );
 
     Ok((new_to_old, old_to_new))
@@ -677,7 +598,7 @@ fn compute_gene_permutation_kmeans(
         Some(vt) => vt,
         None => {
             info!("K-means gene reorder: V^T not available, falling back to SVD seriation");
-            return compute_gene_permutation_svd(points, data, row_stream_point_indices, false, 0);
+            return compute_gene_permutation_svd(points, data, row_stream_point_indices);
         }
     };
 
@@ -1642,7 +1563,6 @@ fn run_clustered_compression(
     tensor_grid: TensorGridParams,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
-    gene_svd_fast: bool,
     joint_svd_fast: bool,
     gene_blocks: usize,
     payload_compression: PayloadCompressionArg,
@@ -1770,35 +1690,29 @@ fn run_clustered_compression(
     let timing_cluster_prep_ms = cluster_prep_start.elapsed().as_millis() as u64;
 
     let gene_order_start = Instant::now();
-    let svd_rng_seed = cluster_seed
-        .unwrap_or(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(0xA5A5_A5A5_A5A5_A5A5);
-    let (gene_order, gene_old_to_new) =
-        if let Some((_, ref new_to_old, ref old_to_new)) = joint_result {
-            info!("Using gene ordering from joint SVD seriation");
-            (new_to_old.clone(), old_to_new.clone())
-        } else {
-            match gene_reorder_method {
-                GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
-                    points,
-                    &quantized_data,
-                    &row_stream_point_indices,
-                )?,
-                GeneReorderMethod::Svd => compute_gene_permutation_svd(
-                    points,
-                    &quantized_data,
-                    &row_stream_point_indices,
-                    gene_svd_fast,
-                    svd_rng_seed,
-                )?,
-                GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
-                    points,
-                    &quantized_data,
-                    &row_stream_point_indices,
-                    cluster_seed,
-                )?,
+    let (gene_order, gene_old_to_new) = if let Some((_, ref new_to_old, ref old_to_new)) =
+        joint_result
+    {
+        info!("Using gene ordering from joint SVD seriation");
+        (new_to_old.clone(), old_to_new.clone())
+    } else {
+        match gene_reorder_method {
+            GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
+                points,
+                &quantized_data,
+                &row_stream_point_indices,
+            )?,
+            GeneReorderMethod::Svd => {
+                compute_gene_permutation_svd(points, &quantized_data, &row_stream_point_indices)?
             }
-        };
+            GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
+                points,
+                &quantized_data,
+                &row_stream_point_indices,
+                cluster_seed,
+            )?,
+        }
+    };
     let timing_gene_order_ms = gene_order_start.elapsed().as_millis() as u64;
 
     // Build per-gene-block column masks.  When gene_blocks <= 1 the single "block" is
@@ -2576,10 +2490,6 @@ struct BuildCommand {
     /// or `svd` (truncated SVD on the sparse matrix, uses right singular vectors).
     #[arg(long = "gene-reorder-method", value_enum, default_value_t = GeneReorderMethod::Projection)]
     gene_reorder_method: GeneReorderMethod,
-    /// For `gene-reorder-method=svd`: use randomized subspace iteration for the top-2 right singular
-    /// vectors only (faster than full dense SVD on the sampled matrix).
-    #[arg(long = "gene-svd-fast", default_value_t = false)]
-    gene_svd_fast: bool,
     /// For `cell-cluster-method=svd-joint`: use randomized joint SVD for cell clusters and gene order.
     #[arg(long = "joint-svd-fast", default_value_t = false)]
     joint_svd_fast: bool,
@@ -2840,7 +2750,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} row_mst_neighbor_mode={:?} row_mst_window={} gene_svd_fast={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} row_mst_neighbor_mode={:?} row_mst_window={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2857,7 +2767,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hnsw_build.ef_search,
                 args.row_mst_neighbor_mode,
                 row_mst_window,
-                args.gene_svd_fast,
                 args.joint_svd_fast,
                 args.index_codec,
                 args.sorted_index_codec,
@@ -2931,7 +2840,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         tensor_grid,
                         args.set_seed,
                         *gene_reorder_method,
-                        args.gene_svd_fast,
                         args.joint_svd_fast,
                         args.gene_blocks,
                         args.output_compression,
@@ -3246,7 +3154,6 @@ mod tests {
             None,
             GeneReorderMethod::Projection,
             false,
-            false,
             1,
             PayloadCompressionArg::Zstd,
         )
@@ -3297,7 +3204,6 @@ mod tests {
             TensorGridParams::default(),
             Some(42),
             GeneReorderMethod::Projection,
-            false,
             false,
             1,
             PayloadCompressionArg::Zstd,
