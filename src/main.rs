@@ -14,9 +14,8 @@ use index_stream::IndexStreamCodec;
 use matrix_io::{load_10x_no_positions, load_10x_with_positions, InputPosType, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
-    encode_subarray_column, encode_subarray_mst_from_precomputed, encode_subarray_mst_with_metric,
-    precompute_subarray_mst_graph, DatalessPoint, EncodedClusterBlock, EncodedColumnBlock,
-    EncodedDiffsMST, HnswBuildConfig, KnnDistanceMetric, MstWeightMode, Point, PrecomputedMstGraph,
+    encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
+    EncodedColumnBlock, EncodedDiffsMST, HnswBuildConfig, KnnDistanceMetric, MstWeightMode, Point,
     RowMstNeighborMode,
 };
 use ndarray::Array2;
@@ -65,7 +64,6 @@ struct CompressionResult {
     timing_cluster_prep_ms: u64,
     timing_gene_order_ms: u64,
     timing_encode_tiles_ms: u64,
-    timing_row_mst_precompute_ms: u64,
     timing_row_mst_encode_ms: u64,
     timing_column_encode_ms: u64,
     cluster_sizes: Vec<usize>,
@@ -1633,7 +1631,6 @@ fn run_clustered_compression(
     hnsw_build: HnswBuildConfig,
     row_mst_neighbor_mode: RowMstNeighborMode,
     row_mst_window: usize,
-    disable_mst_graph_cache: bool,
     cluster_encoding: ClusterEncodingArg,
     column_template_count: usize,
     column_template_adaptive: bool,
@@ -1837,7 +1834,6 @@ fn run_clustered_compression(
     let mut row_order = Vec::new();
     let mut cluster_sizes = Vec::new();
     let mut total_mst_bytes = 0usize;
-    let row_mst_precompute_us = AtomicU64::new(0);
     let row_mst_encode_us = AtomicU64::new(0);
     let column_encode_us = AtomicU64::new(0);
 
@@ -1874,57 +1870,24 @@ fn run_clustered_compression(
             ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
         ) {
             let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-            let mst_graph_cache: Option<PrecomputedMstGraph> = if row_template_adaptive
-                && !disable_mst_graph_cache
-            {
+            let mut try_row_encode = |adaptive: bool| {
                 let t = Instant::now();
-                let out = precompute_subarray_mst_graph(
+                let encoded = encode_subarray_mst_with_metric(
                     cluster_points,
                     &quantized_data,
                     knn_metric,
                     mst_weight_mode,
                     Some(block_gene_o2n),
                     index_codec,
+                    sorted_index_codec,
                     full_row_fallback_ratio,
                     forest_cut_factor,
                     hnsw_build,
                     row_mst_neighbor_mode,
                     row_mst_window,
+                    adaptive,
+                    row_template_max,
                 );
-                row_mst_precompute_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                out
-            } else {
-                None
-            };
-            let mut try_row_encode = |adaptive: bool| {
-                let t = Instant::now();
-                let encoded = if let Some(precomputed) = mst_graph_cache.as_ref() {
-                    encode_subarray_mst_from_precomputed(
-                        precomputed,
-                        sorted_index_codec,
-                        index_codec,
-                        full_row_fallback_ratio,
-                        adaptive,
-                        row_template_max,
-                    )
-                } else {
-                    encode_subarray_mst_with_metric(
-                        cluster_points,
-                        &quantized_data,
-                        knn_metric,
-                        mst_weight_mode,
-                        Some(block_gene_o2n),
-                        index_codec,
-                        sorted_index_codec,
-                        full_row_fallback_ratio,
-                        forest_cut_factor,
-                        hnsw_build,
-                        row_mst_neighbor_mode,
-                        row_mst_window,
-                        adaptive,
-                        row_template_max,
-                    )
-                };
                 row_mst_encode_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if let Some((row_block, dfs_order)) = encoded {
                     let bytes = row_block.total_bytes();
@@ -2199,7 +2162,6 @@ fn run_clustered_compression(
         encoded_blocks.extend(tile_blocks);
     }
     let timing_encode_tiles_ms = encode_tiles_start.elapsed().as_millis() as u64;
-    let timing_row_mst_precompute_ms = row_mst_precompute_us.load(Ordering::Relaxed) / 1_000;
     let timing_row_mst_encode_ms = row_mst_encode_us.load(Ordering::Relaxed) / 1_000;
     let timing_column_encode_ms = column_encode_us.load(Ordering::Relaxed) / 1_000;
 
@@ -2271,7 +2233,6 @@ fn run_clustered_compression(
         timing_cluster_prep_ms,
         timing_gene_order_ms,
         timing_encode_tiles_ms,
-        timing_row_mst_precompute_ms,
         timing_row_mst_encode_ms,
         timing_column_encode_ms,
         cluster_sizes,
@@ -2565,9 +2526,6 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
-    /// Disable per-cluster MST graph reuse across row adaptive/non-adaptive dual-pass.
-    #[arg(long = "disable-mst-graph-cache", default_value_t = false)]
-    disable_mst_graph_cache: bool,
     /// HNSW construction/search preset for MST KNN graph build.
     #[arg(long = "hnsw-fast-profile", value_enum, default_value_t = HnswProfileArg::Default)]
     hnsw_fast_profile: HnswProfileArg,
@@ -2882,7 +2840,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} row_mst_neighbor_mode={:?} row_mst_window={} mst_graph_cache_enabled={} gene_svd_fast={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} row_mst_neighbor_mode={:?} row_mst_window={} gene_svd_fast={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2899,7 +2857,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 hnsw_build.ef_search,
                 args.row_mst_neighbor_mode,
                 row_mst_window,
-                !args.disable_mst_graph_cache,
                 args.gene_svd_fast,
                 args.joint_svd_fast,
                 args.index_codec,
@@ -2963,7 +2920,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         hnsw_build,
                         row_mst_neighbor_mode,
                         row_mst_window,
-                        args.disable_mst_graph_cache,
                         cluster_encoding,
                         args.column_template_count,
                         args.column_template_adaptive,
@@ -2991,11 +2947,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         result.rmse
                     );
                     info!(
-                        "timing: cluster_prep={}ms gene_order={}ms encode_tiles={}ms row_mst_precompute={}ms row_mst_encode={}ms column_encode={}ms",
+                        "timing: cluster_prep={}ms gene_order={}ms encode_tiles={}ms row_mst_encode={}ms column_encode={}ms",
                         result.timing_cluster_prep_ms,
                         result.timing_gene_order_ms,
                         result.timing_encode_tiles_ms,
-                        result.timing_row_mst_precompute_ms,
                         result.timing_row_mst_encode_ms,
                         result.timing_column_encode_ms
                     );
@@ -3279,7 +3234,6 @@ mod tests {
             HnswBuildConfig::default(),
             RowMstNeighborMode::Hnsw,
             8,
-            false,
             ClusterEncodingArg::Hybrid,
             0,
             false,
@@ -3332,7 +3286,6 @@ mod tests {
             HnswBuildConfig::default(),
             RowMstNeighborMode::Hnsw,
             8,
-            false,
             ClusterEncodingArg::Hybrid,
             0,
             false,

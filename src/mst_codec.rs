@@ -35,15 +35,6 @@ pub enum RowMstNeighborMode {
 }
 
 #[derive(Clone, Debug)]
-pub struct PrecomputedMstGraph {
-    num_genes: u32,
-    expressions: Vec<SparseExpression>,
-    local_to_global_raw: Vec<u32>,
-    root: usize,
-    parent: Vec<u32>,
-}
-
-#[derive(Clone, Debug)]
 pub struct Point {
     pub x: f64,
     pub y: f64,
@@ -2241,42 +2232,6 @@ pub fn encode_subarray_mst_with_metric(
     row_template_adaptive: bool,
     row_template_max: usize,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
-    let precomputed = precompute_subarray_mst_graph(
-        points,
-        data,
-        knn_metric,
-        mst_weight_mode,
-        gene_old_to_new,
-        index_codec,
-        full_row_fallback_ratio,
-        forest_cut_factor,
-        hnsw_build,
-        row_mst_neighbor_mode,
-        row_mst_window,
-    )?;
-    encode_subarray_mst_from_precomputed(
-        &precomputed,
-        sorted_index_codec,
-        index_codec,
-        full_row_fallback_ratio,
-        row_template_adaptive,
-        row_template_max,
-    )
-}
-
-pub fn precompute_subarray_mst_graph(
-    points: &[Point],
-    data: &CsMat<u16>,
-    knn_metric: KnnDistanceMetric,
-    mst_weight_mode: MstWeightMode,
-    gene_old_to_new: Option<&[u32]>,
-    index_codec: IndexStreamCodec,
-    full_row_fallback_ratio: Option<f32>,
-    forest_cut_factor: Option<f32>,
-    hnsw_build: HnswBuildConfig,
-    row_mst_neighbor_mode: RowMstNeighborMode,
-    row_mst_window: usize,
-) -> Option<PrecomputedMstGraph> {
     if points.is_empty() {
         return None;
     }
@@ -2298,31 +2253,36 @@ pub fn precompute_subarray_mst_graph(
         row_mst_neighbor_mode,
         row_mst_window,
     );
-    Some(PrecomputedMstGraph {
-        num_genes: data.cols() as u32,
-        expressions,
-        local_to_global_raw,
+    encode_subarray_mst_from_parts(
+        data.cols() as u32,
+        &expressions,
+        &local_to_global_raw,
         root,
-        parent,
-    })
+        &parent,
+        sorted_index_codec,
+        index_codec,
+        full_row_fallback_ratio,
+        row_template_adaptive,
+        row_template_max,
+    )
 }
 
-pub fn encode_subarray_mst_from_precomputed(
-    precomputed: &PrecomputedMstGraph,
+fn encode_subarray_mst_from_parts(
+    num_genes: u32,
+    expressions: &[SparseExpression],
+    local_to_global_raw: &[u32],
+    root: usize,
+    parent: &[u32],
     sorted_index_codec: SortedIndexCodec,
     index_codec: IndexStreamCodec,
     full_row_fallback_ratio: Option<f32>,
     row_template_adaptive: bool,
     row_template_max: usize,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
-    let num_genes = precomputed.num_genes;
-    let expressions = &precomputed.expressions;
-    let parent = &precomputed.parent;
     let local_to_global =
-        EncodedSortedIndices::from_sorted_u32(&precomputed.local_to_global_raw, sorted_index_codec);
-    let (dfs_order, parent_offset_raw) =
-        compute_dfs_order(precomputed.root, parent, expressions.len());
-    let root_expr = &expressions[precomputed.root];
+        EncodedSortedIndices::from_sorted_u32(local_to_global_raw, sorted_index_codec);
+    let (dfs_order, parent_offset_raw) = compute_dfs_order(root, parent, expressions.len());
+    let root_expr = &expressions[root];
     let root_genes: Vec<u32> = root_expr.iter().map(|(g, _)| *g).collect();
     let root_vals_raw: Vec<u32> = root_expr.iter().map(|(_, v)| *v as u32).collect();
 
