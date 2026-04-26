@@ -16,14 +16,18 @@ hnsw_rs = "0.3"
 linfa = "0.8"
 linfa-clustering = "0.8"
 mimalloc = "0.1.48"
+nalgebra = { version = "0.34.2", default-features = false, features = ["std"] }
 ndarray = "0.16.1"
 parquet = "55.2.0"
 petgraph = "0.6"
+rand = "0.9"
+rand_xoshiro = "0.6"
 rayon = "1.11.0"
 sprs = "0.11"
 stream-vbyte = "0.4.1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.13"
 
 [[bin]]
 name = "quadtree"
