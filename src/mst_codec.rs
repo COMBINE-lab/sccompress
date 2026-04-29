@@ -2,7 +2,6 @@ use crate::arith_encode::ArithmeticEncoded;
 use crate::index_stream::{EncodedU32Stream, IndexStreamCodec};
 use crate::sorted_indices::{EncodedSortedIndices, SortedIndexCodec};
 use bincode::{Decode, Encode};
-use hnsw_rs::prelude::*;
 use petgraph::algo::{connected_components, min_spanning_tree};
 use petgraph::data::FromElements;
 use petgraph::graph::UnGraph;
@@ -10,29 +9,6 @@ use petgraph::visit::EdgeRef;
 use rayon::prelude::*;
 use sprs::CsMat;
 use std::collections::{HashMap, HashSet};
-
-#[derive(Clone, Copy, Debug)]
-pub struct HnswBuildConfig {
-    pub max_nb_connection: usize,
-    pub ef_construction: usize,
-    pub ef_search: usize,
-}
-
-impl Default for HnswBuildConfig {
-    fn default() -> Self {
-        Self {
-            max_nb_connection: 16,
-            ef_construction: 100,
-            ef_search: 50,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub enum RowMstNeighborMode {
-    Hnsw,
-    LocalWindow,
-}
 
 #[derive(Clone, Debug)]
 pub struct Point {
@@ -1287,50 +1263,7 @@ fn binary_jaccard_distance(a: &[(u32, u16)], b: &[(u32, u16)]) -> f32 {
     1.0 - (intersection as f32 / union as f32)
 }
 
-#[derive(Clone, Copy)]
-struct L0Distance;
-
-impl Distance<(u32, u16)> for L0Distance {
-    fn eval(&self, va: &[(u32, u16)], vb: &[(u32, u16)]) -> f32 {
-        l0_binary_diff(va, vb) as f32
-    }
-}
-
-#[derive(Clone, Copy)]
-struct L2SquaredDistance;
-
-impl Distance<(u32, u16)> for L2SquaredDistance {
-    fn eval(&self, va: &[(u32, u16)], vb: &[(u32, u16)]) -> f32 {
-        l2_squared_diff(va, vb) as f32
-    }
-}
-
-#[derive(Clone, Copy)]
-struct HammingDistance;
-
-impl Distance<(u32, u16)> for HammingDistance {
-    fn eval(&self, va: &[(u32, u16)], vb: &[(u32, u16)]) -> f32 {
-        hamming_diff(va, vb) as f32
-    }
-}
-
-#[derive(Clone, Copy)]
-struct JaccardDistance;
-
-impl Distance<(u32, u16)> for JaccardDistance {
-    fn eval(&self, va: &[(u32, u16)], vb: &[(u32, u16)]) -> f32 {
-        binary_jaccard_distance(va, vb)
-    }
-}
-
 const JACCARD_WEIGHT_SCALE: f32 = 1_000_000.0;
-
-fn hnsw_distance_to_weight(metric: KnnDistanceMetric, distance: f32) -> u64 {
-    match metric {
-        KnnDistanceMetric::Jaccard => (distance * JACCARD_WEIGHT_SCALE).round() as u64,
-        _ => distance as u64,
-    }
-}
 
 fn pair_distance(metric: KnnDistanceMetric, a: &[(u32, u16)], b: &[(u32, u16)]) -> u64 {
     match metric {
@@ -1482,12 +1415,9 @@ fn edge_weight(
     mst_weight_mode: MstWeightMode,
     index_codec: IndexStreamCodec,
     full_row_fallback_ratio: Option<f32>,
-    metric_distance_hint: Option<f32>,
 ) -> u64 {
     match mst_weight_mode {
-        MstWeightMode::Metric => metric_distance_hint
-            .map(|d| hnsw_distance_to_weight(metric, d))
-            .unwrap_or_else(|| pair_distance(metric, a, b)),
+        MstWeightMode::Metric => pair_distance(metric, a, b),
         MstWeightMode::EncodingCost => {
             symmetric_edge_encoding_cost_bytes(a, b, index_codec, full_row_fallback_ratio)
         }
@@ -1496,14 +1426,12 @@ fn edge_weight(
 
 fn build_mst_prim(
     expressions: &[SparseExpression],
-    k: usize,
+    _k: usize,
     metric: KnnDistanceMetric,
     mst_weight_mode: MstWeightMode,
     index_codec: IndexStreamCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
-    hnsw_build: HnswBuildConfig,
-    row_mst_neighbor_mode: RowMstNeighborMode,
     row_mst_window: usize,
 ) -> (usize, Vec<u32>) {
     let n = expressions.len();
@@ -1517,198 +1445,19 @@ fn build_mst_prim(
     let mut graph = UnGraph::<usize, u64>::new_undirected();
     let nodes: Vec<_> = (0..n).map(|i| graph.add_node(i)).collect();
 
-    if matches!(row_mst_neighbor_mode, RowMstNeighborMode::LocalWindow) {
-        let window = row_mst_window.max(1).min(n.saturating_sub(1));
-        for i in 0..n {
-            let upper = (i + window + 1).min(n);
-            for j in (i + 1)..upper {
-                let weight = edge_weight(
-                    metric,
-                    &expressions[i],
-                    &expressions[j],
-                    mst_weight_mode,
-                    index_codec,
-                    full_row_fallback_ratio,
-                    None,
-                );
-                graph.update_edge(nodes[i], nodes[j], weight);
-            }
-        }
-    } else if n >= 64 {
-        let max_nb_connection = hnsw_build.max_nb_connection.max(1);
-        let ef_construction = hnsw_build.ef_construction.max(1);
-        let nb_layers = 16;
-        let ef_search = hnsw_build.ef_search.max(k).max(1);
-        match metric {
-            KnnDistanceMetric::L0 => {
-                let hnsw = Hnsw::<(u32, u16), L0Distance>::new(
-                    max_nb_connection,
-                    n,
-                    nb_layers,
-                    ef_construction,
-                    L0Distance,
-                );
-
-                for (i, expr) in expressions.iter().enumerate() {
-                    hnsw.insert((expr, i));
-                }
-
-                let knn_results: Vec<Vec<Neighbour>> = expressions
-                    .par_iter()
-                    .map(|expr| hnsw.search(expr, k, ef_search))
-                    .collect();
-
-                for (i, neighbors) in knn_results.into_iter().enumerate() {
-                    for neighbor in neighbors {
-                        if neighbor.d_id != i {
-                            let weight = edge_weight(
-                                metric,
-                                &expressions[i],
-                                &expressions[neighbor.d_id],
-                                mst_weight_mode,
-                                index_codec,
-                                full_row_fallback_ratio,
-                                Some(neighbor.distance),
-                            );
-                            graph.update_edge(nodes[i], nodes[neighbor.d_id], weight);
-                        }
-                    }
-                }
-            }
-            KnnDistanceMetric::L2 => {
-                let hnsw = Hnsw::<(u32, u16), L2SquaredDistance>::new(
-                    max_nb_connection,
-                    n,
-                    nb_layers,
-                    ef_construction,
-                    L2SquaredDistance,
-                );
-
-                for (i, expr) in expressions.iter().enumerate() {
-                    hnsw.insert((expr, i));
-                }
-
-                let knn_results: Vec<Vec<Neighbour>> = expressions
-                    .par_iter()
-                    .map(|expr| hnsw.search(expr, k, ef_search))
-                    .collect();
-
-                for (i, neighbors) in knn_results.into_iter().enumerate() {
-                    for neighbor in neighbors {
-                        if neighbor.d_id != i {
-                            let weight = edge_weight(
-                                metric,
-                                &expressions[i],
-                                &expressions[neighbor.d_id],
-                                mst_weight_mode,
-                                index_codec,
-                                full_row_fallback_ratio,
-                                Some(neighbor.distance),
-                            );
-                            graph.update_edge(nodes[i], nodes[neighbor.d_id], weight);
-                        }
-                    }
-                }
-            }
-            KnnDistanceMetric::Hamming => {
-                let hnsw = Hnsw::<(u32, u16), HammingDistance>::new(
-                    max_nb_connection,
-                    n,
-                    nb_layers,
-                    ef_construction,
-                    HammingDistance,
-                );
-
-                for (i, expr) in expressions.iter().enumerate() {
-                    hnsw.insert((expr, i));
-                }
-
-                let knn_results: Vec<Vec<Neighbour>> = expressions
-                    .par_iter()
-                    .map(|expr| hnsw.search(expr, k, ef_search))
-                    .collect();
-
-                for (i, neighbors) in knn_results.into_iter().enumerate() {
-                    for neighbor in neighbors {
-                        if neighbor.d_id != i {
-                            let weight = edge_weight(
-                                metric,
-                                &expressions[i],
-                                &expressions[neighbor.d_id],
-                                mst_weight_mode,
-                                index_codec,
-                                full_row_fallback_ratio,
-                                Some(neighbor.distance),
-                            );
-                            graph.update_edge(nodes[i], nodes[neighbor.d_id], weight);
-                        }
-                    }
-                }
-            }
-            KnnDistanceMetric::Jaccard => {
-                let hnsw = Hnsw::<(u32, u16), JaccardDistance>::new(
-                    max_nb_connection,
-                    n,
-                    nb_layers,
-                    ef_construction,
-                    JaccardDistance,
-                );
-
-                for (i, expr) in expressions.iter().enumerate() {
-                    hnsw.insert((expr, i));
-                }
-
-                let knn_results: Vec<Vec<Neighbour>> = expressions
-                    .par_iter()
-                    .map(|expr| hnsw.search(expr, k, ef_search))
-                    .collect();
-
-                for (i, neighbors) in knn_results.into_iter().enumerate() {
-                    for neighbor in neighbors {
-                        if neighbor.d_id != i {
-                            let weight = edge_weight(
-                                metric,
-                                &expressions[i],
-                                &expressions[neighbor.d_id],
-                                mst_weight_mode,
-                                index_codec,
-                                full_row_fallback_ratio,
-                                Some(neighbor.distance),
-                            );
-                            graph.update_edge(nodes[i], nodes[neighbor.d_id], weight);
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        for i in 0..n {
-            let mut candidates: Vec<(usize, u64)> = Vec::with_capacity(n - 1);
-            for j in 0..n {
-                if i == j {
-                    continue;
-                }
-                candidates.push((
-                    j,
-                    edge_weight(
-                        metric,
-                        &expressions[i],
-                        &expressions[j],
-                        mst_weight_mode,
-                        index_codec,
-                        full_row_fallback_ratio,
-                        None,
-                    ),
-                ));
-            }
-
-            let k_actual = k.min(candidates.len());
-            if k_actual > 0 {
-                candidates.select_nth_unstable_by(k_actual - 1, |a, b| a.1.cmp(&b.1));
-                for &(j, dist) in &candidates[..k_actual] {
-                    graph.update_edge(nodes[i], nodes[j], dist);
-                }
-            }
+    let window = row_mst_window.max(1).min(n.saturating_sub(1));
+    for i in 0..n {
+        let upper = (i + window + 1).min(n);
+        for j in (i + 1)..upper {
+            let weight = edge_weight(
+                metric,
+                &expressions[i],
+                &expressions[j],
+                mst_weight_mode,
+                index_codec,
+                full_row_fallback_ratio,
+            );
+            graph.update_edge(nodes[i], nodes[j], weight);
         }
     }
 
@@ -1721,7 +1470,6 @@ fn build_mst_prim(
                 mst_weight_mode,
                 index_codec,
                 full_row_fallback_ratio,
-                None,
             );
             graph.update_edge(nodes[0], nodes[i], dist);
         }
@@ -2226,8 +1974,6 @@ pub fn encode_subarray_mst_with_metric(
     sorted_index_codec: SortedIndexCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
-    hnsw_build: HnswBuildConfig,
-    row_mst_neighbor_mode: RowMstNeighborMode,
     row_mst_window: usize,
     row_template_adaptive: bool,
     row_template_max: usize,
@@ -2249,8 +1995,6 @@ pub fn encode_subarray_mst_with_metric(
         index_codec,
         full_row_fallback_ratio,
         forest_cut_factor,
-        hnsw_build,
-        row_mst_neighbor_mode,
         row_mst_window,
     );
     encode_subarray_mst_from_parts(
@@ -2609,8 +2353,6 @@ pub fn encode_subarray_mst(
         SortedIndexCodec::EliasFano,
         Some(1.0),
         None,
-        HnswBuildConfig::default(),
-        RowMstNeighborMode::Hnsw,
         8,
         false,
         0,

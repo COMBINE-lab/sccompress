@@ -3,7 +3,6 @@ use clap::{ArgAction, Parser, ValueEnum};
 use csv::ReaderBuilder;
 use hdf5::types::FixedAscii;
 use hdf5::File as Hdf5File;
-use hnsw_rs::prelude::*;
 use ndarray::{Array1, Array2, Axis};
 use parquet::file::reader::{FileReader, SerializedFileReader};
 use parquet::record::RowAccessor;
@@ -684,120 +683,31 @@ fn load_from_h5_no_pos(h5_path: &Path) -> Result<(Array2<f64>, Array2<f64>)> {
     Ok((dense_data, coords))
 }
 
-/// L0 binary distance: counts genes where sparsity pattern differs
-/// (one is zero, the other is non-zero) — same metric used in MST encoding
-#[derive(Clone, Copy)]
-struct DistL0;
-
-impl Distance<f64> for DistL0 {
-    fn eval(&self, a: &[f64], b: &[f64]) -> f32 {
-        a.iter()
-            .zip(b.iter())
-            .filter(|(&ai, &bi)| (ai > 0.0) != (bi > 0.0))
-            .count() as f32
-    }
-}
-
 fn find_neighbors(data: &Array2<f64>, k: usize, metric: Metric) -> Vec<Vec<usize>> {
     let n = data.nrows();
-
-    // HNSW configuration
-    let max_nb_connection = 16;
-    let nb_elements = n;
-    let nb_layers = 16;
-    let ef_construction = 200;
-    let ef_search = 100;
-
-    match metric {
-        Metric::Cosine => {
-            let hnsw = Hnsw::<f64, DistCosine>::new(
-                max_nb_connection,
-                nb_elements,
-                nb_layers,
-                ef_construction,
-                DistCosine,
-            );
-            // Parallel insertion
-            data.axis_iter(Axis(0))
+    (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let row = data.row(i);
+            let anchor = row.as_slice().expect("contiguous row");
+            let distances = compute_distances(anchor, data, metric);
+            let mut candidates: Vec<(usize, f64)> = distances
+                .into_iter()
                 .enumerate()
-                .collect::<Vec<_>>()
-                .par_iter()
-                .for_each(|(i, row)| {
-                    hnsw.insert((row.as_slice().unwrap(), *i));
-                });
-
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let row = data.row(i);
-                    hnsw.search(row.as_slice().unwrap(), k, ef_search)
-                        .into_iter()
-                        .filter(|nb| nb.d_id != i) // Exclude self
-                        .take(k)
-                        .map(|nb| nb.d_id)
-                        .collect()
-                })
+                .filter(|(j, _)| *j != i)
+                .collect();
+            candidates.sort_unstable_by(|a, b| {
+                a.1.partial_cmp(&b.1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.0.cmp(&b.0))
+            });
+            candidates
+                .into_iter()
+                .take(k)
+                .map(|(neighbor, _)| neighbor)
                 .collect()
-        }
-        Metric::L2 => {
-            let hnsw = Hnsw::<f64, DistL2>::new(
-                max_nb_connection,
-                nb_elements,
-                nb_layers,
-                ef_construction,
-                DistL2,
-            );
-            data.axis_iter(Axis(0))
-                .enumerate()
-                .collect::<Vec<_>>()
-                .par_iter()
-                .for_each(|(i, row)| {
-                    hnsw.insert((row.as_slice().unwrap(), *i));
-                });
-
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let row = data.row(i);
-                    hnsw.search(row.as_slice().unwrap(), k, ef_search)
-                        .into_iter()
-                        .filter(|nb| nb.d_id != i)
-                        .take(k)
-                        .map(|nb| nb.d_id)
-                        .collect()
-                })
-                .collect()
-        }
-        Metric::L0 => {
-            let hnsw = Hnsw::<f64, DistL0>::new(
-                max_nb_connection,
-                nb_elements,
-                nb_layers,
-                ef_construction,
-                DistL0,
-            );
-            data.axis_iter(Axis(0))
-                .enumerate()
-                .collect::<Vec<_>>()
-                .par_iter()
-                .for_each(|(i, row)| {
-                    hnsw.insert((row.as_slice().unwrap(), *i));
-                });
-
-            (0..n)
-                .into_par_iter()
-                .map(|i| {
-                    let row = data.row(i);
-                    hnsw.search(row.as_slice().unwrap(), k, ef_search)
-                        .into_iter()
-                        .filter(|nb| nb.d_id != i)
-                        .take(k)
-                        .map(|nb| nb.d_id)
-                        .collect()
-                })
-                .collect()
-        }
-    }
+        })
+        .collect()
 }
 
 fn build_neighbors_for_mode(

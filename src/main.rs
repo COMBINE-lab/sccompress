@@ -15,8 +15,7 @@ use matrix_io::{load_10x_no_positions, load_10x_with_positions, InputPosType, Pl
 use mimalloc::MiMalloc;
 use mst_codec::{
     encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
-    EncodedColumnBlock, EncodedDiffsMST, HnswBuildConfig, KnnDistanceMetric, MstWeightMode, Point,
-    RowMstNeighborMode,
+    EncodedColumnBlock, EncodedDiffsMST, KnnDistanceMetric, MstWeightMode, Point,
 };
 use ndarray::Array2;
 use rayon::prelude::*;
@@ -141,46 +140,6 @@ impl PayloadCompressionArg {
 enum MstWeightArg {
     Metric,
     EncodingCost,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum HnswProfileArg {
-    Default,
-    Fast,
-    Faster,
-}
-
-impl HnswProfileArg {
-    fn to_config(self) -> HnswBuildConfig {
-        match self {
-            HnswProfileArg::Default => HnswBuildConfig::default(),
-            HnswProfileArg::Fast => HnswBuildConfig {
-                max_nb_connection: 12,
-                ef_construction: 64,
-                ef_search: 24,
-            },
-            HnswProfileArg::Faster => HnswBuildConfig {
-                max_nb_connection: 8,
-                ef_construction: 40,
-                ef_search: 16,
-            },
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum RowMstNeighborArg {
-    Hnsw,
-    LocalWindow,
-}
-
-impl From<RowMstNeighborArg> for RowMstNeighborMode {
-    fn from(value: RowMstNeighborArg) -> Self {
-        match value {
-            RowMstNeighborArg::Hnsw => RowMstNeighborMode::Hnsw,
-            RowMstNeighborArg::LocalWindow => RowMstNeighborMode::LocalWindow,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -1549,8 +1508,6 @@ fn run_clustered_compression(
     sorted_index_codec: SortedIndexCodec,
     full_row_fallback_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
-    hnsw_build: HnswBuildConfig,
-    row_mst_neighbor_mode: RowMstNeighborMode,
     row_mst_window: usize,
     cluster_encoding: ClusterEncodingArg,
     column_template_count: usize,
@@ -1796,8 +1753,6 @@ fn run_clustered_compression(
                     sorted_index_codec,
                     full_row_fallback_ratio,
                     forest_cut_factor,
-                    hnsw_build,
-                    row_mst_neighbor_mode,
                     row_mst_window,
                     adaptive,
                     row_template_max,
@@ -2440,13 +2395,7 @@ struct BuildCommand {
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
-    /// HNSW construction/search preset for MST KNN graph build.
-    #[arg(long = "hnsw-fast-profile", value_enum, default_value_t = HnswProfileArg::Default)]
-    hnsw_fast_profile: HnswProfileArg,
-    /// Candidate graph used before row-MST: HNSW kNN, or local row-order window.
-    #[arg(long = "row-mst-neighbor-mode", value_enum, default_value_t = RowMstNeighborArg::LocalWindow)]
-    row_mst_neighbor_mode: RowMstNeighborArg,
-    /// Number of nearby rows on each side to connect when `--row-mst-neighbor-mode=local-window`.
+    /// Number of nearby rows on each side to connect for row-MST candidate edges.
     #[arg(long = "row-mst-window", default_value_t = 8)]
     row_mst_window: usize,
     /// How to cluster cells (`kmeans` or `svd-joint`).
@@ -2732,8 +2681,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(args.full_row_fallback_ratio.max(0.0))
             };
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
-            let hnsw_build = args.hnsw_fast_profile.to_config();
-            let row_mst_neighbor_mode = RowMstNeighborMode::from(args.row_mst_neighbor_mode);
             let row_mst_window = args.row_mst_window.max(1);
             let cluster_encoding = args.cluster_encoding;
             let spatial_graph = SpatialGraphParams {
@@ -2750,7 +2697,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} hnsw_profile={:?} hnsw_M={} hnsw_ef_construction={} hnsw_query_ef={} row_mst_neighbor_mode={:?} row_mst_window={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} row_mst_window={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2761,11 +2708,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.cell_cluster_method,
                 args.knn_metric,
                 args.mst_weight,
-                args.hnsw_fast_profile,
-                hnsw_build.max_nb_connection,
-                hnsw_build.ef_construction,
-                hnsw_build.ef_search,
-                args.row_mst_neighbor_mode,
                 row_mst_window,
                 args.joint_svd_fast,
                 args.index_codec,
@@ -2826,8 +2768,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         sorted_index_codec,
                         fallback_ratio,
                         forest_cut_factor,
-                        hnsw_build,
-                        row_mst_neighbor_mode,
                         row_mst_window,
                         cluster_encoding,
                         args.column_template_count,
@@ -3139,8 +3079,6 @@ mod tests {
             SortedIndexCodec::EliasFano,
             Some(1.0),
             None,
-            HnswBuildConfig::default(),
-            RowMstNeighborMode::Hnsw,
             8,
             ClusterEncodingArg::Hybrid,
             0,
@@ -3190,8 +3128,6 @@ mod tests {
             SortedIndexCodec::EliasFano,
             Some(1.0),
             None,
-            HnswBuildConfig::default(),
-            RowMstNeighborMode::Hnsw,
             8,
             ClusterEncodingArg::Hybrid,
             0,
