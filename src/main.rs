@@ -17,7 +17,6 @@ use mst_codec::{
     encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
     EncodedColumnBlock, EncodedDiffsMST, KnnDistanceMetric, MstWeightMode, Point,
 };
-use ndarray::Array2;
 use rayon::prelude::*;
 use sorted_indices::SortedIndexCodec;
 use sprs::CsMat;
@@ -36,16 +35,9 @@ use tracing_subscriber::EnvFilter;
 use zstd::stream::{Decoder as ZstdDecoder, Encoder as ZstdEncoder};
 
 use cluster::{
-    build_cell_features, cluster_cells, group_points_by_cluster, joint_svd_seriation,
-    projection_weight, reorder_rows_within_clusters, split_oversized_clusters,
-    CellClusterMethodArg, SpatialGraphParams, TensorGridDisc, TensorGridParams,
+    group_points_by_cluster, joint_svd_seriation, projection_weight, split_oversized_clusters,
 };
-use linfa::prelude::{Fit, Predict};
-use linfa::DatasetBase;
-use linfa_clustering::KMeans;
 use nalgebra::DMatrix;
-use rand_xoshiro::rand_core::SeedableRng;
-use rand_xoshiro::Xoshiro256Plus;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
@@ -164,11 +156,6 @@ enum GeneReorderMethod {
     /// normalized) sparse cell×gene matrix, then sort genes by their first
     /// right singular vector coordinate (`v₁`), breaking ties with `v₂`.
     Svd,
-    /// K-means on SVD right-singular-vector embeddings: cluster genes into groups with similar
-    /// cell-support patterns, then sort within each cluster by `v₁`.  Genes sharing a cluster
-    /// are placed contiguously, so posting-list deltas and MST edit chains benefit from block
-    /// structure that pure seriation may miss when the manifold is not 1-D.
-    Kmeans,
 }
 
 impl From<MstWeightArg> for MstWeightMode {
@@ -213,14 +200,16 @@ fn normalize_quantizer_counts(selected: usize, sweep: &[usize]) -> Vec<usize> {
     counts
 }
 
-fn l2_normalize_rows_inplace(a: &mut Array2<f64>) {
-    for mut row in a.rows_mut() {
-        let norm_sq: f64 = row.iter().map(|v| v * v).sum();
-        let nrm = norm_sq.sqrt();
-        if nrm > 1e-15 {
-            row.mapv_inplace(|x| x / nrm);
+fn invert_permutation(old_to_new: &[u32]) -> Vec<u32> {
+    let n = old_to_new.len();
+    let mut new_to_old = vec![0u32; n];
+    for (old_idx, &new_idx_u32) in old_to_new.iter().enumerate() {
+        let new_idx = new_idx_u32 as usize;
+        if new_idx < n {
+            new_to_old[new_idx] = old_idx as u32;
         }
     }
+    new_to_old
 }
 
 fn compute_gene_permutation_from_row_stream(
@@ -296,10 +285,9 @@ fn compute_gene_permutation_from_row_stream(
         old_to_new[old_idx] = new_idx as u32;
     }
 
-    Ok((
-        new_to_old.into_iter().map(|g| g as u32).collect(),
-        old_to_new,
-    ))
+    // new->old is intentionally not materialized here; recover from old->new when needed.
+    let _ = new_to_old;
+    Ok((Vec::new(), old_to_new))
 }
 
 /// SVD-based gene reordering: build a sparse cell×gene matrix from the cluster
@@ -441,10 +429,8 @@ fn compute_gene_permutation_svd(
     });
 
     let mut old_to_new = vec![0u32; ncols];
-    let mut new_to_old = Vec::with_capacity(ncols);
     for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
         old_to_new[old_idx] = new_idx as u32;
-        new_to_old.push(old_idx as u32);
     }
 
     info!(
@@ -454,209 +440,8 @@ fn compute_gene_permutation_svd(
         ncols
     );
 
-    Ok((new_to_old, old_to_new))
-}
-
-/// K-means on right-singular-vector gene embeddings, then sort within each cluster by v₁.
-///
-/// Builds the same TF-IDF-normalized sparse matrix and SVD as [`compute_gene_permutation_svd`],
-/// but instead of a global 1-D sort by `(v₁,v₂)`, it:
-///   1. Embeds each gene in `ℝ^{n_comp}` via the right singular vectors.
-///   2. Runs k-means on genes to find groups with similar cell-support patterns.
-///   3. Sorts clusters by their centroid's v₁, and genes within each cluster by v₁.
-///
-/// This captures block structure (gene modules) that a pure 1-D seriation can miss.
-fn compute_gene_permutation_kmeans(
-    points: &[Point],
-    data: &CsMat<u16>,
-    row_stream_point_indices: &[usize],
-    cluster_seed: Option<u64>,
-) -> anyhow::Result<(Vec<u32>, Vec<u32>)> {
-    let ncols = data.cols();
-    if ncols == 0 {
-        return Ok((Vec::new(), Vec::new()));
-    }
-
-    let n_cells = row_stream_point_indices.len();
-    if n_cells == 0 {
-        let identity: Vec<u32> = (0..ncols as u32).collect();
-        return Ok((identity.clone(), identity));
-    }
-
-    let mut col_nnz = vec![0u64; ncols];
-    let mut triplets: Vec<(usize, usize)> = Vec::new();
-
-    for (stream_pos, &point_idx) in row_stream_point_indices.iter().enumerate() {
-        let point = &points[point_idx];
-        if let Some(row) = data.outer_view(point.row_index) {
-            for (gene_idx, &value) in row.iter() {
-                if value != 0 {
-                    col_nnz[gene_idx] += 1;
-                    triplets.push((stream_pos, gene_idx));
-                }
-            }
-        }
-    }
-
-    let active_genes: Vec<usize> = (0..ncols).filter(|&g| col_nnz[g] > 0).collect();
-    if active_genes.len() <= 2 {
-        let identity: Vec<u32> = (0..ncols as u32).collect();
-        return Ok((identity.clone(), identity));
-    }
-
-    let max_svd_rows = 4000usize;
-    let max_svd_cols = 2000usize;
-
-    let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
-        let step = n_cells as f64 / max_svd_rows as f64;
-        (0..max_svd_rows)
-            .map(|i| (i as f64 * step) as usize)
-            .collect()
-    } else {
-        (0..n_cells).collect()
-    };
-
-    let active_cols: Vec<usize> = if active_genes.len() > max_svd_cols {
-        let mut by_freq: Vec<(usize, u64)> =
-            active_genes.iter().map(|&g| (g, col_nnz[g])).collect();
-        by_freq.sort_unstable_by(|a, b| b.1.cmp(&a.1));
-        by_freq.truncate(max_svd_cols);
-        by_freq.sort_unstable_by_key(|&(g, _)| g);
-        by_freq.iter().map(|&(g, _)| g).collect()
-    } else {
-        active_genes.clone()
-    };
-
-    let mut col_local: HashMap<usize, usize> = HashMap::with_capacity(active_cols.len());
-    for (local, &global) in active_cols.iter().enumerate() {
-        col_local.insert(global, local);
-    }
-
-    let nr = sampled_rows.len();
-    let nc = active_cols.len();
-
-    let mut dense = vec![0.0f64; nr * nc];
-    let sampled_set: HashMap<usize, usize> = sampled_rows
-        .iter()
-        .enumerate()
-        .map(|(i, &r)| (r, i))
-        .collect();
-
-    for &(stream_pos, gene_idx) in &triplets {
-        if let Some(&local_row) = sampled_set.get(&stream_pos) {
-            if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] =
-                    1.0 / (col_nnz[gene_idx] as f64).sqrt().max(1e-12);
-            }
-        }
-    }
-
-    let mat = DMatrix::from_row_slice(nr, nc, &dense);
-    let svd = mat.svd(false, true);
-    let v_t = match svd.v_t {
-        Some(vt) => vt,
-        None => {
-            info!("K-means gene reorder: V^T not available, falling back to SVD seriation");
-            return compute_gene_permutation_svd(points, data, row_stream_point_indices);
-        }
-    };
-
-    let n_sv = v_t.nrows();
-    let n_comp = n_sv.min(8).max(1);
-
-    // Build gene embedding matrix (active genes only)
-    let mut gene_embed = Array2::<f64>::zeros((nc, n_comp));
-    for (local_col, _) in active_cols.iter().enumerate() {
-        for j in 0..n_comp {
-            gene_embed[(local_col, j)] = v_t[(j, local_col)];
-        }
-    }
-    l2_normalize_rows_inplace(&mut gene_embed);
-
-    // K-means on gene embeddings — use sqrt(nc) clusters, capped
-    let gene_k = (nc as f64).sqrt().ceil() as usize;
-    let gene_k = gene_k.max(2).min(nc);
-    let dataset = DatasetBase::from(gene_embed.clone());
-    let model = if let Some(seed) = cluster_seed {
-        KMeans::params_with_rng(
-            gene_k,
-            Xoshiro256Plus::seed_from_u64(seed.wrapping_add(9001)),
-        )
-        .max_n_iterations(30)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("gene k-means failed: {}", e))?
-    } else {
-        KMeans::params(gene_k)
-            .max_n_iterations(30)
-            .fit(&dataset)
-            .map_err(|e| anyhow::anyhow!("gene k-means failed: {}", e))?
-    };
-    let gene_labels: Vec<usize> = model.predict(&dataset).to_vec();
-
-    // For each gene cluster, compute centroid v₁ for inter-cluster ordering
-    let mut cluster_v1_sum = vec![0.0f64; gene_k];
-    let mut cluster_count = vec![0usize; gene_k];
-    for (local_col, &label) in gene_labels.iter().enumerate() {
-        cluster_v1_sum[label] += v_t[(0, local_col)];
-        cluster_count[label] += 1;
-    }
-    let mut cluster_order: Vec<usize> = (0..gene_k).collect();
-    cluster_order.sort_unstable_by(|&a, &b| {
-        let mean_a = if cluster_count[a] > 0 {
-            cluster_v1_sum[a] / cluster_count[a] as f64
-        } else {
-            f64::INFINITY
-        };
-        let mean_b = if cluster_count[b] > 0 {
-            cluster_v1_sum[b] / cluster_count[b] as f64
-        } else {
-            f64::INFINITY
-        };
-        mean_a.total_cmp(&mean_b)
-    });
-    let mut cluster_rank = vec![0usize; gene_k];
-    for (rank, &cid) in cluster_order.iter().enumerate() {
-        cluster_rank[cid] = rank;
-    }
-
-    // Build final ordering: (cluster_rank, v₁ within cluster, global_gene_idx)
-    let mut scores: Vec<(usize, usize, f64, f64)> = Vec::with_capacity(ncols);
-    for (local_col, &global_gene) in active_cols.iter().enumerate() {
-        let label = gene_labels[local_col];
-        let rank = cluster_rank[label];
-        let s1 = v_t[(0, local_col)];
-        let s2 = if n_sv >= 2 { v_t[(1, local_col)] } else { 0.0 };
-        scores.push((global_gene, rank, s1, s2));
-    }
-    for g in 0..ncols {
-        if col_nnz[g] == 0 || !col_local.contains_key(&g) {
-            scores.push((g, usize::MAX, f64::INFINITY, g as f64));
-        }
-    }
-
-    scores.sort_unstable_by(|a, b| {
-        a.1.cmp(&b.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| a.3.total_cmp(&b.3))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut old_to_new = vec![0u32; ncols];
-    let mut new_to_old = Vec::with_capacity(ncols);
-    for (new_idx, &(old_idx, _, _, _)) in scores.iter().enumerate() {
-        old_to_new[old_idx] = new_idx as u32;
-        new_to_old.push(old_idx as u32);
-    }
-
-    info!(
-        "K-means gene reorder: {} genes -> {} gene clusters ({} active in SVD, {} total)",
-        active_cols.len(),
-        gene_k,
-        nc,
-        ncols
-    );
-
-    Ok((new_to_old, old_to_new))
+    // new->old is intentionally not materialized here; recover from old->new when needed.
+    Ok((Vec::new(), old_to_new))
 }
 
 fn downsample_values(values: &[u16], max_values: usize) -> Vec<u16> {
@@ -680,7 +465,7 @@ fn nearest_center(value: u16, centers: &[u16]) -> u16 {
     best
 }
 
-fn train_quantizer_with_kmeans(values: &[u16], bins: usize) -> anyhow::Result<Vec<u16>> {
+fn train_quantizer_from_quantiles(values: &[u16], bins: usize) -> anyhow::Result<Vec<u16>> {
     if values.is_empty() {
         return Ok(vec![0]);
     }
@@ -695,23 +480,17 @@ fn train_quantizer_with_kmeans(values: &[u16], bins: usize) -> anyhow::Result<Ve
     }
 
     let sampled = downsample_values(values, 200_000);
-    let mut samples = Array2::<f64>::zeros((sampled.len(), 1));
-    for (i, &value) in sampled.iter().enumerate() {
-        samples[(i, 0)] = value as f64;
+    let mut sampled_sorted = sampled;
+    sampled_sorted.sort_unstable();
+    let mut centers = Vec::with_capacity(capped_bins);
+    for bin in 0..capped_bins {
+        let pos = if capped_bins == 1 {
+            sampled_sorted.len() / 2
+        } else {
+            bin * (sampled_sorted.len().saturating_sub(1)) / (capped_bins - 1)
+        };
+        centers.push(sampled_sorted[pos]);
     }
-
-    let dataset = DatasetBase::from(samples);
-    let model = KMeans::params(capped_bins)
-        .max_n_iterations(40)
-        .fit(&dataset)
-        .map_err(|e| anyhow::anyhow!("k-means quantizer training failed: {}", e))?;
-
-    let mut centers: Vec<u16> = model
-        .centroids()
-        .column(0)
-        .iter()
-        .map(|&c| c.round().clamp(0.0, u16::MAX as f64) as u16)
-        .collect();
 
     centers.sort_unstable();
     centers.dedup();
@@ -762,7 +541,7 @@ fn quantize_matrix_by_cluster(
 
     let mut quantizers = Vec::with_capacity(num_clusters);
     for cluster_values in &values_by_cluster {
-        quantizers.push(train_quantizer_with_kmeans(cluster_values, bins)?);
+        quantizers.push(train_quantizer_from_quantiles(cluster_values, bins)?);
     }
 
     let mut quantized_values = values.to_vec();
@@ -1515,9 +1294,6 @@ fn run_clustered_compression(
     column_template_max: usize,
     row_template_adaptive: bool,
     row_template_max: usize,
-    cell_cluster_method: CellClusterMethodArg,
-    spatial_graph: SpatialGraphParams,
-    tensor_grid: TensorGridParams,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
     joint_svd_fast: bool,
@@ -1530,53 +1306,32 @@ fn run_clustered_compression(
     let cluster_prep_start = Instant::now();
 
     let requested_clusters = cell_blocks_requested.max(1).min(points.len());
-    let features = build_cell_features(points, data, 24)?;
 
-    // Joint path: one operation produces both cell assignments and gene ordering.
-    let joint_result = if cell_cluster_method == CellClusterMethodArg::SvdJoint {
-        match joint_svd_seriation(
-            points,
-            data,
-            requested_clusters,
-            cluster_seed,
-            joint_svd_fast,
-        ) {
-            Ok(result) => Some(result),
-            Err(e) => {
-                warn!(
-                    "Joint SVD seriation failed ({}), falling back to separate cell+gene",
-                    e
-                );
-                None
-            }
+    // Joint SVD is the only cell-clustering path. If it fails, keep the run
+    // deterministic by assigning cells round-robin and computing gene order separately.
+    let joint_result = match joint_svd_seriation(
+        points,
+        data,
+        requested_clusters,
+        cluster_seed,
+        joint_svd_fast,
+    ) {
+        Ok(result) => Some(result),
+        Err(e) => {
+            warn!(
+                "Joint SVD seriation failed ({}), falling back to round-robin cell labels",
+                e
+            );
+            None
         }
-    } else {
-        None
     };
 
     let assignments = if let Some((ref cell_labels, _, _)) = joint_result {
         cell_labels.clone()
     } else {
-        match cluster_cells(
-            cell_cluster_method,
-            &features,
-            requested_clusters,
-            points,
-            spatial_graph,
-            tensor_grid,
-            cluster_seed,
-        ) {
-            Ok(a) => a,
-            Err(err) => {
-                warn!(
-                    "Cell clustering failed ({}). Falling back to round-robin assignment.",
-                    err
-                );
-                (0..points.len())
-                    .map(|idx| idx % requested_clusters)
-                    .collect::<Vec<_>>()
-            }
-        }
+        (0..points.len())
+            .map(|idx| idx % requested_clusters)
+            .collect::<Vec<_>>()
     };
 
     let initial_quantizers_used = assignments
@@ -1588,17 +1343,7 @@ fn run_clustered_compression(
 
     let initial_clusters = group_points_by_cluster(&assignments, initial_quantizers_used);
     let initial_max = initial_clusters.iter().map(|c| c.len()).max().unwrap_or(0);
-    let clusters = split_oversized_clusters(
-        points,
-        initial_clusters,
-        &features,
-        max_cluster_size,
-        cell_cluster_method,
-        spatial_graph,
-        tensor_grid,
-        cluster_seed,
-    )?;
-    let clusters = reorder_rows_within_clusters(&clusters, &features);
+    let clusters = split_oversized_clusters(initial_clusters, max_cluster_size)?;
     let final_max = clusters.iter().map(|c| c.len()).max().unwrap_or(0);
 
     info!(
@@ -1651,9 +1396,14 @@ fn run_clustered_compression(
         joint_result
     {
         info!("Using gene ordering from joint SVD seriation");
-        (new_to_old.clone(), old_to_new.clone())
+        let gene_order = if new_to_old.is_empty() {
+            invert_permutation(old_to_new)
+        } else {
+            new_to_old.clone()
+        };
+        (gene_order, old_to_new.clone())
     } else {
-        match gene_reorder_method {
+        let (new_to_old, old_to_new) = match gene_reorder_method {
             GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
                 points,
                 &quantized_data,
@@ -1662,13 +1412,13 @@ fn run_clustered_compression(
             GeneReorderMethod::Svd => {
                 compute_gene_permutation_svd(points, &quantized_data, &row_stream_point_indices)?
             }
-            GeneReorderMethod::Kmeans => compute_gene_permutation_kmeans(
-                points,
-                &quantized_data,
-                &row_stream_point_indices,
-                cluster_seed,
-            )?,
-        }
+        };
+        let gene_order = if new_to_old.is_empty() {
+            invert_permutation(&old_to_new)
+        } else {
+            new_to_old
+        };
+        (gene_order, old_to_new)
     };
     let timing_gene_order_ms = gene_order_start.elapsed().as_millis() as u64;
 
@@ -2398,48 +2148,14 @@ struct BuildCommand {
     /// Number of nearby rows on each side to connect for row-MST candidate edges.
     #[arg(long = "row-mst-window", default_value_t = 8)]
     row_mst_window: usize,
-    /// How to cluster cells (`kmeans` or `svd-joint`).
-    #[arg(long = "cell-cluster-method", value_enum, default_value_t = CellClusterMethodArg::Kmeans)]
-    cell_cluster_method: CellClusterMethodArg,
     /// Optional RNG seed for cell clustering/SVD stages.
     #[arg(long = "set-seed", visible_alias = "cluster-seed")]
     set_seed: Option<u64>,
-    /// If set, run all cell-cluster methods and append one stats row per method.
-    #[arg(
-        long = "cell-cluster-method-sweep-all",
-        visible_alias = "cluster-all",
-        default_value_t = false
-    )]
-    cell_cluster_method_sweep_all: bool,
-    /// For `spatial-graph`: number of spatial \((x,y)\) nearest neighbors per cell.
-    #[arg(long = "cell-cluster-spatial-knn", default_value_t = 12)]
-    cell_cluster_spatial_knn: usize,
-    /// For `spatial-graph`: number of expression (dot-product) nearest neighbors per cell.
-    #[arg(long = "cell-cluster-expr-knn", default_value_t = 12)]
-    cell_cluster_expr_knn: usize,
-    /// For `spatial-graph`: weight in \([0,1]\) on spatial kNN affinity (`1 - blend` on expression kNN).
-    #[arg(long = "cell-cluster-spatial-blend", default_value_t = 0.45)]
-    cell_cluster_spatial_blend: f64,
-    /// For `tensor-grid`: number of bins along x (rect) or hex resolution hint.
-    #[arg(long = "cell-cluster-grid-nx", default_value_t = 8)]
-    cell_cluster_grid_nx: usize,
-    /// For `tensor-grid`: number of bins along y (rect) or hex resolution hint.
-    #[arg(long = "cell-cluster-grid-ny", default_value_t = 8)]
-    cell_cluster_grid_ny: usize,
-    /// For `tensor-grid`: scale of tile coordinates / one-hot vs bucket features.
-    #[arg(long = "cell-cluster-grid-tile-weight", default_value_t = 0.55)]
-    cell_cluster_grid_tile_weight: f64,
-    /// For `tensor-grid`: `rect` = axis-aligned grid; `hex` = pointy-top hex bins.
-    #[arg(long = "cell-cluster-grid-disc", value_enum, default_value_t = TensorGridDisc::Rect)]
-    cell_cluster_grid_disc: TensorGridDisc,
-    /// For `tensor-grid`: use one-hot tile dims when number of tiles ≤ this (else 2D tile centers).
-    #[arg(long = "cell-cluster-grid-onehot-max", default_value_t = 64)]
-    cell_cluster_grid_onehot_max: usize,
     /// How to compute the gene (column) reordering: `projection` (hash-projection seriation, fast)
     /// or `svd` (truncated SVD on the sparse matrix, uses right singular vectors).
     #[arg(long = "gene-reorder-method", value_enum, default_value_t = GeneReorderMethod::Projection)]
     gene_reorder_method: GeneReorderMethod,
-    /// For `cell-cluster-method=svd-joint`: use randomized joint SVD for cell clusters and gene order.
+    /// Use randomized joint SVD for cell clusters and gene order.
     #[arg(long = "joint-svd-fast", default_value_t = false)]
     joint_svd_fast: bool,
     /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
@@ -2483,13 +2199,6 @@ fn infer_stats_label(input: &Path) -> String {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| input.display().to_string())
-}
-
-fn cell_cluster_method_name(method: CellClusterMethodArg) -> String {
-    method
-        .to_possible_value()
-        .map(|v| v.get_name().to_string())
-        .unwrap_or_else(|| format!("{:?}", method).to_lowercase())
 }
 
 fn output_path_with_label_suffix(base: &Path, label: &str) -> PathBuf {
@@ -2683,21 +2392,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
             let row_mst_window = args.row_mst_window.max(1);
             let cluster_encoding = args.cluster_encoding;
-            let spatial_graph = SpatialGraphParams {
-                spatial_knn: args.cell_cluster_spatial_knn.max(1),
-                expr_knn: args.cell_cluster_expr_knn.max(1),
-                blend: args.cell_cluster_spatial_blend.clamp(0.0, 1.0),
-            };
-            let tensor_grid = TensorGridParams {
-                nx: args.cell_cluster_grid_nx.max(1),
-                ny: args.cell_cluster_grid_ny.max(1),
-                tile_weight: args.cell_cluster_grid_tile_weight.max(0.0),
-                disc: args.cell_cluster_grid_disc,
-                onehot_max_tiles: args.cell_cluster_grid_onehot_max.max(1),
-            };
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method={:?} knn_metric={:?} mst_weight={:?} row_mst_window={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2705,7 +2402,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 quantizer_bins,
                 sweep_counts,
                 args.max_cluster_size,
-                args.cell_cluster_method,
                 args.knn_metric,
                 args.mst_weight,
                 row_mst_window,
@@ -2722,30 +2418,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.row_template_max
             );
 
-            // Each sweep config: (cell_method, gene_method, label)
-            let mut sweep_configs: Vec<(CellClusterMethodArg, GeneReorderMethod, String)> =
-                Vec::new();
+            let sweep_configs: Vec<(GeneReorderMethod, String)> =
+                vec![(args.gene_reorder_method, "svd-joint".to_string())];
 
-            if args.cell_cluster_method_sweep_all {
-                for &cm in CellClusterMethodArg::value_variants() {
-                    let label = cell_cluster_method_name(cm);
-                    sweep_configs.push((cm, args.gene_reorder_method, label));
-                }
-            } else {
-                let label = cell_cluster_method_name(args.cell_cluster_method);
-                sweep_configs.push((args.cell_cluster_method, args.gene_reorder_method, label));
-            }
-
-            for (cell_cluster_method, gene_reorder_method, config_label) in &sweep_configs {
-                let is_joint = *cell_cluster_method == CellClusterMethodArg::SvdJoint;
-                let gene_method_label = if is_joint {
-                    config_label.clone()
-                } else {
-                    gene_reorder_method
-                        .to_possible_value()
-                        .map(|v| v.get_name().to_string())
-                        .unwrap_or_else(|| format!("{:?}", gene_reorder_method).to_lowercase())
-                };
+            for (gene_reorder_method, config_label) in &sweep_configs {
+                let gene_method_label = config_label.clone();
                 info!(
                     "Running build: cell={}, gene={}",
                     config_label, gene_method_label
@@ -2775,9 +2452,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.column_template_max,
                         args.row_template_adaptive,
                         args.row_template_max,
-                        *cell_cluster_method,
-                        spatial_graph,
-                        tensor_grid,
                         args.set_seed,
                         *gene_reorder_method,
                         args.joint_svd_fast,
@@ -3086,9 +2760,6 @@ mod tests {
             32,
             false,
             16,
-            CellClusterMethodArg::Kmeans,
-            SpatialGraphParams::default(),
-            TensorGridParams::default(),
             None,
             GeneReorderMethod::Projection,
             false,
@@ -3135,9 +2806,6 @@ mod tests {
             32,
             false,
             16,
-            CellClusterMethodArg::SvdJoint,
-            SpatialGraphParams::default(),
-            TensorGridParams::default(),
             Some(42),
             GeneReorderMethod::Projection,
             false,
