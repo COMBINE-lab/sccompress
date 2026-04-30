@@ -388,13 +388,14 @@ pub(crate) fn joint_svd_seriation(
             .then_with(|| a.0.cmp(&b.0))
     });
     let mut gene_old_to_new = vec![0u32; n_genes];
+    let mut gene_new_to_old = Vec::with_capacity(n_genes);
     for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
         gene_old_to_new[old_idx] = new_idx as u32;
+        gene_new_to_old.push(old_idx as u32);
     }
     info!(
         "Joint SVD seriation: {} cells -> {} clusters ({} raw-count SVD, rank={}, lexicographic seriation + equal cuts), {} genes reordered ({} active in SVD)",
         n_cells, k, svd_mode, n_comp, n_genes, nc
     );
-    // new->old is intentionally not materialized here; recover from old->new when needed.
-    Ok((cell_labels, Vec::new(), gene_old_to_new))
+    Ok((cell_labels, gene_new_to_old, gene_old_to_new))
 }

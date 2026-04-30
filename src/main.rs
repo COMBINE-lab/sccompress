@@ -200,18 +200,6 @@ fn normalize_quantizer_counts(selected: usize, sweep: &[usize]) -> Vec<usize> {
     counts
 }
 
-fn invert_permutation(old_to_new: &[u32]) -> Vec<u32> {
-    let n = old_to_new.len();
-    let mut new_to_old = vec![0u32; n];
-    for (old_idx, &new_idx_u32) in old_to_new.iter().enumerate() {
-        let new_idx = new_idx_u32 as usize;
-        if new_idx < n {
-            new_to_old[new_idx] = old_idx as u32;
-        }
-    }
-    new_to_old
-}
-
 fn compute_gene_permutation_from_row_stream(
     points: &[Point],
     data: &CsMat<u16>,
@@ -285,9 +273,10 @@ fn compute_gene_permutation_from_row_stream(
         old_to_new[old_idx] = new_idx as u32;
     }
 
-    // new->old is intentionally not materialized here; recover from old->new when needed.
-    let _ = new_to_old;
-    Ok((Vec::new(), old_to_new))
+    Ok((
+        new_to_old.into_iter().map(|g| g as u32).collect(),
+        old_to_new,
+    ))
 }
 
 /// SVD-based gene reordering: build a sparse cell×gene matrix from the cluster
@@ -429,8 +418,10 @@ fn compute_gene_permutation_svd(
     });
 
     let mut old_to_new = vec![0u32; ncols];
+    let mut new_to_old = Vec::with_capacity(ncols);
     for (new_idx, &(old_idx, _, _)) in scores.iter().enumerate() {
         old_to_new[old_idx] = new_idx as u32;
+        new_to_old.push(old_idx as u32);
     }
 
     info!(
@@ -440,8 +431,7 @@ fn compute_gene_permutation_svd(
         ncols
     );
 
-    // new->old is intentionally not materialized here; recover from old->new when needed.
-    Ok((Vec::new(), old_to_new))
+    Ok((new_to_old, old_to_new))
 }
 
 fn downsample_values(values: &[u16], max_values: usize) -> Vec<u16> {
@@ -1396,14 +1386,9 @@ fn run_clustered_compression(
         joint_result
     {
         info!("Using gene ordering from joint SVD seriation");
-        let gene_order = if new_to_old.is_empty() {
-            invert_permutation(old_to_new)
-        } else {
-            new_to_old.clone()
-        };
-        (gene_order, old_to_new.clone())
+        (new_to_old.clone(), old_to_new.clone())
     } else {
-        let (new_to_old, old_to_new) = match gene_reorder_method {
+        match gene_reorder_method {
             GeneReorderMethod::Projection => compute_gene_permutation_from_row_stream(
                 points,
                 &quantized_data,
@@ -1412,13 +1397,7 @@ fn run_clustered_compression(
             GeneReorderMethod::Svd => {
                 compute_gene_permutation_svd(points, &quantized_data, &row_stream_point_indices)?
             }
-        };
-        let gene_order = if new_to_old.is_empty() {
-            invert_permutation(&old_to_new)
-        } else {
-            new_to_old
-        };
-        (gene_order, old_to_new)
+        }
     };
     let timing_gene_order_ms = gene_order_start.elapsed().as_millis() as u64;
 
