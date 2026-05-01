@@ -203,7 +203,8 @@ pub fn load_10x_with_positions(
 }
 
 /// Load 10x H5 matrix without any external positions.
-/// Returns CSR expression matrix and dummy coordinates (0,0) for each retained cell.
+/// Returns CSR expression matrix in gene x cell orientation and dummy
+/// coordinates (0,0) for each row (gene).
 pub fn load_10x_no_positions(
     h5_path: &Path,
     max_cells: Option<usize>,
@@ -233,10 +234,11 @@ pub fn load_10x_no_positions(
     let indptr = indptr_all[..=num_cells].to_vec();
     let indices = indices_all[..nnz_limit].to_vec();
     let values = data_all[..nnz_limit].to_vec();
-    let csr = CsMat::new((num_cells, num_features), indptr, indices, values);
+    let csc_native = CsMat::new_csc((num_features, num_cells), indptr, indices, values);
+    let csr = csc_native.to_csr();
 
-    let mut points = Vec::with_capacity(num_cells);
-    for row_idx in 0..num_cells {
+    let mut points = Vec::with_capacity(num_features);
+    for row_idx in 0..num_features {
         points.push(Point::new(0.0, 0.0, row_idx));
     }
 
