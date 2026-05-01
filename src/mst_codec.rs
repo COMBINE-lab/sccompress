@@ -965,6 +965,130 @@ fn build_gene_reference_parents(
     parents
 }
 
+fn build_gene_reference_parents_local_window(
+    posting_rows: &[Vec<u32>],
+    raw_costs: &[u64],
+    index_codec: IndexStreamCodec,
+    window: usize,
+) -> Vec<Option<usize>> {
+    let mut parents = vec![None; posting_rows.len()];
+    let non_empty: Vec<usize> = posting_rows
+        .iter()
+        .enumerate()
+        .filter_map(|(gene_idx, rows)| (!rows.is_empty()).then_some(gene_idx))
+        .collect();
+    if non_empty.len() <= 1 {
+        return parents;
+    }
+
+    let mut graph = UnGraph::<usize, u64>::new_undirected();
+    let mut node_for_gene = vec![None; posting_rows.len()];
+    for &gene_idx in &non_empty {
+        let node = graph.add_node(gene_idx);
+        node_for_gene[gene_idx] = Some(node);
+    }
+
+    let mut added = HashSet::<(usize, usize)>::new();
+    let mut add_edge = |a_gene: usize, b_gene: usize, graph: &mut UnGraph<usize, u64>| {
+        if a_gene == b_gene {
+            return;
+        }
+        let (u_gene, v_gene) = if a_gene < b_gene {
+            (a_gene, b_gene)
+        } else {
+            (b_gene, a_gene)
+        };
+        if !added.insert((u_gene, v_gene)) {
+            return;
+        }
+        let ab = support_ref_cost_bytes(
+            u_gene,
+            v_gene,
+            &posting_rows[u_gene],
+            &posting_rows[v_gene],
+            index_codec,
+        );
+        let ba = support_ref_cost_bytes(
+            v_gene,
+            u_gene,
+            &posting_rows[v_gene],
+            &posting_rows[u_gene],
+            index_codec,
+        );
+        let weight = ab.min(ba);
+        let Some(u_node) = node_for_gene[u_gene] else {
+            return;
+        };
+        let Some(v_node) = node_for_gene[v_gene] else {
+            return;
+        };
+        graph.update_edge(u_node, v_node, weight);
+    };
+
+    let w = window.max(1).min(non_empty.len().saturating_sub(1));
+    for i in 0..non_empty.len() {
+        let upper = (i + w + 1).min(non_empty.len());
+        for j in (i + 1)..upper {
+            add_edge(non_empty[i], non_empty[j], &mut graph);
+        }
+    }
+
+    if connected_components(&graph) > 1 {
+        let anchor = non_empty[0];
+        for &gene_idx in non_empty.iter().skip(1) {
+            add_edge(anchor, gene_idx, &mut graph);
+        }
+    }
+
+    let mst_graph = UnGraph::<usize, u64>::from_elements(min_spanning_tree(&graph));
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); posting_rows.len()];
+    for edge in mst_graph.edge_references() {
+        let u = mst_graph[edge.source()];
+        let v = mst_graph[edge.target()];
+        adjacency[u].push(v);
+        adjacency[v].push(u);
+    }
+
+    let mut visited = vec![false; posting_rows.len()];
+    for &start in &non_empty {
+        if visited[start] {
+            continue;
+        }
+        let mut stack = vec![start];
+        let mut component = Vec::new();
+        visited[start] = true;
+        while let Some(node) = stack.pop() {
+            component.push(node);
+            for &nbr in &adjacency[node] {
+                if !visited[nbr] {
+                    visited[nbr] = true;
+                    stack.push(nbr);
+                }
+            }
+        }
+
+        let root = component
+            .iter()
+            .copied()
+            .min_by_key(|&gene_idx| raw_costs[gene_idx])
+            .unwrap_or(start);
+        let mut orient_stack = vec![root];
+        let mut oriented_seen = HashSet::<usize>::new();
+        oriented_seen.insert(root);
+        parents[root] = None;
+        while let Some(node) = orient_stack.pop() {
+            for &nbr in &adjacency[node] {
+                if oriented_seen.insert(nbr) {
+                    parents[nbr] = Some(node);
+                    orient_stack.push(nbr);
+                }
+            }
+        }
+    }
+
+    parents
+}
+
 fn quantile_pick_positions(n: usize, limit: usize) -> Vec<usize> {
     if n == 0 || limit == 0 {
         return Vec::new();
@@ -1612,6 +1736,7 @@ pub fn encode_subarray_column(
     template_count: usize,
     template_adaptive: bool,
     template_max: usize,
+    gene_ref_local_window: bool,
 ) -> Option<(EncodedColumnBlock, Vec<u32>)> {
     if points.is_empty() {
         return None;
@@ -1670,7 +1795,16 @@ pub fn encode_subarray_column(
         .iter()
         .map(|rows| encoded_gene_only_cost_bytes(rows, index_codec))
         .collect();
-    let ref_parents = build_gene_reference_parents(&posting_rows, &raw_support_costs, index_codec);
+    let ref_parents = if gene_ref_local_window {
+        build_gene_reference_parents_local_window(
+            &posting_rows,
+            &raw_support_costs,
+            index_codec,
+            12,
+        )
+    } else {
+        build_gene_reference_parents(&posting_rows, &raw_support_costs, index_codec)
+    };
 
     let requested_template_count = if template_adaptive {
         template_max.max(template_count)

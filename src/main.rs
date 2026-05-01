@@ -1282,6 +1282,7 @@ fn run_clustered_compression(
     column_template_count: usize,
     column_template_adaptive: bool,
     column_template_max: usize,
+    gene_ref_local_window: bool,
     row_template_adaptive: bool,
     row_template_max: usize,
     cluster_seed: Option<u64>,
@@ -1519,6 +1520,7 @@ fn run_clustered_compression(
                     column_template_count,
                     adaptive,
                     column_template_max,
+                    gene_ref_local_window,
                 ) {
                     let (col_block, order) = col_block;
                     let bytes = col_block.total_bytes();
@@ -2149,6 +2151,10 @@ struct BuildCommand {
     /// Maximum number of column templates to consider in adaptive mode.
     #[arg(long = "column-template-max", default_value_t = 32)]
     column_template_max: usize,
+    /// Build the gene-reference parent pointers for column encoding using a
+    /// row-MST-style local-window MST over gene index order (no projection ordering).
+    #[arg(long = "gene-ref-local-window", default_value_t = false)]
+    gene_ref_local_window: bool,
     /// Enable adaptive row-template mode for row-MST payloads.
     #[arg(long = "row-template-adaptive", default_value_t = false)]
     row_template_adaptive: bool,
@@ -2429,6 +2435,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.column_template_count,
                         args.column_template_adaptive,
                         args.column_template_max,
+                        args.gene_ref_local_window,
                         args.row_template_adaptive,
                         args.row_template_max,
                         args.set_seed,
@@ -2738,6 +2745,7 @@ mod tests {
             false,
             32,
             false,
+            false,
             16,
             None,
             GeneReorderMethod::Projection,
@@ -2783,6 +2791,7 @@ mod tests {
             0,
             false,
             32,
+            false,
             false,
             16,
             Some(42),
