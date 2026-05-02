@@ -9,6 +9,7 @@ use petgraph::visit::EdgeRef;
 use rayon::prelude::*;
 use sprs::CsMat;
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug)]
 pub struct Point {
@@ -649,6 +650,66 @@ impl EncodedClusterBlock {
 
 type SparseExpression = Vec<(u32, u16)>;
 
+fn traversal_order_to_parent_offsets_allow_backrefs(
+    traversal_order: &[u32],
+    parent: &[u32],
+) -> Vec<u32> {
+    let n = traversal_order.len();
+    let mut pos_in_order = vec![0u32; n];
+    for (pos, &orig) in traversal_order.iter().enumerate() {
+        pos_in_order[orig as usize] = pos as u32;
+    }
+    let mut parent_offset = Vec::with_capacity(n);
+    for (traversal_pos, &orig_cell) in traversal_order.iter().enumerate() {
+        let parent_orig = parent[orig_cell as usize] as usize;
+        if parent_orig == orig_cell as usize || pos_in_order[parent_orig] >= traversal_pos as u32 {
+            // Mode FULL/TEMPLATE does not consult parent_offset. Store 0 for backward/future refs.
+            parent_offset.push(0);
+        } else {
+            parent_offset.push((traversal_pos as u32) - pos_in_order[parent_orig]);
+        }
+    }
+    parent_offset
+}
+
+/// Parameters for building column gene-reference parents from transposed gene vectors.
+#[derive(Clone, Copy, Debug)]
+pub struct GeneKruskalMstParams {
+    pub knn_metric: KnnDistanceMetric,
+    pub mst_weight_mode: MstWeightMode,
+    pub index_codec: IndexStreamCodec,
+    pub full_row_fallback_ratio: Option<f32>,
+    pub forest_cut_factor: Option<f32>,
+    pub row_mst_window: usize,
+}
+
+static ROW_MST_PROJECTION_FULL_BACKREFS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RowMstOrderStats {
+    pub projection_full_backrefs: u64,
+}
+
+pub fn reset_row_mst_order_stats() {
+    ROW_MST_PROJECTION_FULL_BACKREFS.store(0, Ordering::Relaxed);
+}
+
+pub fn row_mst_order_stats() -> RowMstOrderStats {
+    RowMstOrderStats {
+        projection_full_backrefs: ROW_MST_PROJECTION_FULL_BACKREFS.load(Ordering::Relaxed),
+    }
+}
+
+fn row_mst_traversal_and_offsets(
+    parent: &[u32],
+    expressions: &[SparseExpression],
+) -> (Vec<u32>, Vec<u32>) {
+    ROW_MST_PROJECTION_FULL_BACKREFS.fetch_add(1, Ordering::Relaxed);
+    let order = optimize_row_order_for_column(expressions);
+    let po = traversal_order_to_parent_offsets_allow_backrefs(&order, parent);
+    (order, po)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KnnDistanceMetric {
     L0,
@@ -748,6 +809,49 @@ fn zigzag_decode_i64(v: u32) -> i64 {
     ((v >> 1) as i64) ^ (-((v & 1) as i64))
 }
 
+/// One sparse vector per local gene: entries are `(local_cell_row, value)` — transpose of local
+/// cell rows over genes. Feeds the same [`build_mst_kruskal`] used for row-MST, with `window` /
+/// metrics interpreted over **gene indices** 0..num_genes-1 (parallel to cell indices 0..n-1).
+fn sparse_vectors_per_local_gene(
+    cell_rows: &[SparseExpression],
+    num_genes: usize,
+) -> Vec<SparseExpression> {
+    let mut per_gene: Vec<Vec<(u32, u16)>> = vec![Vec::new(); num_genes];
+    for (row_idx, expr) in cell_rows.iter().enumerate() {
+        let r = row_idx as u32;
+        for &(g, v) in expr {
+            let gi = g as usize;
+            if gi < num_genes {
+                per_gene[gi].push((r, v));
+            }
+        }
+    }
+    for v in &mut per_gene {
+        v.sort_unstable_by_key(|(row, _)| *row);
+    }
+    per_gene
+}
+
+fn kruskal_gene_parent_vec_to_ref_parents(
+    parent: &[u32],
+    gene_nonempty: &[bool],
+) -> Vec<Option<usize>> {
+    debug_assert_eq!(parent.len(), gene_nonempty.len());
+    let mut out = vec![None; parent.len()];
+    for i in 0..parent.len() {
+        if !gene_nonempty[i] {
+            continue;
+        }
+        let p = parent[i] as usize;
+        if p == i {
+            out[i] = None;
+        } else {
+            out[i] = Some(p);
+        }
+    }
+    out
+}
+
 fn optimize_row_order_for_column(expressions: &[SparseExpression]) -> Vec<u32> {
     let mut scored: Vec<(u32, f64, f64, usize)> = Vec::with_capacity(expressions.len());
     for (row_idx, expr) in expressions.iter().enumerate() {
@@ -818,275 +922,6 @@ fn support_ref_cost_bytes(
         + encoded_gene_only_cost_bytes(&removes, index_codec)
         + encoded_gene_only_cost_bytes(&adds, index_codec)
         + 2
-}
-
-fn build_gene_reference_parents(
-    posting_rows: &[Vec<u32>],
-    raw_costs: &[u64],
-    index_codec: IndexStreamCodec,
-) -> Vec<Option<usize>> {
-    let mut parents = vec![None; posting_rows.len()];
-    let non_empty: Vec<usize> = posting_rows
-        .iter()
-        .enumerate()
-        .filter_map(|(gene_idx, rows)| (!rows.is_empty()).then_some(gene_idx))
-        .collect();
-    if non_empty.len() <= 1 {
-        return parents;
-    }
-
-    let mut graph = UnGraph::<usize, u64>::new_undirected();
-    let mut node_for_gene = vec![None; posting_rows.len()];
-    for &gene_idx in &non_empty {
-        let node = graph.add_node(gene_idx);
-        node_for_gene[gene_idx] = Some(node);
-    }
-
-    let mut projected: Vec<(usize, f64, f64, usize)> = non_empty
-        .iter()
-        .map(|&gene_idx| {
-            let mut s1 = 0.0f64;
-            let mut s2 = 0.0f64;
-            for &row in &posting_rows[gene_idx] {
-                s1 += support_projection_weight(row, 0xD1B5_4A32_9C73_8E19);
-                s2 += support_projection_weight(row, 0x5F19_77CB_8A31_2D43);
-            }
-            (gene_idx, s1, s2, posting_rows[gene_idx].len())
-        })
-        .collect();
-    projected.sort_unstable_by(|a, b| {
-        a.1.total_cmp(&b.1)
-            .then_with(|| a.2.total_cmp(&b.2))
-            .then_with(|| a.3.cmp(&b.3))
-            .then_with(|| a.0.cmp(&b.0))
-    });
-
-    let mut added = HashSet::<(usize, usize)>::new();
-    let mut add_edge = |a_gene: usize, b_gene: usize, graph: &mut UnGraph<usize, u64>| {
-        if a_gene == b_gene {
-            return;
-        }
-        let (u_gene, v_gene) = if a_gene < b_gene {
-            (a_gene, b_gene)
-        } else {
-            (b_gene, a_gene)
-        };
-        if !added.insert((u_gene, v_gene)) {
-            return;
-        }
-        let ab = support_ref_cost_bytes(
-            u_gene,
-            v_gene,
-            &posting_rows[u_gene],
-            &posting_rows[v_gene],
-            index_codec,
-        );
-        let ba = support_ref_cost_bytes(
-            v_gene,
-            u_gene,
-            &posting_rows[v_gene],
-            &posting_rows[u_gene],
-            index_codec,
-        );
-        let weight = ab.min(ba);
-        let Some(u_node) = node_for_gene[u_gene] else {
-            return;
-        };
-        let Some(v_node) = node_for_gene[v_gene] else {
-            return;
-        };
-        graph.update_edge(u_node, v_node, weight);
-    };
-
-    const GENE_MST_WINDOW: usize = 12;
-    for i in 0..projected.len() {
-        let upper = (i + GENE_MST_WINDOW + 1).min(projected.len());
-        for j in (i + 1)..upper {
-            add_edge(projected[i].0, projected[j].0, &mut graph);
-        }
-    }
-    for pair in non_empty.windows(2) {
-        add_edge(pair[0], pair[1], &mut graph);
-    }
-
-    if connected_components(&graph) > 1 {
-        let anchor = non_empty[0];
-        for &gene_idx in non_empty.iter().skip(1) {
-            add_edge(anchor, gene_idx, &mut graph);
-        }
-    }
-
-    let mst_graph = UnGraph::<usize, u64>::from_elements(min_spanning_tree(&graph));
-    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); posting_rows.len()];
-    for edge in mst_graph.edge_references() {
-        let u = mst_graph[edge.source()];
-        let v = mst_graph[edge.target()];
-        adjacency[u].push(v);
-        adjacency[v].push(u);
-    }
-
-    let mut visited = vec![false; posting_rows.len()];
-    for &start in &non_empty {
-        if visited[start] {
-            continue;
-        }
-        let mut stack = vec![start];
-        let mut component = Vec::new();
-        visited[start] = true;
-        while let Some(node) = stack.pop() {
-            component.push(node);
-            for &nbr in &adjacency[node] {
-                if !visited[nbr] {
-                    visited[nbr] = true;
-                    stack.push(nbr);
-                }
-            }
-        }
-
-        let root = component
-            .iter()
-            .copied()
-            .min_by_key(|&gene_idx| raw_costs[gene_idx])
-            .unwrap_or(start);
-        let mut orient_stack = vec![root];
-        let mut oriented_seen = HashSet::<usize>::new();
-        oriented_seen.insert(root);
-        parents[root] = None;
-        while let Some(node) = orient_stack.pop() {
-            for &nbr in &adjacency[node] {
-                if oriented_seen.insert(nbr) {
-                    parents[nbr] = Some(node);
-                    orient_stack.push(nbr);
-                }
-            }
-        }
-    }
-
-    parents
-}
-
-fn build_gene_reference_parents_local_window(
-    posting_rows: &[Vec<u32>],
-    raw_costs: &[u64],
-    index_codec: IndexStreamCodec,
-    window: usize,
-) -> Vec<Option<usize>> {
-    let mut parents = vec![None; posting_rows.len()];
-    let non_empty: Vec<usize> = posting_rows
-        .iter()
-        .enumerate()
-        .filter_map(|(gene_idx, rows)| (!rows.is_empty()).then_some(gene_idx))
-        .collect();
-    if non_empty.len() <= 1 {
-        return parents;
-    }
-
-    let mut graph = UnGraph::<usize, u64>::new_undirected();
-    let mut node_for_gene = vec![None; posting_rows.len()];
-    for &gene_idx in &non_empty {
-        let node = graph.add_node(gene_idx);
-        node_for_gene[gene_idx] = Some(node);
-    }
-
-    let mut added = HashSet::<(usize, usize)>::new();
-    let mut add_edge = |a_gene: usize, b_gene: usize, graph: &mut UnGraph<usize, u64>| {
-        if a_gene == b_gene {
-            return;
-        }
-        let (u_gene, v_gene) = if a_gene < b_gene {
-            (a_gene, b_gene)
-        } else {
-            (b_gene, a_gene)
-        };
-        if !added.insert((u_gene, v_gene)) {
-            return;
-        }
-        let ab = support_ref_cost_bytes(
-            u_gene,
-            v_gene,
-            &posting_rows[u_gene],
-            &posting_rows[v_gene],
-            index_codec,
-        );
-        let ba = support_ref_cost_bytes(
-            v_gene,
-            u_gene,
-            &posting_rows[v_gene],
-            &posting_rows[u_gene],
-            index_codec,
-        );
-        let weight = ab.min(ba);
-        let Some(u_node) = node_for_gene[u_gene] else {
-            return;
-        };
-        let Some(v_node) = node_for_gene[v_gene] else {
-            return;
-        };
-        graph.update_edge(u_node, v_node, weight);
-    };
-
-    let w = window.max(1).min(non_empty.len().saturating_sub(1));
-    for i in 0..non_empty.len() {
-        let upper = (i + w + 1).min(non_empty.len());
-        for j in (i + 1)..upper {
-            add_edge(non_empty[i], non_empty[j], &mut graph);
-        }
-    }
-
-    if connected_components(&graph) > 1 {
-        let anchor = non_empty[0];
-        for &gene_idx in non_empty.iter().skip(1) {
-            add_edge(anchor, gene_idx, &mut graph);
-        }
-    }
-
-    let mst_graph = UnGraph::<usize, u64>::from_elements(min_spanning_tree(&graph));
-    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); posting_rows.len()];
-    for edge in mst_graph.edge_references() {
-        let u = mst_graph[edge.source()];
-        let v = mst_graph[edge.target()];
-        adjacency[u].push(v);
-        adjacency[v].push(u);
-    }
-
-    let mut visited = vec![false; posting_rows.len()];
-    for &start in &non_empty {
-        if visited[start] {
-            continue;
-        }
-        let mut stack = vec![start];
-        let mut component = Vec::new();
-        visited[start] = true;
-        while let Some(node) = stack.pop() {
-            component.push(node);
-            for &nbr in &adjacency[node] {
-                if !visited[nbr] {
-                    visited[nbr] = true;
-                    stack.push(nbr);
-                }
-            }
-        }
-
-        let root = component
-            .iter()
-            .copied()
-            .min_by_key(|&gene_idx| raw_costs[gene_idx])
-            .unwrap_or(start);
-        let mut orient_stack = vec![root];
-        let mut oriented_seen = HashSet::<usize>::new();
-        oriented_seen.insert(root);
-        parents[root] = None;
-        while let Some(node) = orient_stack.pop() {
-            for &nbr in &adjacency[node] {
-                if oriented_seen.insert(nbr) {
-                    parents[nbr] = Some(node);
-                    orient_stack.push(nbr);
-                }
-            }
-        }
-    }
-
-    parents
 }
 
 fn quantile_pick_positions(n: usize, limit: usize) -> Vec<usize> {
@@ -1548,7 +1383,7 @@ fn edge_weight(
     }
 }
 
-fn build_mst_prim(
+fn build_mst_kruskal(
     expressions: &[SparseExpression],
     _k: usize,
     metric: KnnDistanceMetric,
@@ -1656,48 +1491,6 @@ fn build_mst_prim(
     (primary_root, parent)
 }
 
-fn compute_dfs_order(_root: usize, parent: &[u32], n: usize) -> (Vec<u32>, Vec<u32>) {
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); n];
-    let mut roots = Vec::new();
-    for i in 0..n {
-        if parent[i] as usize == i {
-            roots.push(i);
-        } else {
-            children[parent[i] as usize].push(i);
-        }
-    }
-    roots.sort_unstable();
-    if roots.is_empty() {
-        roots.push(0);
-    }
-
-    let mut dfs_order = Vec::with_capacity(n);
-    let mut pos_in_dfs = vec![0u32; n];
-
-    for &root in &roots {
-        let mut stack = vec![root];
-        while let Some(node) = stack.pop() {
-            pos_in_dfs[node] = dfs_order.len() as u32;
-            dfs_order.push(node as u32);
-            for &child in children[node].iter().rev() {
-                stack.push(child);
-            }
-        }
-    }
-
-    let mut parent_offset = Vec::with_capacity(n);
-    for (dfs_pos, &orig_cell) in dfs_order.iter().enumerate() {
-        if parent[orig_cell as usize] as usize == orig_cell as usize {
-            parent_offset.push(0);
-        } else {
-            let parent_orig = parent[orig_cell as usize] as usize;
-            parent_offset.push((dfs_pos as u32) - pos_in_dfs[parent_orig]);
-        }
-    }
-
-    (dfs_order, parent_offset)
-}
-
 fn append_gene_stream(genes: &[u32], first: &mut Vec<u32>, gaps: &mut Vec<u32>) {
     if let Some((&first_gene, rest)) = genes.split_first() {
         first.push(first_gene);
@@ -1727,6 +1520,8 @@ fn append_entry_stream(
     }
 }
 
+/// Column postings use projection-seriated row IDs, and column references are built by running the
+/// shared windowed Kruskal MST builder on transposed gene vectors.
 pub fn encode_subarray_column(
     points: &[Point],
     data: &CsMat<u16>,
@@ -1736,7 +1531,7 @@ pub fn encode_subarray_column(
     template_count: usize,
     template_adaptive: bool,
     template_max: usize,
-    gene_ref_local_window: bool,
+    gene_kruskal_mst: GeneKruskalMstParams,
 ) -> Option<(EncodedColumnBlock, Vec<u32>)> {
     if points.is_empty() {
         return None;
@@ -1761,8 +1556,6 @@ pub fn encode_subarray_column(
         }
     }
 
-    let local_to_global =
-        EncodedSortedIndices::from_sorted_u32(&local_to_global_raw, sorted_index_codec);
     let mut posting_modes_raw = Vec::<u32>::with_capacity(postings.len());
     let mut posting_counts = Vec::<u32>::with_capacity(postings.len());
     let mut raw_row_firsts = Vec::<u32>::new();
@@ -1795,16 +1588,25 @@ pub fn encode_subarray_column(
         .iter()
         .map(|rows| encoded_gene_only_cost_bytes(rows, index_codec))
         .collect();
-    let ref_parents = if gene_ref_local_window {
-        build_gene_reference_parents_local_window(
-            &posting_rows,
-            &raw_support_costs,
-            index_codec,
-            12,
-        )
-    } else {
-        build_gene_reference_parents(&posting_rows, &raw_support_costs, index_codec)
-    };
+    let p = gene_kruskal_mst;
+    let num_genes = local_to_global_raw.len();
+    let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
+    let gene_nonempty: Vec<bool> = gene_sparse.iter().map(|e| !e.is_empty()).collect();
+    let kg = 8usize.min(num_genes.saturating_sub(1)).max(1);
+    let (_, parent_g) = build_mst_kruskal(
+        &gene_sparse,
+        kg,
+        p.knn_metric,
+        p.mst_weight_mode,
+        p.index_codec,
+        p.full_row_fallback_ratio,
+        p.forest_cut_factor,
+        p.row_mst_window,
+    );
+    let ref_parents = kruskal_gene_parent_vec_to_ref_parents(&parent_g, &gene_nonempty);
+
+    let local_to_global =
+        EncodedSortedIndices::from_sorted_u32(&local_to_global_raw, sorted_index_codec);
 
     let requested_template_count = if template_adaptive {
         template_max.max(template_count)
@@ -2121,7 +1923,7 @@ pub fn encode_subarray_mst_with_metric(
         .collect();
     let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
     let k = 8usize.min(points.len().saturating_sub(1)).max(1);
-    let (root, parent) = build_mst_prim(
+    let (root, parent) = build_mst_kruskal(
         &expressions,
         k,
         knn_metric,
@@ -2157,9 +1959,8 @@ fn encode_subarray_mst_from_parts(
     row_template_adaptive: bool,
     row_template_max: usize,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
-    let local_to_global =
-        EncodedSortedIndices::from_sorted_u32(local_to_global_raw, sorted_index_codec);
-    let (dfs_order, parent_offset_raw) = compute_dfs_order(root, parent, expressions.len());
+    let local_to_global = EncodedSortedIndices::from_u32(local_to_global_raw, sorted_index_codec);
+    let (traversal_order, parent_offset_raw) = row_mst_traversal_and_offsets(parent, expressions);
     let root_expr = &expressions[root];
     let root_genes: Vec<u32> = root_expr.iter().map(|(g, _)| *g).collect();
     let root_vals_raw: Vec<u32> = root_expr.iter().map(|(_, v)| *v as u32).collect();
@@ -2194,7 +1995,15 @@ fn encode_subarray_mst_from_parts(
     let mut child_add_vals_raw = Vec::<u32>::new();
     let mut child_update_vals_raw = Vec::<u32>::new();
 
-    let child_origs: Vec<usize> = dfs_order.iter().skip(1).map(|&v| v as usize).collect();
+    let child_origs: Vec<usize> = traversal_order
+        .iter()
+        .skip(1)
+        .map(|&v| v as usize)
+        .collect();
+    let mut pos_in_traversal = vec![0usize; expressions.len()];
+    for (pos, &orig) in traversal_order.iter().enumerate() {
+        pos_in_traversal[orig as usize] = pos;
+    }
     let selected_row_templates = if row_template_adaptive && row_template_max > 0 {
         let template_candidates = build_row_template_candidates(&expressions, row_template_max);
         if template_candidates.is_empty() {
@@ -2203,26 +2012,32 @@ fn encode_subarray_mst_from_parts(
             let mut baseline_costs = Vec::with_capacity(child_origs.len());
             for &orig_cell in &child_origs {
                 let parent_orig = parent[orig_cell] as usize;
+                let parent_ref_available = parent_orig != orig_cell
+                    && pos_in_traversal[parent_orig] < pos_in_traversal[orig_cell];
                 let child_expr = &expressions[orig_cell];
                 let parent_expr = &expressions[parent_orig];
-                let (parent_delta_cost, parent_ops) =
-                    row_delta_cost_and_ops(parent_expr, child_expr, index_codec);
-                let edit_count =
-                    parent_ops.removes.len() + parent_ops.adds.len() + parent_ops.updates.len();
-                let use_full_row = match full_row_fallback_ratio {
-                    Some(ratio) => {
-                        if child_expr.is_empty() {
-                            edit_count > 0
-                        } else {
-                            (edit_count as f32) > ratio * (child_expr.len() as f32)
+                let baseline = if parent_ref_available {
+                    let (parent_delta_cost, parent_ops) =
+                        row_delta_cost_and_ops(parent_expr, child_expr, index_codec);
+                    let edit_count =
+                        parent_ops.removes.len() + parent_ops.adds.len() + parent_ops.updates.len();
+                    let use_full_row = match full_row_fallback_ratio {
+                        Some(ratio) => {
+                            if child_expr.is_empty() {
+                                edit_count > 0
+                            } else {
+                                (edit_count as f32) > ratio * (child_expr.len() as f32)
+                            }
                         }
+                        None => false,
+                    };
+                    if use_full_row {
+                        full_row_cost_bytes(child_expr, index_codec)
+                    } else {
+                        parent_delta_cost
                     }
-                    None => false,
-                };
-                let baseline = if use_full_row {
-                    full_row_cost_bytes(child_expr, index_codec)
                 } else {
-                    parent_delta_cost
+                    full_row_cost_bytes(child_expr, index_codec)
                 };
                 baseline_costs.push(baseline);
             }
@@ -2288,13 +2103,14 @@ fn encode_subarray_mst_from_parts(
 
     for &orig_cell in &child_origs {
         let parent_orig = parent[orig_cell] as usize;
+        let parent_ref_available =
+            parent_orig != orig_cell && pos_in_traversal[parent_orig] < pos_in_traversal[orig_cell];
         let child_expr = &expressions[orig_cell];
         let parent_expr = &expressions[parent_orig];
         let (parent_delta_cost, parent_ops) =
             row_delta_cost_and_ops(parent_expr, child_expr, index_codec);
         let edit_count =
             parent_ops.removes.len() + parent_ops.adds.len() + parent_ops.updates.len();
-
         let use_full_row = match full_row_fallback_ratio {
             Some(ratio) => {
                 if child_expr.is_empty() {
@@ -2306,17 +2122,17 @@ fn encode_subarray_mst_from_parts(
             None => false,
         };
 
-        let mut best_mode = if use_full_row {
-            ROW_MODE_FULL
-        } else {
+        let mut best_mode = if parent_ref_available && !use_full_row {
             ROW_MODE_PARENT
+        } else {
+            ROW_MODE_FULL
         };
         let mut best_template_id: Option<usize> = None;
         let mut best_ops = parent_ops;
-        let mut best_cost = if use_full_row {
-            full_row_cost_bytes(child_expr, index_codec)
-        } else {
+        let mut best_cost = if parent_ref_available && !use_full_row {
             parent_delta_cost
+        } else {
+            full_row_cost_bytes(child_expr, index_codec)
         };
 
         for (template_idx, template_expr) in selected_row_templates.iter().enumerate() {
@@ -2468,7 +2284,7 @@ fn encode_subarray_mst_from_parts(
             child_add_vals,
             child_update_vals,
         },
-        dfs_order,
+        traversal_order,
     ))
 }
 
@@ -2890,7 +2706,14 @@ mod tests {
             Point::new(4.0, 0.0, 4),
             Point::new(5.0, 0.0, 5),
         ];
-
+        let gene_cfg = GeneKruskalMstParams {
+            knn_metric: KnnDistanceMetric::L0,
+            mst_weight_mode: MstWeightMode::Metric,
+            index_codec: IndexStreamCodec::Arithmetic,
+            full_row_fallback_ratio: Some(1.0),
+            forest_cut_factor: None,
+            row_mst_window: 8,
+        };
         let (encoded, local_order) = encode_subarray_column(
             &points,
             &csr,
@@ -2900,6 +2723,7 @@ mod tests {
             3,
             false,
             32,
+            gene_cfg,
         )
         .expect("column encoding should succeed");
         let decoded_rows = encoded.decode_rows();
@@ -2934,5 +2758,107 @@ mod tests {
         let sparse = compute_sparse_expression(&point, &csr, Some(&block_map));
 
         assert_eq!(sparse, vec![(0, 5), (1, 11)]);
+    }
+
+    /// Row-MST and gene-side references both use [`build_mst_kruskal`], with row-MST
+    /// emitted in projection-full-backrefs order and column refs built on transposed genes.
+    #[test]
+    fn compare_row_vs_column_mst_kruskal_parallel_traversals() {
+        let mut tri = TriMatI::<u16, usize>::new((6, 8));
+        tri.add_triplet(0, 0, 2);
+        tri.add_triplet(0, 2, 1);
+        tri.add_triplet(1, 0, 3);
+        tri.add_triplet(1, 2, 1);
+        tri.add_triplet(1, 4, 1);
+        tri.add_triplet(2, 1, 2);
+        tri.add_triplet(2, 3, 1);
+        tri.add_triplet(3, 1, 2);
+        tri.add_triplet(3, 3, 1);
+        tri.add_triplet(3, 5, 1);
+        tri.add_triplet(4, 0, 1);
+        tri.add_triplet(4, 2, 1);
+        tri.add_triplet(4, 4, 1);
+        tri.add_triplet(5, 1, 1);
+        tri.add_triplet(5, 3, 1);
+        tri.add_triplet(5, 5, 1);
+        let csr = tri.to_csr::<usize>();
+
+        let points = vec![
+            Point::new(0.0, 0.0, 0),
+            Point::new(1.0, 0.0, 1),
+            Point::new(2.0, 0.0, 2),
+            Point::new(3.0, 0.0, 3),
+            Point::new(4.0, 0.0, 4),
+            Point::new(5.0, 0.0, 5),
+        ];
+
+        let expressions_global: Vec<SparseExpression> = points
+            .iter()
+            .map(|p| compute_sparse_expression(p, &csr, None))
+            .collect();
+        let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
+        let num_genes = local_to_global_raw.len();
+        let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
+        let k_gene = 8usize.min(num_genes.saturating_sub(1)).max(1);
+        let _gene_kruskal = build_mst_kruskal(
+            &gene_sparse,
+            k_gene,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            IndexStreamCodec::Arithmetic,
+            Some(1.0),
+            None,
+            8,
+        );
+        let gene_cfg = GeneKruskalMstParams {
+            knn_metric: KnnDistanceMetric::L0,
+            mst_weight_mode: MstWeightMode::Metric,
+            index_codec: IndexStreamCodec::Arithmetic,
+            full_row_fallback_ratio: Some(1.0),
+            forest_cut_factor: None,
+            row_mst_window: 8,
+        };
+        let col_kruskal_gene_mst = encode_subarray_column(
+            &points,
+            &csr,
+            None,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::Delta,
+            3,
+            false,
+            32,
+            gene_cfg,
+        )
+        .expect("column Kruskal gene-MST ref parents");
+
+        let row_stream = encode_subarray_mst_with_metric(
+            &points,
+            &csr,
+            KnnDistanceMetric::L0,
+            MstWeightMode::Metric,
+            None,
+            IndexStreamCodec::Arithmetic,
+            SortedIndexCodec::Delta,
+            Some(1.0),
+            None,
+            8,
+            false,
+            32,
+        )
+        .expect("row-MST projection-full-backrefs stream");
+
+        eprintln!(
+            "--- MST construction: row cells & gene transpose both use build_mst_kruskal (L0, metric, same window cap) ---"
+        );
+        eprintln!("gene MST: n={}", num_genes);
+        eprintln!(
+            "column total_bytes: kruskal_gene_mst_like_row_mst={}",
+            col_kruskal_gene_mst.0.total_bytes()
+        );
+        eprintln!(
+            "row-MST total_bytes: projection_full_backrefs={}",
+            row_stream.0.total_bytes()
+        );
+        assert_eq!(col_kruskal_gene_mst.0.decode_rows().len(), points.len());
     }
 }

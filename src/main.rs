@@ -14,8 +14,9 @@ use index_stream::IndexStreamCodec;
 use matrix_io::{load_10x_no_positions, load_10x_with_positions, InputPosType, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
-    encode_subarray_column, encode_subarray_mst_with_metric, DatalessPoint, EncodedClusterBlock,
-    EncodedColumnBlock, EncodedDiffsMST, KnnDistanceMetric, MstWeightMode, Point,
+    encode_subarray_column, encode_subarray_mst_with_metric, reset_row_mst_order_stats,
+    row_mst_order_stats, DatalessPoint, EncodedClusterBlock, EncodedColumnBlock, EncodedDiffsMST,
+    GeneKruskalMstParams, KnnDistanceMetric, MstWeightMode, Point,
 };
 use rayon::prelude::*;
 use sorted_indices::SortedIndexCodec;
@@ -132,13 +133,6 @@ impl PayloadCompressionArg {
 enum MstWeightArg {
     Metric,
     EncodingCost,
-}
-
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ClusterEncodingArg {
-    Row,
-    Column,
-    Hybrid,
 }
 
 /// How to compute the gene (column) permutation that maps original gene indices
@@ -1275,14 +1269,12 @@ fn run_clustered_compression(
     mst_weight_mode: MstWeightMode,
     index_codec: IndexStreamCodec,
     sorted_index_codec: SortedIndexCodec,
-    full_row_fallback_ratio: Option<f32>,
+    row_parent_ref_cost_ratio: Option<f32>,
     forest_cut_factor: Option<f32>,
     row_mst_window: usize,
-    cluster_encoding: ClusterEncodingArg,
     column_template_count: usize,
     column_template_adaptive: bool,
     column_template_max: usize,
-    gene_ref_local_window: bool,
     row_template_adaptive: bool,
     row_template_max: usize,
     cluster_seed: Option<u64>,
@@ -1419,17 +1411,6 @@ fn run_clustered_compression(
         ranges
     };
 
-    if effective_gene_blocks > 1 {
-        info!(
-            "Gene blocking: {} blocks, sizes {:?}",
-            effective_gene_blocks,
-            gene_block_ranges
-                .iter()
-                .map(|r| r.len())
-                .collect::<Vec<_>>()
-        );
-    }
-
     let mut encoded_blocks = Vec::new();
     let mut positions = Vec::new();
     let mut row_order = Vec::new();
@@ -1461,15 +1442,10 @@ fn run_clustered_compression(
                        block_gene_o2n: &[u32],
                        cluster_idx: usize|
      -> anyhow::Result<(EncodedClusterBlock, Vec<u32>, usize, bool, bool)> {
-        let mut row_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
-        let mut col_candidate: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
         let mut row_selected_adaptive = false;
         let mut col_selected_adaptive = false;
 
-        if matches!(
-            cluster_encoding,
-            ClusterEncodingArg::Row | ClusterEncodingArg::Hybrid
-        ) {
+        let row_candidate = {
             let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
             let mut try_row_encode = |adaptive: bool| {
                 let t = Instant::now();
@@ -1481,17 +1457,21 @@ fn run_clustered_compression(
                     Some(block_gene_o2n),
                     index_codec,
                     sorted_index_codec,
-                    full_row_fallback_ratio,
+                    row_parent_ref_cost_ratio,
                     forest_cut_factor,
                     row_mst_window,
                     adaptive,
                     row_template_max,
                 );
                 row_mst_encode_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                if let Some((row_block, dfs_order)) = encoded {
+                if let Some((row_block, traversal_order)) = encoded {
                     let bytes = row_block.total_bytes();
                     if best_row.as_ref().map(|b| bytes < b.2).unwrap_or(true) {
-                        best_row = Some((EncodedClusterBlock::RowMst(row_block), dfs_order, bytes));
+                        best_row = Some((
+                            EncodedClusterBlock::RowMst(row_block),
+                            traversal_order,
+                            bytes,
+                        ));
                         row_selected_adaptive = adaptive;
                     }
                 }
@@ -1501,16 +1481,21 @@ fn run_clustered_compression(
             if row_template_adaptive {
                 try_row_encode(false);
             }
-            row_candidate = best_row;
-        }
+            best_row
+        };
 
-        if matches!(
-            cluster_encoding,
-            ClusterEncodingArg::Column | ClusterEncodingArg::Hybrid
-        ) {
+        let col_candidate = {
             let mut best_col: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
             let mut try_col_encode = |adaptive: bool| {
                 let t = Instant::now();
+                let gene_kruskal_cfg = GeneKruskalMstParams {
+                    knn_metric,
+                    mst_weight_mode,
+                    index_codec,
+                    full_row_fallback_ratio: row_parent_ref_cost_ratio,
+                    forest_cut_factor,
+                    row_mst_window,
+                };
                 if let Some(col_block) = encode_subarray_column(
                     cluster_points,
                     &quantized_data,
@@ -1520,7 +1505,7 @@ fn run_clustered_compression(
                     column_template_count,
                     adaptive,
                     column_template_max,
-                    gene_ref_local_window,
+                    gene_kruskal_cfg,
                 ) {
                     let (col_block, order) = col_block;
                     let bytes = col_block.total_bytes();
@@ -1536,35 +1521,27 @@ fn run_clustered_compression(
             if column_template_adaptive {
                 try_col_encode(false);
             }
-            col_candidate = best_col;
-        }
+            best_col
+        };
 
         let row_available = row_candidate.is_some();
         let col_available = col_candidate.is_some();
-        let (encoded, local_order, bytes) = match cluster_encoding {
-            ClusterEncodingArg::Row => row_candidate.ok_or_else(|| {
-                anyhow::anyhow!("Row-MST encoding failed for cluster {}", cluster_idx)
-            })?,
-            ClusterEncodingArg::Column => col_candidate.ok_or_else(|| {
-                anyhow::anyhow!("Column encoding failed for cluster {}", cluster_idx)
-            })?,
-            ClusterEncodingArg::Hybrid => match (row_candidate, col_candidate) {
-                (Some(r), Some(c)) => {
-                    if r.2 <= c.2 {
-                        r
-                    } else {
-                        c
-                    }
+        let (encoded, local_order, bytes) = match (row_candidate, col_candidate) {
+            (Some(r), Some(c)) => {
+                if r.2 <= c.2 {
+                    r
+                } else {
+                    c
                 }
-                (Some(r), None) => r,
-                (None, Some(c)) => c,
-                (None, None) => {
-                    return Err(anyhow::anyhow!(
-                        "Both row and column encoding failed for cluster {} gene-block",
-                        cluster_idx
-                    ))
-                }
-            },
+            }
+            (Some(r), None) => r,
+            (None, Some(c)) => c,
+            (None, None) => {
+                return Err(anyhow::anyhow!(
+                    "Both row and column encoding failed for cluster {} gene-block",
+                    cluster_idx
+                ))
+            }
         };
 
         Ok((
@@ -1579,6 +1556,7 @@ fn run_clustered_compression(
     // Each cluster produces one or more encoded blocks (one per gene block).
     // positions / row_order come from the first gene block's DFS order.
     let encode_tiles_start = Instant::now();
+    reset_row_mst_order_stats();
     let cluster_results: Vec<
         anyhow::Result<
             Option<(
@@ -1768,6 +1746,11 @@ fn run_clustered_compression(
     info!(
         "Cluster payload selection: row_blocks={} column_blocks={}",
         row_block_count, column_block_count
+    );
+    let row_order_stats = row_mst_order_stats();
+    info!(
+        "Row-MST stream order usage: projection_full_backrefs={}",
+        row_order_stats.projection_full_backrefs
     );
     if row_template_adaptive || column_template_adaptive {
         info!(
@@ -2071,7 +2054,7 @@ struct BuildCommand {
     #[arg(long = "no-output", default_value_t = false)]
     no_output: bool,
     /// Compression codec for payload output and size estimation.
-    #[arg(long = "output-compression", value_enum, default_value_t = PayloadCompressionArg::SevenZip)]
+    #[arg(long = "output-compression", value_enum, default_value_t = PayloadCompressionArg::Zstd)]
     output_compression: PayloadCompressionArg,
     /// Optional CSV path to append compression statistics per run.
     #[arg(long = "stats-csv")]
@@ -2095,7 +2078,7 @@ struct BuildCommand {
     #[arg(long = "lossy-quantizers", default_value_t = 8)]
     lossy_quantizers: usize,
     /// Number of cell clusters (blocks) used by the cell clustering stage.
-    #[arg(long = "cell-blocks", default_value_t = 8)]
+    #[arg(long = "cell-blocks", default_value_t = 6)]
     cell_blocks: usize,
     #[arg(long = "lossy-bins", default_value_t = 16)]
     lossy_bins: usize,
@@ -2117,12 +2100,6 @@ struct BuildCommand {
     /// Codec used for sorted support/index lists (root supports, column gene ids, local dictionaries).
     #[arg(long = "sorted-index-codec", value_enum, default_value_t = SortedIndexCodecArg::Delta)]
     sorted_index_codec: SortedIndexCodecArg,
-    /// If set, disable per-child full-row fallback when edit deltas are too large.
-    #[arg(long = "disable-full-row-fallback", default_value_t = false)]
-    disable_full_row_fallback: bool,
-    /// Trigger full-row storage for a child when `delta_edits > ratio * child_nnz`.
-    #[arg(long = "full-row-fallback-ratio", default_value_t = 1.0)]
-    full_row_fallback_ratio: f32,
     /// If set, cut MST edges larger than `median_edge_weight * factor`, producing a forest.
     #[arg(long = "forest-cut-factor")]
     forest_cut_factor: Option<f32>,
@@ -2139,9 +2116,6 @@ struct BuildCommand {
     /// Use randomized joint SVD for cell clusters and gene order.
     #[arg(long = "joint-svd-fast", default_value_t = false)]
     joint_svd_fast: bool,
-    /// Cluster payload strategy: row MST ops, column postings, or choose smaller per-cluster.
-    #[arg(long = "cluster-encoding", value_enum, default_value_t = ClusterEncodingArg::Hybrid)]
-    cluster_encoding: ClusterEncodingArg,
     /// Fixed number of prototype supports per cluster for column encoding (used when adaptive is off).
     #[arg(long = "column-template-count", default_value_t = 0)]
     column_template_count: usize,
@@ -2151,16 +2125,12 @@ struct BuildCommand {
     /// Maximum number of column templates to consider in adaptive mode.
     #[arg(long = "column-template-max", default_value_t = 32)]
     column_template_max: usize,
-    /// Build the gene-reference parent pointers for column encoding using a
-    /// row-MST-style local-window MST over gene index order (no projection ordering).
-    #[arg(long = "gene-ref-local-window", default_value_t = false)]
-    gene_ref_local_window: bool,
     /// Enable adaptive row-template mode for row-MST payloads.
     #[arg(long = "row-template-adaptive", default_value_t = false)]
     row_template_adaptive: bool,
     /// Split genes into this many contiguous blocks (after reordering) and build
     /// MST independently on each (cell_cluster × gene_block) tile.  Default 1 = no splitting.
-    #[arg(long = "gene-blocks", default_value_t = 4)]
+    #[arg(long = "gene-blocks", default_value_t = 5)]
     gene_blocks: usize,
     /// Maximum number of row templates to consider in adaptive mode.
     #[arg(long = "row-template-max", default_value_t = 16)]
@@ -2369,17 +2339,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let index_codec = IndexStreamCodec::from(args.index_codec);
             let sorted_index_codec = SortedIndexCodec::from(args.sorted_index_codec);
             let mst_weight_mode = MstWeightMode::from(args.mst_weight);
-            let fallback_ratio = if args.disable_full_row_fallback {
-                None
-            } else {
-                Some(args.full_row_fallback_ratio.max(0.0))
-            };
+            let row_parent_ref_cost_ratio = Some(1.0);
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
             let row_mst_window = args.row_mst_window.max(1);
-            let cluster_encoding = args.cluster_encoding;
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} full_row_fallback={:?} forest_cut_factor={:?} cluster_encoding={:?} column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2393,9 +2358,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.joint_svd_fast,
                 args.index_codec,
                 args.sorted_index_codec,
-                fallback_ratio,
                 forest_cut_factor,
-                cluster_encoding,
                 args.column_template_count,
                 args.column_template_adaptive,
                 args.column_template_max,
@@ -2428,14 +2391,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         mst_weight_mode,
                         index_codec,
                         sorted_index_codec,
-                        fallback_ratio,
+                        row_parent_ref_cost_ratio,
                         forest_cut_factor,
                         row_mst_window,
-                        cluster_encoding,
                         args.column_template_count,
                         args.column_template_adaptive,
                         args.column_template_max,
-                        args.gene_ref_local_window,
                         args.row_template_adaptive,
                         args.row_template_max,
                         args.set_seed,
@@ -2527,7 +2488,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut bytes_delta_vals = 0usize;
                 let mut bytes_num_genes = 0usize;
 
-                for (block_idx, block) in selected.encoded_blocks.iter().enumerate() {
+                for block in &selected.encoded_blocks {
                     let (p, ri, rv, i, dv, ng) = block.bytes_breakdown();
                     bytes_parent += p;
                     bytes_root_indices += ri;
@@ -2535,29 +2496,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     bytes_indices += i;
                     bytes_delta_vals += dv;
                     bytes_num_genes += ng;
-                    match block {
-                    EncodedClusterBlock::RowMst(_) => info!(
-                        "  block[{}] type=row_mst: parent={} root_indices={} root_vals={} op_indices={} op_vals={} num_genes_meta={} total={}",
-                        block_idx,
-                        p,
-                        ri,
-                        rv,
-                        i,
-                        dv,
-                        ng,
-                        p + ri + rv + i + dv + ng
-                    ),
-                    EncodedClusterBlock::Column(_) => info!(
-                        "  block[{}] type=column: local_to_global={} posting_count_streams={} posting_index_streams={} vals={} num_cells_genes_meta={} total={}",
-                        block_idx,
-                        ri,
-                        rv,
-                        i,
-                        dv,
-                        ng,
-                        p + ri + rv + i + dv + ng
-                    ),
-                }
                 }
 
                 let topology_bytes = bytes_parent;
@@ -2740,11 +2678,9 @@ mod tests {
             Some(1.0),
             None,
             8,
-            ClusterEncodingArg::Hybrid,
             0,
             false,
             32,
-            false,
             false,
             16,
             None,
@@ -2787,11 +2723,9 @@ mod tests {
             Some(1.0),
             None,
             8,
-            ClusterEncodingArg::Hybrid,
             0,
             false,
             32,
-            false,
             false,
             16,
             Some(42),

@@ -11,9 +11,18 @@ pub enum SortedIndexCodec {
 pub enum EncodedSortedIndices {
     Delta(DeltaEncodedIndices),
     EliasFano(EliasFanoEncoded),
+    Raw(Vec<u32>),
 }
 
 impl EncodedSortedIndices {
+    pub fn from_u32(indices: &[u32], codec: SortedIndexCodec) -> Self {
+        if indices.windows(2).all(|w| w[0] <= w[1]) {
+            Self::from_sorted_u32(indices, codec)
+        } else {
+            EncodedSortedIndices::Raw(indices.to_vec())
+        }
+    }
+
     pub fn from_sorted_u32(indices: &[u32], codec: SortedIndexCodec) -> Self {
         match codec {
             SortedIndexCodec::Delta => {
@@ -32,6 +41,7 @@ impl EncodedSortedIndices {
                 d.decode_all().into_iter().map(|x| x as u32).collect()
             }
             EncodedSortedIndices::EliasFano(e) => e.decode_all_u32(),
+            EncodedSortedIndices::Raw(v) => v.clone(),
         }
     }
 
@@ -39,6 +49,7 @@ impl EncodedSortedIndices {
         match self {
             EncodedSortedIndices::Delta(d) => d.size_in_bytes(),
             EncodedSortedIndices::EliasFano(e) => e.size_in_bytes(),
+            EncodedSortedIndices::Raw(v) => v.len() * 4 + 8,
         }
     }
 }
