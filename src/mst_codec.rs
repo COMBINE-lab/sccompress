@@ -528,12 +528,11 @@ impl EncodedColumnBlock {
                     .copied()
                     .unwrap_or(0);
                 ref_parent_cursor += 1;
-                let signed_delta = zigzag_decode_i64(parent_delta);
-                let parent_idx = (gene_pos as i64)
-                    .checked_add(signed_delta)
-                    .filter(|idx| *idx >= 0 && (*idx as usize) < local_to_global.len())
-                    .map(|idx| idx as usize)
-                    .unwrap_or(gene_pos);
+                let parent_idx = if parent_delta > 0 {
+                    gene_pos.saturating_sub(parent_delta as usize)
+                } else {
+                    gene_pos
+                };
                 let remove_count = ref_remove_counts
                     .get(ref_count_cursor)
                     .copied()
@@ -801,14 +800,6 @@ fn support_projection_weight(idx: u32, seed: u64) -> f64 {
     (unit * 2.0) - 1.0
 }
 
-fn zigzag_encode_i64(delta: i64) -> u32 {
-    ((delta << 1) ^ (delta >> 63)) as u32
-}
-
-fn zigzag_decode_i64(v: u32) -> i64 {
-    ((v >> 1) as i64) ^ (-((v & 1) as i64))
-}
-
 /// One sparse vector per local gene: entries are `(local_cell_row, value)` — transpose of local
 /// cell rows over genes. Feeds the same [`build_mst_kruskal`] used for row-MST, with `window` /
 /// metrics interpreted over **gene indices** 0..num_genes-1 (parallel to cell indices 0..n-1).
@@ -830,26 +821,6 @@ fn sparse_vectors_per_local_gene(
         v.sort_unstable_by_key(|(row, _)| *row);
     }
     per_gene
-}
-
-fn kruskal_gene_parent_vec_to_ref_parents(
-    parent: &[u32],
-    gene_nonempty: &[bool],
-) -> Vec<Option<usize>> {
-    debug_assert_eq!(parent.len(), gene_nonempty.len());
-    let mut out = vec![None; parent.len()];
-    for i in 0..parent.len() {
-        if !gene_nonempty[i] {
-            continue;
-        }
-        let p = parent[i] as usize;
-        if p == i {
-            out[i] = None;
-        } else {
-            out[i] = Some(p);
-        }
-    }
-    out
 }
 
 fn optimize_row_order_for_column(expressions: &[SparseExpression]) -> Vec<u32> {
@@ -910,14 +881,17 @@ fn compute_row_set_edits(parent: &[u32], child: &[u32]) -> (Vec<u32>, Vec<u32>) 
 }
 
 fn support_ref_cost_bytes(
-    parent_idx: usize,
-    child_idx: usize,
+    parent_pos: usize,
+    child_pos: usize,
     parent_rows: &[u32],
     child_rows: &[u32],
     index_codec: IndexStreamCodec,
 ) -> u64 {
+    if parent_pos >= child_pos {
+        return u64::MAX;
+    }
     let (removes, adds) = compute_row_set_edits(parent_rows, child_rows);
-    let parent_delta = zigzag_encode_i64((parent_idx as i64) - (child_idx as i64));
+    let parent_delta = (child_pos - parent_pos) as u32;
     index_symbol_bytes(parent_delta, index_codec)
         + encoded_gene_only_cost_bytes(&removes, index_codec)
         + encoded_gene_only_cost_bytes(&adds, index_codec)
@@ -1591,7 +1565,6 @@ pub fn encode_subarray_column(
     let p = gene_kruskal_mst;
     let num_genes = local_to_global_raw.len();
     let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
-    let gene_nonempty: Vec<bool> = gene_sparse.iter().map(|e| !e.is_empty()).collect();
     let kg = 8usize.min(num_genes.saturating_sub(1)).max(1);
     let (_, parent_g) = build_mst_kruskal(
         &gene_sparse,
@@ -1603,10 +1576,16 @@ pub fn encode_subarray_column(
         p.forest_cut_factor,
         p.row_mst_window,
     );
-    let ref_parents = kruskal_gene_parent_vec_to_ref_parents(&parent_g, &gene_nonempty);
+    let gene_traversal = optimize_row_order_for_column(&gene_sparse);
+    let parent_offsets =
+        traversal_order_to_parent_offsets_allow_backrefs(&gene_traversal, &parent_g);
+    let local_to_global_projected: Vec<u32> = gene_traversal
+        .iter()
+        .map(|&gene_idx| local_to_global_raw[gene_idx as usize])
+        .collect();
 
     let local_to_global =
-        EncodedSortedIndices::from_sorted_u32(&local_to_global_raw, sorted_index_codec);
+        EncodedSortedIndices::from_u32(&local_to_global_projected, sorted_index_codec);
 
     let requested_template_count = if template_adaptive {
         template_max.max(template_count)
@@ -1616,40 +1595,45 @@ pub fn encode_subarray_column(
     let template_candidates =
         build_support_template_candidates(&posting_rows, requested_template_count);
     let selected_templates = if template_adaptive && !template_candidates.is_empty() {
-        let mut base_costs = vec![0u64; posting_rows.len()];
-        for gene_idx in 0..posting_rows.len() {
+        let mut base_costs = vec![0u64; gene_traversal.len()];
+        for (gene_pos, &gene_idx_u32) in gene_traversal.iter().enumerate() {
+            let gene_idx = gene_idx_u32 as usize;
             let rows = &posting_rows[gene_idx];
             if rows.is_empty() {
-                base_costs[gene_idx] = 0;
+                base_costs[gene_pos] = 0;
                 continue;
             }
             let raw_cost = raw_support_costs[gene_idx];
-            let ref_cost = ref_parents
-                .get(gene_idx)
-                .and_then(|p| *p)
-                .map(|parent_idx| {
+            let ref_cost = parent_offsets
+                .get(gene_pos)
+                .copied()
+                .filter(|&offset| offset > 0)
+                .map(|offset| {
+                    let parent_pos = gene_pos.saturating_sub(offset as usize);
+                    let parent_idx = gene_traversal[parent_pos] as usize;
                     support_ref_cost_bytes(
-                        parent_idx,
-                        gene_idx,
+                        parent_pos,
+                        gene_pos,
                         &posting_rows[parent_idx],
                         rows,
                         index_codec,
                     )
                 })
                 .unwrap_or(u64::MAX);
-            base_costs[gene_idx] = raw_cost.min(ref_cost);
+            base_costs[gene_pos] = raw_cost.min(ref_cost);
         }
 
-        let mut template_costs = vec![vec![0u64; posting_rows.len()]; template_candidates.len()];
+        let mut template_costs = vec![vec![0u64; gene_traversal.len()]; template_candidates.len()];
         for (template_idx, template_rows) in template_candidates.iter().enumerate() {
-            for gene_idx in 0..posting_rows.len() {
+            for (gene_pos, &gene_idx_u32) in gene_traversal.iter().enumerate() {
+                let gene_idx = gene_idx_u32 as usize;
                 let rows = &posting_rows[gene_idx];
                 if rows.is_empty() {
-                    template_costs[template_idx][gene_idx] = 0;
+                    template_costs[template_idx][gene_pos] = 0;
                     continue;
                 }
                 let (removes, adds) = compute_row_set_edits(template_rows, rows);
-                template_costs[template_idx][gene_idx] =
+                template_costs[template_idx][gene_pos] =
                     index_symbol_bytes(template_idx as u32, index_codec)
                         + encoded_gene_only_cost_bytes(&removes, index_codec)
                         + encoded_gene_only_cost_bytes(&adds, index_codec)
@@ -1665,13 +1649,13 @@ pub fn encode_subarray_column(
 
         for k in 1..=template_candidates.len() {
             dict_sum += encoded_gene_only_cost_bytes(&template_candidates[k - 1], index_codec);
-            for gene_idx in 0..posting_rows.len() {
-                let c = template_costs[k - 1][gene_idx];
-                if c < running_best[gene_idx] {
+            for gene_pos in 0..gene_traversal.len() {
+                let c = template_costs[k - 1][gene_pos];
+                if c < running_best[gene_pos] {
                     running_sum = running_sum
-                        .saturating_sub(running_best[gene_idx])
+                        .saturating_sub(running_best[gene_pos])
                         .saturating_add(c);
-                    running_best[gene_idx] = c;
+                    running_best[gene_pos] = c;
                 }
             }
             let total = running_sum.saturating_add(dict_sum);
@@ -1702,9 +1686,10 @@ pub fn encode_subarray_column(
             adds: Vec<u32>,
         },
     }
-    let mut decisions = Vec::with_capacity(postings.len());
+    let mut decisions = Vec::with_capacity(gene_traversal.len());
 
-    for (gene_idx, _) in postings.iter().enumerate() {
+    for (gene_pos, &gene_idx_u32) in gene_traversal.iter().enumerate() {
+        let gene_idx = gene_idx_u32 as usize;
         let rows = &posting_rows[gene_idx];
         let raw_cost = raw_support_costs[gene_idx];
 
@@ -1716,9 +1701,15 @@ pub fn encode_subarray_column(
         let mut best_cost = raw_cost as f64;
         let mut best_decision = PostingDecision::Raw;
 
-        if let Some(parent_idx) = ref_parents.get(gene_idx).and_then(|p| *p) {
+        if let Some(parent_offset) = parent_offsets
+            .get(gene_pos)
+            .copied()
+            .filter(|&offset| offset > 0)
+        {
+            let parent_pos = gene_pos.saturating_sub(parent_offset as usize);
+            let parent_idx = gene_traversal[parent_pos] as usize;
             let (removes, adds) = compute_row_set_edits(&posting_rows[parent_idx], rows);
-            let parent_delta = zigzag_encode_i64((parent_idx as i64) - (gene_idx as i64));
+            let parent_delta = parent_offset;
             let ref_cost = index_symbol_bytes(parent_delta, index_codec)
                 + encoded_gene_only_cost_bytes(&removes, index_codec)
                 + encoded_gene_only_cost_bytes(&adds, index_codec)
@@ -1763,10 +1754,12 @@ pub fn encode_subarray_column(
         );
     }
 
-    for (gene_idx, entries) in postings.iter().enumerate() {
+    for (gene_pos, &gene_idx_u32) in gene_traversal.iter().enumerate() {
+        let gene_idx = gene_idx_u32 as usize;
+        let entries = &postings[gene_idx];
         posting_counts.push(entries.len() as u32);
         let rows = &posting_rows[gene_idx];
-        match decisions.get(gene_idx) {
+        match decisions.get(gene_pos) {
             Some(PostingDecision::Ref {
                 parent_delta,
                 removes,
