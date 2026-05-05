@@ -11,7 +11,7 @@ use flate2::read::GzDecoder;
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use index_stream::IndexStreamCodec;
-use matrix_io::{load_10x_no_positions, load_10x_with_positions, InputPosType, Platform};
+use matrix_io::{load_10x_oriented, InputPosType, MatrixOrientation, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
     encode_subarray_column, encode_subarray_mst_with_metric, reset_row_mst_order_stats,
@@ -2026,6 +2026,18 @@ fn resolve_position_columns(
     }
 }
 
+fn coordinate_mode_label(
+    platform: Option<Platform>,
+    input_pos: Option<&PathBuf>,
+    matrix_orientation: MatrixOrientation,
+) -> &'static str {
+    match (platform, input_pos, matrix_orientation) {
+        (Some(Platform::SingleCell), _, _) | (_, None, _) => "none",
+        (_, Some(_), MatrixOrientation::CellGene) => "coordinates",
+        (_, Some(_), MatrixOrientation::GeneCell) => "requested-but-dummy-gene-rows",
+    }
+}
+
 #[derive(Parser)]
 #[command(version, about = "Clustered MST encoder (lossless + lossy)")]
 struct Cli {
@@ -2063,6 +2075,9 @@ struct BuildCommand {
     pos_format: InputPosType,
     #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
+    /// Matrix row/column orientation used by the encoder.
+    #[arg(long = "matrix-orientation", value_enum, default_value_t = MatrixOrientation::GeneCell)]
+    matrix_orientation: MatrixOrientation,
     #[arg(long = "pos-x-col")]
     pos_x_col: Option<usize>,
     #[arg(long = "pos-y-col")]
@@ -2283,6 +2298,9 @@ struct RoundtripCheckCommand {
     pos_format: InputPosType,
     #[arg(short = 'P', long = "platform", value_enum)]
     platform: Option<Platform>,
+    /// Matrix row/column orientation used when loading the ground-truth input.
+    #[arg(long = "matrix-orientation", value_enum, default_value_t = MatrixOrientation::GeneCell)]
+    matrix_orientation: MatrixOrientation,
     #[arg(long = "pos-x-col")]
     pos_x_col: Option<usize>,
     #[arg(long = "pos-y-col")]
@@ -2306,30 +2324,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Build(args) => {
-            let (csr, points) = match args.platform {
-                Some(Platform::SingleCell) => {
-                    // Single-cell mode: no positions file required; generate dummy points.
-                    load_10x_no_positions(&args.input, args.max_cells)?
-                }
-                _ => {
-                    // Spatial modes: positions file is required.
-                    let pos_path = args.input_pos.as_ref().ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "input-pos is required unless --platform single-cell is used"
-                        )
-                    })?;
-                    let (pos_x_col, pos_y_col) =
-                        resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
-                    load_10x_with_positions(
-                        &args.input,
-                        pos_path,
-                        args.pos_format,
-                        pos_x_col,
-                        pos_y_col,
-                        args.max_cells,
-                    )?
-                }
+            let positions_arg: Option<&PathBuf> = if args.platform == Some(Platform::SingleCell) {
+                None
+            } else {
+                args.input_pos.as_ref()
             };
+            let coordinate_mode =
+                coordinate_mode_label(args.platform, positions_arg, args.matrix_orientation);
+            let (pos_x_col, pos_y_col) =
+                resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
+            let positions_spec = positions_arg
+                .map(|pos_path| (pos_path.as_path(), args.pos_format, pos_x_col, pos_y_col));
+            if positions_spec.is_none()
+                && args.platform != Some(Platform::SingleCell)
+                && args.matrix_orientation == MatrixOrientation::CellGene
+            {
+                return Err(anyhow::anyhow!(
+                    "input-pos is required for --platform {:?} with --matrix-orientation cell-gene",
+                    args.platform
+                )
+                .into());
+            }
+            if positions_spec.is_some() && args.matrix_orientation == MatrixOrientation::GeneCell {
+                warn!(
+                    "input positions were provided with gene-cell orientation; gene rows cannot use cell coordinates, so dummy coordinates are used"
+                );
+            }
+            let (csr, points) = load_10x_oriented(
+                &args.input,
+                positions_spec,
+                args.matrix_orientation,
+                args.max_cells,
+            )?;
 
             let quantize_values = args.lossy && !args.lossy_lossless;
             let target_quantizers = args.lossy_quantizers.max(1);
@@ -2344,7 +2370,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let row_mst_window = args.row_mst_window.max(1);
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2355,6 +2381,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.knn_metric,
                 args.mst_weight,
                 row_mst_window,
+                args.matrix_orientation,
+                coordinate_mode,
+                csr.rows(),
+                csr.cols(),
+                csr.nnz(),
                 args.joint_svd_fast,
                 args.index_codec,
                 args.sorted_index_codec,
@@ -2582,6 +2613,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::RoundtripCheck(args) => {
             let (pos_x_col, pos_y_col) =
                 resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
+            let positions_spec = if args.platform == Some(Platform::SingleCell) {
+                None
+            } else {
+                Some((
+                    args.input_pos.as_path(),
+                    args.pos_format,
+                    pos_x_col,
+                    pos_y_col,
+                ))
+            };
 
             let (encoded_blocks, _positions, row_order, gene_order) =
                 decode_clustered_payload(&args.encoded, args.input_compression)?;
@@ -2598,20 +2639,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .into());
             }
 
-            let (csr_truth, _points) = load_10x_with_positions(
+            let (csr_truth, _points) = load_10x_oriented(
                 &args.input,
-                &args.input_pos,
-                args.pos_format,
-                pos_x_col,
-                pos_y_col,
+                positions_spec,
+                args.matrix_orientation,
                 args.max_cells,
             )?;
 
             info!(
-                "Ground truth CSR: rows={}, cols={}, nnz={}",
+                "Ground truth CSR: rows={}, cols={}, nnz={}, matrix_orientation={:?}",
                 csr_truth.rows(),
                 csr_truth.cols(),
-                csr_truth.nnz()
+                csr_truth.nnz(),
+                args.matrix_orientation
             );
 
             let reconstructed = reconstruct_csr_from_clustered_payload(

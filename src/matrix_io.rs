@@ -14,11 +14,19 @@ pub enum InputPosType {
     Parquet,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Platform {
     Visium,
     Xenium,
     SingleCell,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MatrixOrientation {
+    /// Rows are cells/spots/barcodes and columns are genes/features.
+    CellGene,
+    /// Rows are genes/features and columns are cells/spots/barcodes.
+    GeneCell,
 }
 
 fn read_strings_dynamic(file: &Hdf5File, path: &str) -> anyhow::Result<Vec<String>> {
@@ -137,12 +145,10 @@ fn load_positions_from_parquet(
     Ok(pos_map)
 }
 
-pub fn load_10x_with_positions(
+pub fn load_10x_oriented(
     h5_path: &Path,
-    pos_path: &Path,
-    pos_type: InputPosType,
-    pos_x_col: usize,
-    pos_y_col: usize,
+    positions: Option<(&Path, InputPosType, usize, usize)>,
+    orientation: MatrixOrientation,
     max_cells: Option<usize>,
 ) -> anyhow::Result<(CsMat<u16>, Vec<Point>)> {
     let file = Hdf5File::open(h5_path)?;
@@ -170,77 +176,61 @@ pub fn load_10x_with_positions(
     let indptr = indptr_all[..=num_cells].to_vec();
     let indices = indices_all[..nnz_limit].to_vec();
     let values = data_all[..nnz_limit].to_vec();
-    let csr = CsMat::new((num_cells, num_features), indptr, indices, values);
 
-    let barcodes = read_strings_dynamic(&file, "matrix/barcodes")?;
-    if barcodes.len() < num_cells {
-        anyhow::bail!(
-            "Not enough barcodes for selected rows: have {}, need {}",
-            barcodes.len(),
-            num_cells
-        );
+    match orientation {
+        MatrixOrientation::CellGene => {
+            let csr = CsMat::new((num_cells, num_features), indptr, indices, values);
+
+            let points = if let Some((pos_path, pos_type, pos_x_col, pos_y_col)) = positions {
+                let barcodes = read_strings_dynamic(&file, "matrix/barcodes")?;
+                if barcodes.len() < num_cells {
+                    anyhow::bail!(
+                        "Not enough barcodes for selected rows: have {}, need {}",
+                        barcodes.len(),
+                        num_cells
+                    );
+                }
+
+                let pos_map = match pos_type {
+                    InputPosType::Csv => load_positions_from_csv(pos_path, pos_x_col, pos_y_col)?,
+                    InputPosType::Parquet => {
+                        load_positions_from_parquet(pos_path, pos_x_col, pos_y_col)?
+                    }
+                };
+
+                let mut points = Vec::with_capacity(num_cells);
+                for row_idx in 0..num_cells {
+                    let barcode = &barcodes[row_idx];
+                    let (x, y) = pos_map.get(barcode).copied().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Missing position for barcode '{}' at row {}",
+                            barcode,
+                            row_idx
+                        )
+                    })?;
+                    points.push(Point::new(x, y, row_idx));
+                }
+                points
+            } else {
+                dummy_points(num_cells)
+            };
+
+            Ok((csr, points))
+        }
+        MatrixOrientation::GeneCell => {
+            // 10x H5 stores a feature x cell CSC matrix. Converting it to CSR
+            // makes features/genes the row axis.
+            let csc_native = CsMat::new_csc((num_features, num_cells), indptr, indices, values);
+            let csr = csc_native.to_csr();
+            Ok((csr, dummy_points(num_features)))
+        }
     }
-
-    let pos_map = match pos_type {
-        InputPosType::Csv => load_positions_from_csv(pos_path, pos_x_col, pos_y_col)?,
-        InputPosType::Parquet => load_positions_from_parquet(pos_path, pos_x_col, pos_y_col)?,
-    };
-
-    let mut points = Vec::with_capacity(num_cells);
-    for row_idx in 0..num_cells {
-        let barcode = &barcodes[row_idx];
-        let (x, y) = pos_map.get(barcode).copied().ok_or_else(|| {
-            anyhow::anyhow!(
-                "Missing position for barcode '{}' at row {}",
-                barcode,
-                row_idx
-            )
-        })?;
-        points.push(Point::new(x, y, row_idx));
-    }
-
-    Ok((csr, points))
 }
 
-/// Load 10x H5 matrix without any external positions.
-/// Returns CSR expression matrix in gene x cell orientation and dummy
-/// coordinates (0,0) for each row (gene).
-pub fn load_10x_no_positions(
-    h5_path: &Path,
-    max_cells: Option<usize>,
-) -> anyhow::Result<(CsMat<u16>, Vec<Point>)> {
-    let file = Hdf5File::open(h5_path)?;
-    let matrix = file.group("matrix")?;
-
-    let shape = matrix.dataset("shape")?.read_1d::<usize>()?.to_vec();
-    if shape.len() != 2 {
-        anyhow::bail!("matrix/shape must be length 2, found {}", shape.len());
-    }
-
-    let num_features = shape[0];
-    let num_cells_total = shape[1];
-    let num_cells = max_cells
-        .map(|m| m.min(num_cells_total))
-        .unwrap_or(num_cells_total);
-
-    let data_all = matrix.dataset("data")?.read_1d::<u16>()?.to_vec();
-    let indices_all = matrix.dataset("indices")?.read_1d::<usize>()?.to_vec();
-    let indptr_all = matrix.dataset("indptr")?.read_1d::<usize>()?.to_vec();
-
-    let nnz_limit = *indptr_all
-        .get(num_cells)
-        .ok_or_else(|| anyhow::anyhow!("indptr missing upper bound for {} rows", num_cells))?;
-
-    let indptr = indptr_all[..=num_cells].to_vec();
-    let indices = indices_all[..nnz_limit].to_vec();
-    let values = data_all[..nnz_limit].to_vec();
-    let csc_native = CsMat::new_csc((num_features, num_cells), indptr, indices, values);
-    let csr = csc_native.to_csr();
-
-    let mut points = Vec::with_capacity(num_features);
-    for row_idx in 0..num_features {
+fn dummy_points(n: usize) -> Vec<Point> {
+    let mut points = Vec::with_capacity(n);
+    for row_idx in 0..n {
         points.push(Point::new(0.0, 0.0, row_idx));
     }
-
-    Ok((csr, points))
+    points
 }
