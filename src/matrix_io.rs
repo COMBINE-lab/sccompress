@@ -7,6 +7,8 @@ use parquet::record::RowAccessor;
 use sprs::CsMat;
 use std::collections::HashMap;
 use std::path::Path;
+use std::time::Instant;
+use tracing::info;
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum InputPosType {
@@ -165,9 +167,11 @@ pub fn load_10x_oriented(
         .map(|m| m.min(num_cells_total))
         .unwrap_or(num_cells_total);
 
+    let read_start = Instant::now();
     let data_all = matrix.dataset("data")?.read_1d::<u16>()?.to_vec();
     let indices_all = matrix.dataset("indices")?.read_1d::<usize>()?.to_vec();
     let indptr_all = matrix.dataset("indptr")?.read_1d::<usize>()?.to_vec();
+    let read_ms = read_start.elapsed().as_millis();
 
     let nnz_limit = *indptr_all
         .get(num_cells)
@@ -179,7 +183,16 @@ pub fn load_10x_oriented(
 
     match orientation {
         MatrixOrientation::CellGene => {
+            let construct_start = Instant::now();
             let csr = CsMat::new((num_cells, num_features), indptr, indices, values);
+            info!(
+                "Matrix load timing: orientation=cell-gene read_h5_arrays_ms={} construct_csr_ms={} csc_to_csr_ms=0 rows={} cols={} nnz={}",
+                read_ms,
+                construct_start.elapsed().as_millis(),
+                csr.rows(),
+                csr.cols(),
+                csr.nnz()
+            );
 
             let points = if let Some((pos_path, pos_type, pos_x_col, pos_y_col)) = positions {
                 let barcodes = read_strings_dynamic(&file, "matrix/barcodes")?;
@@ -220,8 +233,21 @@ pub fn load_10x_oriented(
         MatrixOrientation::GeneCell => {
             // 10x H5 stores a feature x cell CSC matrix. Converting it to CSR
             // makes features/genes the row axis.
+            let construct_start = Instant::now();
             let csc_native = CsMat::new_csc((num_features, num_cells), indptr, indices, values);
+            let construct_csc_ms = construct_start.elapsed().as_millis();
+            let convert_start = Instant::now();
             let csr = csc_native.to_csr();
+            let csc_to_csr_ms = convert_start.elapsed().as_millis();
+            info!(
+                "Matrix load timing: orientation=gene-cell read_h5_arrays_ms={} construct_csc_ms={} csc_to_csr_ms={} rows={} cols={} nnz={}",
+                read_ms,
+                construct_csc_ms,
+                csc_to_csr_ms,
+                csr.rows(),
+                csr.cols(),
+                csr.nnz()
+            );
             Ok((csr, dummy_points(num_features)))
         }
     }

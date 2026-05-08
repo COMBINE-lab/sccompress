@@ -220,7 +220,7 @@ pub(crate) fn joint_svd_seriation(
             (0..n_genes as u32).collect(),
         ));
     }
-    let max_svd_rows = 4000usize;
+    let max_svd_rows = 2000usize;
     let max_svd_cols = 2000usize;
     let sampled_rows: Vec<usize> = if n_cells > max_svd_rows {
         if let Some(seed) = cluster_seed {
@@ -337,7 +337,7 @@ pub(crate) fn joint_svd_seriation(
             }
         }
     };
-    let n_comp = k.min(u.ncols()).max(1);
+    let n_comp = 2usize.min(k).min(u.ncols()).max(1);
     let mut cell_emb: Vec<Vec<f64>> = vec![vec![0.0f64; n_comp]; n_cells];
     for ci in 0..n_cells {
         if let Some(&lr) = sampled_set.get(&ci) {

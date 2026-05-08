@@ -14,9 +14,10 @@ use index_stream::IndexStreamCodec;
 use matrix_io::{load_10x_oriented, InputPosType, MatrixOrientation, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
-    encode_subarray_column, encode_subarray_mst_with_metric, reset_row_mst_order_stats,
-    row_mst_order_stats, DatalessPoint, EncodedClusterBlock, EncodedColumnBlock, EncodedDiffsMST,
-    GeneKruskalMstParams, KnnDistanceMetric, MstWeightMode, Point,
+    codec_timing_stats, encode_subarray_column, encode_subarray_mst_with_metric,
+    reset_codec_timing_stats, reset_row_mst_order_stats, row_mst_order_stats, DatalessPoint,
+    EncodedClusterBlock, EncodedColumnBlock, EncodedDiffsMST, GeneKruskalMstParams,
+    KnnDistanceMetric, MstWeightMode, Point,
 };
 use rayon::prelude::*;
 use sorted_indices::SortedIndexCodec;
@@ -1277,6 +1278,9 @@ fn run_clustered_compression(
     column_template_max: usize,
     row_template_adaptive: bool,
     row_template_max: usize,
+    disable_row_mst_candidate: bool,
+    disable_row_parent_ref: bool,
+    disable_column_ref: bool,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
     joint_svd_fast: bool,
@@ -1445,7 +1449,9 @@ fn run_clustered_compression(
         let mut row_selected_adaptive = false;
         let mut col_selected_adaptive = false;
 
-        let row_candidate = {
+        let row_candidate = if disable_row_mst_candidate {
+            None
+        } else {
             let mut best_row: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
             let mut try_row_encode = |adaptive: bool| {
                 let t = Instant::now();
@@ -1462,6 +1468,7 @@ fn run_clustered_compression(
                     row_mst_window,
                     adaptive,
                     row_template_max,
+                    !disable_row_parent_ref,
                 );
                 row_mst_encode_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if let Some((row_block, traversal_order)) = encoded {
@@ -1495,6 +1502,7 @@ fn run_clustered_compression(
                     full_row_fallback_ratio: row_parent_ref_cost_ratio,
                     forest_cut_factor,
                     row_mst_window,
+                    allow_ref: !disable_column_ref,
                 };
                 if let Some(col_block) = encode_subarray_column(
                     cluster_points,
@@ -1557,6 +1565,7 @@ fn run_clustered_compression(
     // positions / row_order come from the first gene block's DFS order.
     let encode_tiles_start = Instant::now();
     reset_row_mst_order_stats();
+    reset_codec_timing_stats();
     let cluster_results: Vec<
         anyhow::Result<
             Option<(
@@ -1654,6 +1663,9 @@ fn run_clustered_compression(
 
     let mut row_block_count = 0usize;
     let mut column_block_count = 0usize;
+    let mut row_mode_parent_total = 0usize;
+    let mut row_mode_full_total = 0usize;
+    let mut row_mode_template_total = 0usize;
     let mut row_adaptive_fallback_wins = 0usize;
     let mut col_adaptive_fallback_wins = 0usize;
     let mut col_value_model_global_blocks = 0usize;
@@ -1687,7 +1699,17 @@ fn run_clustered_compression(
         }
         for encoded in &tile_blocks {
             match encoded {
-                EncodedClusterBlock::RowMst(_) => row_block_count += 1,
+                EncodedClusterBlock::RowMst(block) => {
+                    row_block_count += 1;
+                    for mode in block.child_modes.decode_all().unwrap_or_default() {
+                        match mode {
+                            0 => row_mode_parent_total += 1,
+                            1 => row_mode_full_total += 1,
+                            2 => row_mode_template_total += 1,
+                            _ => {}
+                        }
+                    }
+                }
                 EncodedClusterBlock::Column(block) => {
                     column_block_count += 1;
                     if block.uses_per_gene_values() {
@@ -1742,11 +1764,21 @@ fn run_clustered_compression(
     let timing_encode_tiles_ms = encode_tiles_start.elapsed().as_millis() as u64;
     let timing_row_mst_encode_ms = row_mst_encode_us.load(Ordering::Relaxed) / 1_000;
     let timing_column_encode_ms = column_encode_us.load(Ordering::Relaxed) / 1_000;
+    let codec_timing = codec_timing_stats();
 
     info!(
         "Cluster payload selection: row_blocks={} column_blocks={}",
         row_block_count, column_block_count
     );
+    if row_block_count > 0 {
+        info!(
+            "Row-MST child mode usage: parent={} full={} template={} total={}",
+            row_mode_parent_total,
+            row_mode_full_total,
+            row_mode_template_total,
+            row_mode_parent_total + row_mode_full_total + row_mode_template_total
+        );
+    }
     let row_order_stats = row_mst_order_stats();
     info!(
         "Row-MST stream order usage: projection_full_backrefs={}",
@@ -1780,6 +1812,23 @@ fn run_clustered_compression(
             col_blocks_mixed_modes
         );
     }
+    info!(
+        "Row-MST candidate timing breakdown: expressions={}ms build_mst={}ms traversal_setup={}ms template_select={}ms child_modes={}ms stream_encode={}ms",
+        codec_timing.row_expressions_us / 1_000,
+        codec_timing.row_build_mst_us / 1_000,
+        codec_timing.row_traversal_setup_us / 1_000,
+        codec_timing.row_template_select_us / 1_000,
+        codec_timing.row_child_modes_us / 1_000,
+        codec_timing.row_stream_encode_us / 1_000
+    );
+    info!(
+        "Column candidate timing breakdown: expressions_postings={}ms gene_mst={}ms template_select={}ms posting_decisions={}ms stream_encode={}ms",
+        codec_timing.column_expressions_postings_us / 1_000,
+        codec_timing.column_gene_mst_us / 1_000,
+        codec_timing.column_template_select_us / 1_000,
+        codec_timing.column_posting_decisions_us / 1_000,
+        codec_timing.column_stream_encode_us / 1_000
+    );
 
     if verify_lossless && !quantize_values {
         let reconstructed = reconstruct_csr_from_clustered_payload(
@@ -2150,6 +2199,19 @@ struct BuildCommand {
     /// Maximum number of row templates to consider in adaptive mode.
     #[arg(long = "row-template-max", default_value_t = 16)]
     row_template_max: usize,
+    /// Disable the row-MST full-row fallback. When enabled, row-MST children
+    /// must use parent/template edits unless no valid parent is available.
+    #[arg(long = "disable-row-full-fallback", default_value_t = false)]
+    disable_row_full_fallback: bool,
+    /// Disable the row-MST candidate entirely, forcing tiles to use column encoding.
+    #[arg(long = "disable-row-mst-candidate", default_value_t = false)]
+    disable_row_mst_candidate: bool,
+    /// Disable parent/reference edit mode inside row-MST blocks.
+    #[arg(long = "disable-row-parent-ref", default_value_t = false)]
+    disable_row_parent_ref: bool,
+    /// Disable reference posting mode inside column blocks.
+    #[arg(long = "disable-column-ref", default_value_t = false)]
+    disable_column_ref: bool,
     /// If set, emit combinatorial and entropy diagnostics for op_indices.
     #[arg(long = "report-index-bounds", default_value_t = false)]
     report_index_bounds: bool,
@@ -2365,12 +2427,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let index_codec = IndexStreamCodec::from(args.index_codec);
             let sorted_index_codec = SortedIndexCodec::from(args.sorted_index_codec);
             let mst_weight_mode = MstWeightMode::from(args.mst_weight);
-            let row_parent_ref_cost_ratio = Some(1.0);
+            let row_parent_ref_cost_ratio = if args.disable_row_full_fallback {
+                None
+            } else {
+                Some(1.0)
+            };
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
             let row_mst_window = args.row_mst_window.max(1);
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_row_parent_ref={} disable_column_ref={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2387,6 +2453,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 csr.cols(),
                 csr.nnz(),
                 args.joint_svd_fast,
+                !args.disable_row_full_fallback,
+                args.disable_row_mst_candidate,
+                args.disable_row_parent_ref,
+                args.disable_column_ref,
                 args.index_codec,
                 args.sorted_index_codec,
                 forest_cut_factor,
@@ -2430,6 +2500,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.column_template_max,
                         args.row_template_adaptive,
                         args.row_template_max,
+                        args.disable_row_mst_candidate,
+                        args.disable_row_parent_ref,
+                        args.disable_column_ref,
                         args.set_seed,
                         *gene_reorder_method,
                         args.joint_svd_fast,
@@ -2723,6 +2796,9 @@ mod tests {
             32,
             false,
             16,
+            false,
+            false,
+            false,
             None,
             GeneReorderMethod::Projection,
             false,
@@ -2768,6 +2844,9 @@ mod tests {
             32,
             false,
             16,
+            false,
+            false,
+            false,
             Some(42),
             GeneReorderMethod::Projection,
             false,

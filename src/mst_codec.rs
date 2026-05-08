@@ -10,6 +10,7 @@ use rayon::prelude::*;
 use sprs::CsMat;
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 #[derive(Clone, Debug)]
 pub struct Point {
@@ -681,9 +682,23 @@ pub struct GeneKruskalMstParams {
     pub full_row_fallback_ratio: Option<f32>,
     pub forest_cut_factor: Option<f32>,
     pub row_mst_window: usize,
+    pub allow_ref: bool,
 }
 
 static ROW_MST_PROJECTION_FULL_BACKREFS: AtomicU64 = AtomicU64::new(0);
+
+static ROW_TIMING_EXPRESSIONS_US: AtomicU64 = AtomicU64::new(0);
+static ROW_TIMING_BUILD_MST_US: AtomicU64 = AtomicU64::new(0);
+static ROW_TIMING_TRAVERSAL_SETUP_US: AtomicU64 = AtomicU64::new(0);
+static ROW_TIMING_TEMPLATE_SELECT_US: AtomicU64 = AtomicU64::new(0);
+static ROW_TIMING_CHILD_MODES_US: AtomicU64 = AtomicU64::new(0);
+static ROW_TIMING_STREAM_ENCODE_US: AtomicU64 = AtomicU64::new(0);
+
+static COLUMN_TIMING_EXPRESSIONS_POSTINGS_US: AtomicU64 = AtomicU64::new(0);
+static COLUMN_TIMING_GENE_MST_US: AtomicU64 = AtomicU64::new(0);
+static COLUMN_TIMING_TEMPLATE_SELECT_US: AtomicU64 = AtomicU64::new(0);
+static COLUMN_TIMING_POSTING_DECISIONS_US: AtomicU64 = AtomicU64::new(0);
+static COLUMN_TIMING_STREAM_ENCODE_US: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RowMstOrderStats {
@@ -698,6 +713,56 @@ pub fn row_mst_order_stats() -> RowMstOrderStats {
     RowMstOrderStats {
         projection_full_backrefs: ROW_MST_PROJECTION_FULL_BACKREFS.load(Ordering::Relaxed),
     }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct CodecTimingStats {
+    pub row_expressions_us: u64,
+    pub row_build_mst_us: u64,
+    pub row_traversal_setup_us: u64,
+    pub row_template_select_us: u64,
+    pub row_child_modes_us: u64,
+    pub row_stream_encode_us: u64,
+    pub column_expressions_postings_us: u64,
+    pub column_gene_mst_us: u64,
+    pub column_template_select_us: u64,
+    pub column_posting_decisions_us: u64,
+    pub column_stream_encode_us: u64,
+}
+
+pub fn reset_codec_timing_stats() {
+    ROW_TIMING_EXPRESSIONS_US.store(0, Ordering::Relaxed);
+    ROW_TIMING_BUILD_MST_US.store(0, Ordering::Relaxed);
+    ROW_TIMING_TRAVERSAL_SETUP_US.store(0, Ordering::Relaxed);
+    ROW_TIMING_TEMPLATE_SELECT_US.store(0, Ordering::Relaxed);
+    ROW_TIMING_CHILD_MODES_US.store(0, Ordering::Relaxed);
+    ROW_TIMING_STREAM_ENCODE_US.store(0, Ordering::Relaxed);
+    COLUMN_TIMING_EXPRESSIONS_POSTINGS_US.store(0, Ordering::Relaxed);
+    COLUMN_TIMING_GENE_MST_US.store(0, Ordering::Relaxed);
+    COLUMN_TIMING_TEMPLATE_SELECT_US.store(0, Ordering::Relaxed);
+    COLUMN_TIMING_POSTING_DECISIONS_US.store(0, Ordering::Relaxed);
+    COLUMN_TIMING_STREAM_ENCODE_US.store(0, Ordering::Relaxed);
+}
+
+pub fn codec_timing_stats() -> CodecTimingStats {
+    CodecTimingStats {
+        row_expressions_us: ROW_TIMING_EXPRESSIONS_US.load(Ordering::Relaxed),
+        row_build_mst_us: ROW_TIMING_BUILD_MST_US.load(Ordering::Relaxed),
+        row_traversal_setup_us: ROW_TIMING_TRAVERSAL_SETUP_US.load(Ordering::Relaxed),
+        row_template_select_us: ROW_TIMING_TEMPLATE_SELECT_US.load(Ordering::Relaxed),
+        row_child_modes_us: ROW_TIMING_CHILD_MODES_US.load(Ordering::Relaxed),
+        row_stream_encode_us: ROW_TIMING_STREAM_ENCODE_US.load(Ordering::Relaxed),
+        column_expressions_postings_us: COLUMN_TIMING_EXPRESSIONS_POSTINGS_US
+            .load(Ordering::Relaxed),
+        column_gene_mst_us: COLUMN_TIMING_GENE_MST_US.load(Ordering::Relaxed),
+        column_template_select_us: COLUMN_TIMING_TEMPLATE_SELECT_US.load(Ordering::Relaxed),
+        column_posting_decisions_us: COLUMN_TIMING_POSTING_DECISIONS_US.load(Ordering::Relaxed),
+        column_stream_encode_us: COLUMN_TIMING_STREAM_ENCODE_US.load(Ordering::Relaxed),
+    }
+}
+
+fn record_elapsed_us(counter: &AtomicU64, start: Instant) {
+    counter.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
 }
 
 fn row_mst_traversal_and_offsets(
@@ -1537,6 +1602,7 @@ pub fn encode_subarray_column(
         return None;
     }
 
+    let t_expressions = Instant::now();
     let expressions_global: Vec<SparseExpression> = points
         .par_iter()
         .map(|p| compute_sparse_expression(p, data, gene_old_to_new))
@@ -1555,6 +1621,7 @@ pub fn encode_subarray_column(
             postings[gene as usize].push((row_id, value));
         }
     }
+    record_elapsed_us(&COLUMN_TIMING_EXPRESSIONS_POSTINGS_US, t_expressions);
 
     let mut posting_modes_raw = Vec::<u32>::with_capacity(postings.len());
     let mut posting_counts = Vec::<u32>::with_capacity(postings.len());
@@ -1580,6 +1647,7 @@ pub fn encode_subarray_column(
     let mut vals_flat = Vec::<u32>::new();
     let mut vals_by_gene = Vec::<Vec<u32>>::with_capacity(postings.len());
 
+    let t_gene_mst = Instant::now();
     let posting_rows: Vec<Vec<u32>> = postings
         .iter()
         .map(|entries| entries.iter().map(|&(row, _)| row).collect())
@@ -1590,24 +1658,30 @@ pub fn encode_subarray_column(
         .collect();
     let p = gene_kruskal_mst;
     let num_genes = local_to_global_raw.len();
-    let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
-    let gene_nonempty: Vec<bool> = gene_sparse.iter().map(|e| !e.is_empty()).collect();
-    let kg = 8usize.min(num_genes.saturating_sub(1)).max(1);
-    let (_, parent_g) = build_mst_kruskal(
-        &gene_sparse,
-        kg,
-        p.knn_metric,
-        p.mst_weight_mode,
-        p.index_codec,
-        p.full_row_fallback_ratio,
-        p.forest_cut_factor,
-        p.row_mst_window,
-    );
-    let ref_parents = kruskal_gene_parent_vec_to_ref_parents(&parent_g, &gene_nonempty);
+    let ref_parents = if p.allow_ref {
+        let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
+        let gene_nonempty: Vec<bool> = gene_sparse.iter().map(|e| !e.is_empty()).collect();
+        let kg = 8usize.min(num_genes.saturating_sub(1)).max(1);
+        let (_, parent_g) = build_mst_kruskal(
+            &gene_sparse,
+            kg,
+            p.knn_metric,
+            p.mst_weight_mode,
+            p.index_codec,
+            p.full_row_fallback_ratio,
+            p.forest_cut_factor,
+            p.row_mst_window,
+        );
+        kruskal_gene_parent_vec_to_ref_parents(&parent_g, &gene_nonempty)
+    } else {
+        vec![None; num_genes]
+    };
+    record_elapsed_us(&COLUMN_TIMING_GENE_MST_US, t_gene_mst);
 
     let local_to_global =
         EncodedSortedIndices::from_sorted_u32(&local_to_global_raw, sorted_index_codec);
 
+    let t_template_select = Instant::now();
     let requested_template_count = if template_adaptive {
         template_max.max(template_count)
     } else {
@@ -1688,6 +1762,7 @@ pub fn encode_subarray_column(
     } else {
         template_candidates
     };
+    record_elapsed_us(&COLUMN_TIMING_TEMPLATE_SELECT_US, t_template_select);
 
     enum PostingDecision {
         Raw,
@@ -1704,6 +1779,7 @@ pub fn encode_subarray_column(
     }
     let mut decisions = Vec::with_capacity(postings.len());
 
+    let t_posting_decisions = Instant::now();
     for (gene_idx, _) in postings.iter().enumerate() {
         let rows = &posting_rows[gene_idx];
         let raw_cost = raw_support_costs[gene_idx];
@@ -1809,7 +1885,9 @@ pub fn encode_subarray_column(
         }
         vals_by_gene.push(gene_vals);
     }
+    record_elapsed_us(&COLUMN_TIMING_POSTING_DECISIONS_US, t_posting_decisions);
 
+    let t_stream_encode = Instant::now();
     let posting_modes = if posting_modes_raw.is_empty() {
         ArithmeticEncoded::default()
     } else {
@@ -1867,6 +1945,7 @@ pub fn encode_subarray_column(
     } else {
         vals_global
     };
+    record_elapsed_us(&COLUMN_TIMING_STREAM_ENCODE_US, t_stream_encode);
 
     Some((
         EncodedColumnBlock {
@@ -1913,15 +1992,20 @@ pub fn encode_subarray_mst_with_metric(
     row_mst_window: usize,
     row_template_adaptive: bool,
     row_template_max: usize,
+    allow_parent_ref: bool,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
     if points.is_empty() {
         return None;
     }
+    let t_expressions = Instant::now();
     let expressions_global: Vec<SparseExpression> = points
         .par_iter()
         .map(|p| compute_sparse_expression(p, data, gene_old_to_new))
         .collect();
     let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
+    record_elapsed_us(&ROW_TIMING_EXPRESSIONS_US, t_expressions);
+
+    let t_build_mst = Instant::now();
     let k = 8usize.min(points.len().saturating_sub(1)).max(1);
     let (root, parent) = build_mst_kruskal(
         &expressions,
@@ -1933,6 +2017,8 @@ pub fn encode_subarray_mst_with_metric(
         forest_cut_factor,
         row_mst_window,
     );
+    record_elapsed_us(&ROW_TIMING_BUILD_MST_US, t_build_mst);
+
     encode_subarray_mst_from_parts(
         data.cols() as u32,
         &expressions,
@@ -1944,6 +2030,7 @@ pub fn encode_subarray_mst_with_metric(
         full_row_fallback_ratio,
         row_template_adaptive,
         row_template_max,
+        allow_parent_ref,
     )
 }
 
@@ -1958,12 +2045,15 @@ fn encode_subarray_mst_from_parts(
     full_row_fallback_ratio: Option<f32>,
     row_template_adaptive: bool,
     row_template_max: usize,
+    allow_parent_ref: bool,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
+    let t_traversal_setup = Instant::now();
     let local_to_global = EncodedSortedIndices::from_u32(local_to_global_raw, sorted_index_codec);
     let (traversal_order, parent_offset_raw) = row_mst_traversal_and_offsets(parent, expressions);
     let root_expr = &expressions[root];
     let root_genes: Vec<u32> = root_expr.iter().map(|(g, _)| *g).collect();
     let root_vals_raw: Vec<u32> = root_expr.iter().map(|(_, v)| *v as u32).collect();
+    record_elapsed_us(&ROW_TIMING_TRAVERSAL_SETUP_US, t_traversal_setup);
 
     const ROW_MODE_PARENT: u32 = 0;
     const ROW_MODE_FULL: u32 = 1;
@@ -2004,6 +2094,7 @@ fn encode_subarray_mst_from_parts(
     for (pos, &orig) in traversal_order.iter().enumerate() {
         pos_in_traversal[orig as usize] = pos;
     }
+    let t_template_select = Instant::now();
     let selected_row_templates = if row_template_adaptive && row_template_max > 0 {
         let template_candidates = build_row_template_candidates(&expressions, row_template_max);
         if template_candidates.is_empty() {
@@ -2012,7 +2103,8 @@ fn encode_subarray_mst_from_parts(
             let mut baseline_costs = Vec::with_capacity(child_origs.len());
             for &orig_cell in &child_origs {
                 let parent_orig = parent[orig_cell] as usize;
-                let parent_ref_available = parent_orig != orig_cell
+                let parent_ref_available = allow_parent_ref
+                    && parent_orig != orig_cell
                     && pos_in_traversal[parent_orig] < pos_in_traversal[orig_cell];
                 let child_expr = &expressions[orig_cell];
                 let parent_expr = &expressions[parent_orig];
@@ -2090,7 +2182,9 @@ fn encode_subarray_mst_from_parts(
     } else {
         Vec::new()
     };
+    record_elapsed_us(&ROW_TIMING_TEMPLATE_SELECT_US, t_template_select);
 
+    let t_child_modes = Instant::now();
     for template_expr in &selected_row_templates {
         row_template_counts_raw.push(template_expr.len() as u32);
         append_entry_stream(
@@ -2103,8 +2197,9 @@ fn encode_subarray_mst_from_parts(
 
     for &orig_cell in &child_origs {
         let parent_orig = parent[orig_cell] as usize;
-        let parent_ref_available =
-            parent_orig != orig_cell && pos_in_traversal[parent_orig] < pos_in_traversal[orig_cell];
+        let parent_ref_available = allow_parent_ref
+            && parent_orig != orig_cell
+            && pos_in_traversal[parent_orig] < pos_in_traversal[orig_cell];
         let child_expr = &expressions[orig_cell];
         let parent_expr = &expressions[parent_orig];
         let (parent_delta_cost, parent_ops) =
@@ -2190,7 +2285,9 @@ fn encode_subarray_mst_from_parts(
             );
         }
     }
+    record_elapsed_us(&ROW_TIMING_CHILD_MODES_US, t_child_modes);
 
+    let t_stream_encode = Instant::now();
     let parent_offset =
         ArithmeticEncoded::from_slice(&parent_offset_raw).expect("valid parent offset");
     let root_indices = EncodedSortedIndices::from_sorted_u32(&root_genes, sorted_index_codec);
@@ -2254,6 +2351,7 @@ fn encode_subarray_mst_from_parts(
     } else {
         ArithmeticEncoded::from_slice(&child_update_vals_raw).expect("valid update values")
     };
+    record_elapsed_us(&ROW_TIMING_STREAM_ENCODE_US, t_stream_encode);
 
     Some((
         EncodedDiffsMST {
@@ -2306,6 +2404,7 @@ pub fn encode_subarray_mst(
         8,
         false,
         0,
+        true,
     )
 }
 
@@ -2713,6 +2812,7 @@ mod tests {
             full_row_fallback_ratio: Some(1.0),
             forest_cut_factor: None,
             row_mst_window: 8,
+            allow_ref: true,
         };
         let (encoded, local_order) = encode_subarray_column(
             &points,
@@ -2817,6 +2917,7 @@ mod tests {
             full_row_fallback_ratio: Some(1.0),
             forest_cut_factor: None,
             row_mst_window: 8,
+            allow_ref: true,
         };
         let col_kruskal_gene_mst = encode_subarray_column(
             &points,
@@ -2844,6 +2945,7 @@ mod tests {
             8,
             false,
             32,
+            true,
         )
         .expect("row-MST projection-full-backrefs stream");
 
