@@ -1279,6 +1279,7 @@ fn run_clustered_compression(
     row_template_adaptive: bool,
     row_template_max: usize,
     disable_row_mst_candidate: bool,
+    disable_column_candidate: bool,
     disable_row_parent_ref: bool,
     disable_column_ref: bool,
     cluster_seed: Option<u64>,
@@ -1491,7 +1492,9 @@ fn run_clustered_compression(
             best_row
         };
 
-        let col_candidate = {
+        let col_candidate = if disable_column_candidate {
+            None
+        } else {
             let mut best_col: Option<(EncodedClusterBlock, Vec<u32>, usize)> = None;
             let mut try_col_encode = |adaptive: bool| {
                 let t = Instant::now();
@@ -2206,6 +2209,12 @@ struct BuildCommand {
     /// Disable the row-MST candidate entirely, forcing tiles to use column encoding.
     #[arg(long = "disable-row-mst-candidate", default_value_t = false)]
     disable_row_mst_candidate: bool,
+    /// Force every tile to use column encoding only.
+    #[arg(long = "column-only", default_value_t = false)]
+    column_only: bool,
+    /// Disable the column candidate entirely, forcing tiles to use row-MST encoding.
+    #[arg(long = "disable-column-candidate", default_value_t = false)]
+    disable_column_candidate: bool,
     /// Disable parent/reference edit mode inside row-MST blocks.
     #[arg(long = "disable-row-parent-ref", default_value_t = false)]
     disable_row_parent_ref: bool,
@@ -2434,9 +2443,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let forest_cut_factor = args.forest_cut_factor.map(|f| f.max(0.0));
             let row_mst_window = args.row_mst_window.max(1);
+            let disable_row_mst_candidate = args.disable_row_mst_candidate || args.column_only;
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_row_parent_ref={} disable_column_ref={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_column_candidate={} disable_row_parent_ref={} disable_column_ref={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -2454,7 +2464,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 csr.nnz(),
                 args.joint_svd_fast,
                 !args.disable_row_full_fallback,
-                args.disable_row_mst_candidate,
+                disable_row_mst_candidate,
+                args.disable_column_candidate,
                 args.disable_row_parent_ref,
                 args.disable_column_ref,
                 args.index_codec,
@@ -2500,7 +2511,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.column_template_max,
                         args.row_template_adaptive,
                         args.row_template_max,
-                        args.disable_row_mst_candidate,
+                        disable_row_mst_candidate,
+                        args.disable_column_candidate,
                         args.disable_row_parent_ref,
                         args.disable_column_ref,
                         args.set_seed,
@@ -2799,6 +2811,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
             GeneReorderMethod::Projection,
             false,
@@ -2844,6 +2857,7 @@ mod tests {
             32,
             false,
             16,
+            false,
             false,
             false,
             false,

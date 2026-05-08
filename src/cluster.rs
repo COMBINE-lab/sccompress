@@ -70,9 +70,13 @@ struct JointSvdFactors {
     v_t: DMatrix<f64>,
 }
 
-fn randomized_joint_svd_top_k(a: &DMatrix<f64>, k: usize, seed: u64) -> Option<JointSvdFactors> {
-    let nr = a.nrows();
-    let nc = a.ncols();
+fn randomized_joint_svd_top_k_sparse_entries(
+    nr: usize,
+    nc: usize,
+    entries: &[(usize, usize, f64)],
+    k: usize,
+    seed: u64,
+) -> Option<JointSvdFactors> {
     if k == 0 || nr == 0 || nc == 0 {
         return None;
     }
@@ -84,12 +88,35 @@ fn randomized_joint_svd_top_k(a: &DMatrix<f64>, k: usize, seed: u64) -> Option<J
         (u as f64 / (u64::MAX as f64)) * 2.0 - 1.0
     });
 
-    // One power iteration: A * (A^T * (A * Omega)).
-    let y0 = a * &omega;
-    let at_y0 = a.transpose() * &y0;
-    let y = a * &at_y0;
+    let mut y0 = DMatrix::<f64>::zeros(nr, l);
+    for &(row, col, value) in entries {
+        for j in 0..l {
+            y0[(row, j)] += value * omega[(col, j)];
+        }
+    }
+
+    let mut at_y0 = DMatrix::<f64>::zeros(nc, l);
+    for &(row, col, value) in entries {
+        for j in 0..l {
+            at_y0[(col, j)] += value * y0[(row, j)];
+        }
+    }
+
+    let mut y = DMatrix::<f64>::zeros(nr, l);
+    for &(row, col, value) in entries {
+        for j in 0..l {
+            y[(row, j)] += value * at_y0[(col, j)];
+        }
+    }
+
     let q = orthonormalize_columns(&y);
-    let w = q.transpose() * a;
+    let mut w = DMatrix::<f64>::zeros(l, nc);
+    for &(row, col, value) in entries {
+        for j in 0..l {
+            w[(j, col)] += q[(row, j)] * value;
+        }
+    }
+
     let svd = w.svd(true, true);
     let u_small = svd.u?;
     let v_t = svd.v_t?;
@@ -269,6 +296,7 @@ pub(crate) fn joint_svd_seriation(
     let nr = sampled_rows.len();
     let nc = active_cols.len();
     let mut dense = vec![0.0f64; nr * nc];
+    let mut sparse_entries = Vec::<(usize, usize, f64)>::new();
     let sampled_set: HashMap<usize, usize> = sampled_rows
         .iter()
         .enumerate()
@@ -277,7 +305,9 @@ pub(crate) fn joint_svd_seriation(
     for &(ci, gene_idx, value) in &triplets {
         if let Some(&local_row) = sampled_set.get(&ci) {
             if let Some(&local_col) = col_local.get(&gene_idx) {
-                dense[local_row * nc + local_col] = value as f64;
+                let value = value as f64;
+                dense[local_row * nc + local_col] = value;
+                sparse_entries.push((local_row, local_col, value));
             }
         }
     }
@@ -287,7 +317,13 @@ pub(crate) fn joint_svd_seriation(
         .wrapping_add(0x517C_C1B7_2722_0A95);
     let target_rank = k.min(nr).min(nc).max(1);
     let (u, sigma, v_t, svd_mode) = if joint_svd_fast {
-        match randomized_joint_svd_top_k(&mat, target_rank, svd_seed) {
+        match randomized_joint_svd_top_k_sparse_entries(
+            nr,
+            nc,
+            &sparse_entries,
+            target_rank,
+            svd_seed,
+        ) {
             Some(factors)
                 if factors.u.iter().all(|x| x.is_finite())
                     && factors.v_t.iter().all(|x| x.is_finite()) =>
@@ -296,11 +332,13 @@ pub(crate) fn joint_svd_seriation(
                     factors.u,
                     factors.singular_values,
                     factors.v_t,
-                    "randomized",
+                    "sparse-randomized",
                 )
             }
             _ => {
-                warn!("Fast joint SVD failed or produced non-finite values; using exact SVD");
+                warn!(
+                    "Fast sparse joint SVD failed or produced non-finite values; using exact sampled dense SVD"
+                );
                 let svd = mat.svd(true, true);
                 match (svd.u, svd.v_t) {
                     (Some(u), Some(vt)) => (
