@@ -201,17 +201,6 @@ impl ColumnValuesEncoded {
         ColumnValuesEncoded::Global(encoded)
     }
 
-    fn from_per_gene(values_by_gene: &[Vec<u32>]) -> Self {
-        let mut streams = Vec::new();
-        for values in values_by_gene {
-            if values.is_empty() {
-                continue;
-            }
-            streams.push(ArithmeticEncoded::from_slice(values).expect("valid posting values"));
-        }
-        ColumnValuesEncoded::PerGene(streams)
-    }
-
     fn size_in_bytes(&self) -> usize {
         match self {
             ColumnValuesEncoded::Global(stream) => stream.size_in_bytes(),
@@ -647,6 +636,13 @@ impl EncodedClusterBlock {
             EncodedClusterBlock::Column(block) => block.decode_rows(),
         }
     }
+
+    pub fn num_cells(&self) -> usize {
+        match self {
+            EncodedClusterBlock::RowMst(block) => block.num_cells(),
+            EncodedClusterBlock::Column(block) => block.num_cells as usize,
+        }
+    }
 }
 
 type SparseExpression = Vec<(u32, u16)>;
@@ -700,6 +696,19 @@ static COLUMN_TIMING_TEMPLATE_SELECT_US: AtomicU64 = AtomicU64::new(0);
 static COLUMN_TIMING_POSTING_DECISIONS_US: AtomicU64 = AtomicU64::new(0);
 static COLUMN_TIMING_STREAM_ENCODE_US: AtomicU64 = AtomicU64::new(0);
 
+static COLUMN_MEM_EXPRESSIONS_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_EXPRESSIONS_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_REORDERED_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_REORDERED_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_POSTINGS_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_POSTINGS_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_POSTING_ROWS_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_POSTING_ROWS_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_GENE_SPARSE_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_GENE_SPARSE_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_VALS_FLAT_BYTES: AtomicU64 = AtomicU64::new(0);
+static COLUMN_MEM_VALS_FLAT_MAX_BYTES: AtomicU64 = AtomicU64::new(0);
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RowMstOrderStats {
     pub projection_full_backrefs: u64,
@@ -730,6 +739,22 @@ pub struct CodecTimingStats {
     pub column_stream_encode_us: u64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ColumnMemoryStats {
+    pub expressions_bytes_total: u64,
+    pub expressions_bytes_max_tile: u64,
+    pub reordered_bytes_total: u64,
+    pub reordered_bytes_max_tile: u64,
+    pub postings_bytes_total: u64,
+    pub postings_bytes_max_tile: u64,
+    pub posting_rows_bytes_total: u64,
+    pub posting_rows_bytes_max_tile: u64,
+    pub gene_sparse_bytes_total: u64,
+    pub gene_sparse_bytes_max_tile: u64,
+    pub vals_flat_bytes_total: u64,
+    pub vals_flat_bytes_max_tile: u64,
+}
+
 pub fn reset_codec_timing_stats() {
     ROW_TIMING_EXPRESSIONS_US.store(0, Ordering::Relaxed);
     ROW_TIMING_BUILD_MST_US.store(0, Ordering::Relaxed);
@@ -742,6 +767,54 @@ pub fn reset_codec_timing_stats() {
     COLUMN_TIMING_TEMPLATE_SELECT_US.store(0, Ordering::Relaxed);
     COLUMN_TIMING_POSTING_DECISIONS_US.store(0, Ordering::Relaxed);
     COLUMN_TIMING_STREAM_ENCODE_US.store(0, Ordering::Relaxed);
+}
+
+pub fn reset_column_memory_stats() {
+    COLUMN_MEM_EXPRESSIONS_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_EXPRESSIONS_MAX_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_REORDERED_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_REORDERED_MAX_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_POSTINGS_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_POSTINGS_MAX_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_POSTING_ROWS_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_POSTING_ROWS_MAX_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_GENE_SPARSE_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_GENE_SPARSE_MAX_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_VALS_FLAT_BYTES.store(0, Ordering::Relaxed);
+    COLUMN_MEM_VALS_FLAT_MAX_BYTES.store(0, Ordering::Relaxed);
+}
+
+fn atomic_max(counter: &AtomicU64, value: u64) {
+    let mut current = counter.load(Ordering::Relaxed);
+    while value > current {
+        match counter.compare_exchange_weak(current, value, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn record_mem_stat(total: &AtomicU64, max_tile: &AtomicU64, bytes: usize) {
+    let bytes = bytes as u64;
+    total.fetch_add(bytes, Ordering::Relaxed);
+    atomic_max(max_tile, bytes);
+}
+
+pub fn column_memory_stats() -> ColumnMemoryStats {
+    ColumnMemoryStats {
+        expressions_bytes_total: COLUMN_MEM_EXPRESSIONS_BYTES.load(Ordering::Relaxed),
+        expressions_bytes_max_tile: COLUMN_MEM_EXPRESSIONS_MAX_BYTES.load(Ordering::Relaxed),
+        reordered_bytes_total: COLUMN_MEM_REORDERED_BYTES.load(Ordering::Relaxed),
+        reordered_bytes_max_tile: COLUMN_MEM_REORDERED_MAX_BYTES.load(Ordering::Relaxed),
+        postings_bytes_total: COLUMN_MEM_POSTINGS_BYTES.load(Ordering::Relaxed),
+        postings_bytes_max_tile: COLUMN_MEM_POSTINGS_MAX_BYTES.load(Ordering::Relaxed),
+        posting_rows_bytes_total: COLUMN_MEM_POSTING_ROWS_BYTES.load(Ordering::Relaxed),
+        posting_rows_bytes_max_tile: COLUMN_MEM_POSTING_ROWS_MAX_BYTES.load(Ordering::Relaxed),
+        gene_sparse_bytes_total: COLUMN_MEM_GENE_SPARSE_BYTES.load(Ordering::Relaxed),
+        gene_sparse_bytes_max_tile: COLUMN_MEM_GENE_SPARSE_MAX_BYTES.load(Ordering::Relaxed),
+        vals_flat_bytes_total: COLUMN_MEM_VALS_FLAT_BYTES.load(Ordering::Relaxed),
+        vals_flat_bytes_max_tile: COLUMN_MEM_VALS_FLAT_MAX_BYTES.load(Ordering::Relaxed),
+    }
 }
 
 pub fn codec_timing_stats() -> CodecTimingStats {
@@ -763,6 +836,14 @@ pub fn codec_timing_stats() -> CodecTimingStats {
 
 fn record_elapsed_us(counter: &AtomicU64, start: Instant) {
     counter.fetch_add(start.elapsed().as_micros() as u64, Ordering::Relaxed);
+}
+
+fn nested_vec_heap_bytes<T>(values: &Vec<Vec<T>>) -> usize {
+    values.capacity() * std::mem::size_of::<Vec<T>>()
+        + values
+            .iter()
+            .map(|inner| inner.capacity() * std::mem::size_of::<T>())
+            .sum::<usize>()
 }
 
 fn row_mst_traversal_and_offsets(
@@ -1608,11 +1689,21 @@ pub fn encode_subarray_column(
         .map(|p| compute_sparse_expression(p, data, gene_old_to_new))
         .collect();
     let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
+    record_mem_stat(
+        &COLUMN_MEM_EXPRESSIONS_BYTES,
+        &COLUMN_MEM_EXPRESSIONS_MAX_BYTES,
+        nested_vec_heap_bytes(&expressions_global) + nested_vec_heap_bytes(&expressions),
+    );
     let local_order = optimize_row_order_for_column(&expressions);
     let mut reordered = Vec::with_capacity(expressions.len());
     for &old_local in &local_order {
         reordered.push(expressions[old_local as usize].clone());
     }
+    record_mem_stat(
+        &COLUMN_MEM_REORDERED_BYTES,
+        &COLUMN_MEM_REORDERED_MAX_BYTES,
+        nested_vec_heap_bytes(&reordered),
+    );
 
     let mut postings: Vec<Vec<(u32, u16)>> = vec![Vec::new(); local_to_global_raw.len()];
     for (local_row, expr) in reordered.iter().enumerate() {
@@ -1621,6 +1712,11 @@ pub fn encode_subarray_column(
             postings[gene as usize].push((row_id, value));
         }
     }
+    record_mem_stat(
+        &COLUMN_MEM_POSTINGS_BYTES,
+        &COLUMN_MEM_POSTINGS_MAX_BYTES,
+        nested_vec_heap_bytes(&postings),
+    );
     record_elapsed_us(&COLUMN_TIMING_EXPRESSIONS_POSTINGS_US, t_expressions);
 
     let mut posting_modes_raw = Vec::<u32>::with_capacity(postings.len());
@@ -1645,13 +1741,17 @@ pub fn encode_subarray_column(
     let mut template_add_firsts = Vec::<u32>::new();
     let mut template_add_gaps = Vec::<u32>::new();
     let mut vals_flat = Vec::<u32>::new();
-    let mut vals_by_gene = Vec::<Vec<u32>>::with_capacity(postings.len());
 
     let t_gene_mst = Instant::now();
     let posting_rows: Vec<Vec<u32>> = postings
         .iter()
         .map(|entries| entries.iter().map(|&(row, _)| row).collect())
         .collect();
+    record_mem_stat(
+        &COLUMN_MEM_POSTING_ROWS_BYTES,
+        &COLUMN_MEM_POSTING_ROWS_MAX_BYTES,
+        nested_vec_heap_bytes(&posting_rows),
+    );
     let raw_support_costs: Vec<u64> = posting_rows
         .iter()
         .map(|rows| encoded_gene_only_cost_bytes(rows, index_codec))
@@ -1660,6 +1760,11 @@ pub fn encode_subarray_column(
     let num_genes = local_to_global_raw.len();
     let ref_parents = if p.allow_ref {
         let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
+        record_mem_stat(
+            &COLUMN_MEM_GENE_SPARSE_BYTES,
+            &COLUMN_MEM_GENE_SPARSE_MAX_BYTES,
+            nested_vec_heap_bytes(&gene_sparse),
+        );
         let gene_nonempty: Vec<bool> = gene_sparse.iter().map(|e| !e.is_empty()).collect();
         let kg = 8usize.min(num_genes.saturating_sub(1)).max(1);
         let (_, parent_g) = build_mst_kruskal(
@@ -1877,14 +1982,16 @@ pub fn encode_subarray_column(
             }
         };
 
-        let mut gene_vals = Vec::with_capacity(entries.len());
         for &(_, value) in entries {
             let v = value as u32;
             vals_flat.push(v);
-            gene_vals.push(v);
         }
-        vals_by_gene.push(gene_vals);
     }
+    record_mem_stat(
+        &COLUMN_MEM_VALS_FLAT_BYTES,
+        &COLUMN_MEM_VALS_FLAT_MAX_BYTES,
+        vals_flat.capacity() * std::mem::size_of::<u32>(),
+    );
     record_elapsed_us(&COLUMN_TIMING_POSTING_DECISIONS_US, t_posting_decisions);
 
     let t_stream_encode = Instant::now();
@@ -1938,13 +2045,7 @@ pub fn encode_subarray_column(
     let template_remove_gaps = EncodedU32Stream::from_slice(&template_remove_gaps, index_codec);
     let template_add_firsts = EncodedU32Stream::from_slice(&template_add_firsts, index_codec);
     let template_add_gaps = EncodedU32Stream::from_slice(&template_add_gaps, index_codec);
-    let vals_global = ColumnValuesEncoded::from_flat(&vals_flat);
-    let vals_per_gene = ColumnValuesEncoded::from_per_gene(&vals_by_gene);
-    let vals = if vals_per_gene.size_in_bytes() < vals_global.size_in_bytes() {
-        vals_per_gene
-    } else {
-        vals_global
-    };
+    let vals = ColumnValuesEncoded::from_flat(&vals_flat);
     record_elapsed_us(&COLUMN_TIMING_STREAM_ENCODE_US, t_stream_encode);
 
     Some((
