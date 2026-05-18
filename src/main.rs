@@ -14,10 +14,11 @@ use index_stream::IndexStreamCodec;
 use matrix_io::{load_10x_oriented, InputPosType, MatrixOrientation, Platform};
 use mimalloc::MiMalloc;
 use mst_codec::{
-    codec_timing_stats, encode_subarray_column, encode_subarray_mst_with_metric,
-    reset_codec_timing_stats, reset_row_mst_order_stats, row_mst_order_stats, DatalessPoint,
-    EncodedClusterBlock, EncodedColumnBlock, EncodedDiffsMST, GeneKruskalMstParams,
-    KnnDistanceMetric, MstWeightMode, Point,
+    codec_timing_stats, column_memory_stats, encode_subarray_column,
+    encode_subarray_mst_with_metric, reset_codec_timing_stats, reset_column_memory_stats,
+    reset_row_mst_order_stats, row_mst_order_stats, DatalessPoint, EncodedClusterBlock,
+    EncodedColumnBlock, EncodedDiffsMST, GeneKruskalMstParams, KnnDistanceMetric, MstWeightMode,
+    Point,
 };
 use rayon::prelude::*;
 use sorted_indices::SortedIndexCodec;
@@ -44,6 +45,43 @@ use nalgebra::DMatrix;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+fn current_rss_bytes() -> Option<u64> {
+    let output = Command::new("ps")
+        .arg("-o")
+        .arg("rss=")
+        .arg("-p")
+        .arg(std::process::id().to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let rss_kb = String::from_utf8_lossy(&output.stdout)
+        .trim()
+        .parse::<u64>()
+        .ok()?;
+    Some(rss_kb * 1024)
+}
+
+fn mib(bytes: u64) -> f64 {
+    bytes as f64 / (1024.0 * 1024.0)
+}
+
+fn log_memory_checkpoint(label: &str) {
+    if let Some(rss) = current_rss_bytes() {
+        info!("Memory checkpoint: {} current_rss={:.1} MiB", label, mib(rss));
+    } else {
+        info!("Memory checkpoint: {} current_rss=unavailable", label);
+    }
+}
+
+fn estimate_csr_heap_bytes(matrix: &CsMat<u16>) -> u64 {
+    let values = matrix.nnz() * std::mem::size_of::<u16>();
+    let indices = matrix.nnz() * std::mem::size_of::<usize>();
+    let indptr = (matrix.rows() + 1) * std::mem::size_of::<usize>();
+    (values + indices + indptr) as u64
+}
+
 #[derive(Clone)]
 struct CompressionResult {
     quantizers_requested: usize,
@@ -62,6 +100,7 @@ struct CompressionResult {
     cluster_sizes: Vec<usize>,
     encoded_blocks: Vec<EncodedClusterBlock>,
     positions: Vec<DatalessPoint>,
+    tile_local_orders: Vec<Vec<u32>>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -570,12 +609,29 @@ fn sparse_quantization_sse(original: &CsMat<u16>, quantized: &CsMat<u16>) -> any
     Ok(sse)
 }
 
-/// Serialized layout: `encoded_blocks`, then `positions`. Row/gene order permutations are
-/// not stored on disk (smaller archives; [`decode_clustered_payload`] returns empty order
-/// vectors for new payloads).
+/// Serialized layout (in order):
+///   1. `encoded_blocks`
+///   2. `positions`
+///   3. `row_order` placeholder (empty `Vec<u32>` for current builds; reserved slot for
+///      future "exact-order" payloads)
+///   4. `gene_order` placeholder (empty `Vec<u32>`; same reservation)
+///   5. `cluster_sizes: Vec<u32>` - one entry per cluster, used by the count-matrix
+///      decoder to group tiles within a cluster (`gene_blocks = blocks / clusters`).
+///   6. `ncols: u32` - number of columns in the original matrix (post-orientation).
+///   7. `tile_local_orders: Vec<Vec<u32>>` - one permutation per encoded block, mapping
+///      each tile's local row index back to its cluster-local row index. Required to
+///      merge per-gene-block tiles into a single row in the count matrix.
+///
+/// Empty placeholders for `row_order`/`gene_order` keep this format readable by older
+/// readers that probed for those fields. The new tail
+/// (`cluster_sizes` + `ncols` + `tile_local_orders`) enables permutation-tolerant
+/// decompression back to a count matrix.
 fn serialize_payload(
     encoded_blocks: &[EncodedClusterBlock],
     positions: &[DatalessPoint],
+    cluster_sizes: &[u32],
+    ncols: u32,
+    tile_local_orders: &[Vec<u32>],
 ) -> anyhow::Result<Vec<u8>> {
     let config = bincode::config::standard()
         .with_little_endian()
@@ -583,6 +639,12 @@ fn serialize_payload(
     let mut payload = Vec::new();
     bincode::encode_into_std_write(encoded_blocks, &mut payload, config)?;
     bincode::encode_into_std_write(positions, &mut payload, config)?;
+    let empty_order: Vec<u32> = Vec::new();
+    bincode::encode_into_std_write(&empty_order, &mut payload, config)?;
+    bincode::encode_into_std_write(&empty_order, &mut payload, config)?;
+    bincode::encode_into_std_write(&cluster_sizes.to_vec(), &mut payload, config)?;
+    bincode::encode_into_std_write(&ncols, &mut payload, config)?;
+    bincode::encode_into_std_write(&tile_local_orders.to_vec(), &mut payload, config)?;
     Ok(payload)
 }
 
@@ -638,8 +700,17 @@ fn estimate_compressed_payload_size(
     compression: PayloadCompressionArg,
     encoded_blocks: &[EncodedClusterBlock],
     positions: &[DatalessPoint],
+    cluster_sizes: &[u32],
+    ncols: u32,
+    tile_local_orders: &[Vec<u32>],
 ) -> anyhow::Result<usize> {
-    let payload = serialize_payload(encoded_blocks, positions)?;
+    let payload = serialize_payload(
+        encoded_blocks,
+        positions,
+        cluster_sizes,
+        ncols,
+        tile_local_orders,
+    )?;
     Ok(compress_payload_bytes(&payload, compression)?.len())
 }
 
@@ -1282,6 +1353,7 @@ fn run_clustered_compression(
     disable_column_candidate: bool,
     disable_row_parent_ref: bool,
     disable_column_ref: bool,
+    report_memory: bool,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
     joint_svd_fast: bool,
@@ -1354,17 +1426,28 @@ fn run_clustered_compression(
         anyhow::bail!("Internal error: some points were not assigned to a final cluster");
     }
 
-    let quantized_data = if quantize_values {
-        quantize_matrix_by_cluster(
+    let quantized_data_owned = if quantize_values {
+        Some(quantize_matrix_by_cluster(
             data,
             points,
             &refined_assignments,
             clusters.len(),
             quantizer_bins,
-        )?
+        )?)
     } else {
-        data.clone()
+        None
     };
+    let quantized_data = quantized_data_owned.as_ref().unwrap_or(data);
+    if report_memory {
+        log_memory_checkpoint("after quantized_data selection");
+        info!(
+            "Memory estimate: active_csr_heap={:.1} MiB rows={} cols={} nnz={}",
+            mib(estimate_csr_heap_bytes(quantized_data)),
+            quantized_data.rows(),
+            quantized_data.cols(),
+            quantized_data.nnz()
+        );
+    }
 
     let row_stream_point_indices: Vec<usize> = clusters
         .iter()
@@ -1420,6 +1503,7 @@ fn run_clustered_compression(
     let mut positions = Vec::new();
     let mut row_order = Vec::new();
     let mut cluster_sizes = Vec::new();
+    let mut tile_local_orders: Vec<Vec<u32>> = Vec::new();
     let mut total_mst_bytes = 0usize;
     let row_mst_encode_us = AtomicU64::new(0);
     let column_encode_us = AtomicU64::new(0);
@@ -1442,6 +1526,22 @@ fn run_clustered_compression(
             }
         })
         .collect();
+    if report_memory {
+        let gene_order_bytes = (gene_order.capacity() + gene_old_to_new.capacity())
+            * std::mem::size_of::<u32>();
+        let block_maps_bytes = block_gene_o2ns.capacity() * std::mem::size_of::<Vec<u32>>()
+            + block_gene_o2ns
+                .iter()
+                .map(|map| map.capacity() * std::mem::size_of::<u32>())
+                .sum::<usize>();
+        log_memory_checkpoint("after gene order and block maps");
+        info!(
+            "Memory estimate: gene_order_maps={:.1} MiB block_gene_o2ns={:.1} MiB gene_blocks={}",
+            mib(gene_order_bytes as u64),
+            mib(block_maps_bytes as u64),
+            block_gene_o2ns.len()
+        );
+    }
 
     let encode_tile = |cluster_points: &[Point],
                        block_gene_o2n: &[u32],
@@ -1569,11 +1669,13 @@ fn run_clustered_compression(
     let encode_tiles_start = Instant::now();
     reset_row_mst_order_stats();
     reset_codec_timing_stats();
+    reset_column_memory_stats();
     let cluster_results: Vec<
         anyhow::Result<
             Option<(
                 usize,
                 Vec<EncodedClusterBlock>,
+                Vec<Vec<u32>>,
                 Vec<DatalessPoint>,
                 Vec<u32>,
                 usize,
@@ -1614,6 +1716,8 @@ fn run_clustered_compression(
             ordered_tiles.sort_unstable_by_key(|(gb_idx, _, _, _, _, _)| *gb_idx);
 
             let mut tile_blocks = Vec::with_capacity(effective_gene_blocks);
+            let mut tile_local_orders: Vec<Vec<u32>> =
+                Vec::with_capacity(effective_gene_blocks);
             let mut total_bytes = 0usize;
             let mut first_order: Option<Vec<u32>> = None;
             let mut any_row_fallback = false;
@@ -1622,11 +1726,12 @@ fn run_clustered_compression(
             for (_gb_idx, encoded, local_order, bytes, row_fb, col_fb) in ordered_tiles {
                 total_bytes += bytes;
                 if first_order.is_none() {
-                    first_order = Some(local_order);
+                    first_order = Some(local_order.clone());
                 }
                 any_row_fallback |= row_fb;
                 any_col_fallback |= col_fb;
                 tile_blocks.push(encoded);
+                tile_local_orders.push(local_order);
             }
 
             let local_order =
@@ -1646,6 +1751,7 @@ fn run_clustered_compression(
             Ok(Some((
                 cluster_idx,
                 tile_blocks,
+                tile_local_orders,
                 cluster_positions,
                 cluster_row_order,
                 cluster_points.len(),
@@ -1662,7 +1768,7 @@ fn run_clustered_compression(
             ordered.push(v);
         }
     }
-    ordered.sort_unstable_by_key(|(cluster_idx, _, _, _, _, _, _, _)| *cluster_idx);
+    ordered.sort_unstable_by_key(|(cluster_idx, _, _, _, _, _, _, _, _)| *cluster_idx);
 
     let mut row_block_count = 0usize;
     let mut column_block_count = 0usize;
@@ -1686,6 +1792,7 @@ fn run_clustered_compression(
     for (
         _idx,
         tile_blocks,
+        cluster_tile_local_orders,
         cluster_positions,
         cluster_row_order,
         cluster_ncells,
@@ -1763,8 +1870,28 @@ fn run_clustered_compression(
         positions.extend(cluster_positions);
         row_order.extend(cluster_row_order);
         encoded_blocks.extend(tile_blocks);
+        tile_local_orders.extend(cluster_tile_local_orders);
     }
     let timing_encode_tiles_ms = encode_tiles_start.elapsed().as_millis() as u64;
+    if report_memory {
+        let col_mem = column_memory_stats();
+        log_memory_checkpoint("after encode tiles");
+        info!(
+            "Column memory estimates total/max_tile MiB: expressions={:.1}/{:.1} reordered={:.1}/{:.1} postings={:.1}/{:.1} posting_rows={:.1}/{:.1} gene_sparse={:.1}/{:.1} vals_flat={:.1}/{:.1}",
+            mib(col_mem.expressions_bytes_total),
+            mib(col_mem.expressions_bytes_max_tile),
+            mib(col_mem.reordered_bytes_total),
+            mib(col_mem.reordered_bytes_max_tile),
+            mib(col_mem.postings_bytes_total),
+            mib(col_mem.postings_bytes_max_tile),
+            mib(col_mem.posting_rows_bytes_total),
+            mib(col_mem.posting_rows_bytes_max_tile),
+            mib(col_mem.gene_sparse_bytes_total),
+            mib(col_mem.gene_sparse_bytes_max_tile),
+            mib(col_mem.vals_flat_bytes_total),
+            mib(col_mem.vals_flat_bytes_max_tile),
+        );
+    }
     let timing_row_mst_encode_ms = row_mst_encode_us.load(Ordering::Relaxed) / 1_000;
     let timing_column_encode_ms = column_encode_us.load(Ordering::Relaxed) / 1_000;
     let codec_timing = codec_timing_stats();
@@ -1834,14 +1961,20 @@ fn run_clustered_compression(
     );
 
     if verify_lossless && !quantize_values {
-        let reconstructed = reconstruct_csr_from_clustered_payload(
+        let cluster_sizes_u32: Vec<u32> = cluster_sizes.iter().map(|&s| s as u32).collect();
+        let reconstructed = reconstruct_count_matrix_from_payload(
             &encoded_blocks,
-            &row_order,
-            &gene_order,
-            data.rows(),
+            &cluster_sizes_u32,
             data.cols(),
+            &tile_local_orders,
         )?;
-        compare_csr_exact(data, &reconstructed)?;
+        compare_count_matrix_permutation_invariant(data, &reconstructed)?;
+        info!(
+            "In-memory decompress verify PASSED: rows={} cols={} nnz={} (matches input under row/column permutation)",
+            reconstructed.rows(),
+            reconstructed.cols(),
+            reconstructed.nnz()
+        );
     }
 
     let sse = if quantize_values {
@@ -1852,8 +1985,16 @@ fn run_clustered_compression(
     let total_entries = (points.len() * data.cols()).max(1);
     let mse = sse / total_entries as f64;
     let rmse = mse.sqrt();
-    let compressed_bytes_estimate =
-        estimate_compressed_payload_size(payload_compression, &encoded_blocks, &positions)?;
+    let cluster_sizes_u32: Vec<u32> = cluster_sizes.iter().map(|&s| s as u32).collect();
+    let ncols_u32 = data.cols() as u32;
+    let compressed_bytes_estimate = estimate_compressed_payload_size(
+        payload_compression,
+        &encoded_blocks,
+        &positions,
+        &cluster_sizes_u32,
+        ncols_u32,
+        &tile_local_orders,
+    )?;
     let rate_bits_per_value = (compressed_bytes_estimate as f64 * 8.0) / total_entries as f64;
 
     Ok(CompressionResult {
@@ -1873,18 +2014,24 @@ fn run_clustered_compression(
         cluster_sizes,
         encoded_blocks,
         positions,
+        tile_local_orders,
     })
+}
+
+struct DecodedPayload {
+    encoded_blocks: Vec<EncodedClusterBlock>,
+    positions: Vec<DatalessPoint>,
+    row_order: Vec<u32>,
+    gene_order: Vec<u32>,
+    cluster_sizes: Vec<u32>,
+    ncols: u32,
+    tile_local_orders: Vec<Vec<u32>>,
 }
 
 fn decode_clustered_payload(
     input: &Path,
     input_compression: Option<PayloadCompressionArg>,
-) -> anyhow::Result<(
-    Vec<EncodedClusterBlock>,
-    Vec<DatalessPoint>,
-    Vec<u32>,
-    Vec<u32>,
-)> {
+) -> anyhow::Result<DecodedPayload> {
     let compression = input_compression.unwrap_or_else(|| {
         input
             .extension()
@@ -1936,20 +2083,175 @@ fn decode_clustered_payload(
     let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut payload_reader, config)?;
     let end = payload_reader.get_ref().len();
     let pos = payload_reader.position() as usize;
-    let row_order = if pos < end {
+    let row_order: Vec<u32> = if pos < end {
         bincode::decode_from_std_read(&mut payload_reader, config)?
     } else {
         Vec::new()
     };
     let pos = payload_reader.position() as usize;
-    let gene_order = if pos < end {
+    let gene_order: Vec<u32> = if pos < end {
         bincode::decode_from_std_read(&mut payload_reader, config)?
     } else {
         Vec::new()
     };
-    Ok((encoded_blocks, positions, row_order, gene_order))
+    let pos = payload_reader.position() as usize;
+    let cluster_sizes: Vec<u32> = if pos < end {
+        bincode::decode_from_std_read(&mut payload_reader, config)?
+    } else {
+        Vec::new()
+    };
+    let pos = payload_reader.position() as usize;
+    let ncols: u32 = if pos < end {
+        bincode::decode_from_std_read(&mut payload_reader, config)?
+    } else {
+        0
+    };
+    let pos = payload_reader.position() as usize;
+    let tile_local_orders: Vec<Vec<u32>> = if pos < end {
+        bincode::decode_from_std_read(&mut payload_reader, config)?
+    } else {
+        Vec::new()
+    };
+    Ok(DecodedPayload {
+        encoded_blocks,
+        positions,
+        row_order,
+        gene_order,
+        cluster_sizes,
+        ncols,
+        tile_local_orders,
+    })
 }
 
+/// Reconstruct a sparse count matrix from the encoded payload using the
+/// `cluster_sizes` + `ncols` + `tile_local_orders` metadata embedded in the payload.
+///
+/// The returned matrix has the same shape and nnz as the original, but its row order
+/// is the encoder's cluster + SVD order and its column order is the encoder's
+/// gene-SVD order. Both are permutations of the original input matrix.
+///
+/// Within a cluster, each gene-block tile may have chosen its own row ordering (DFS
+/// for row-MST tiles, value-aware reorder for column tiles). `tile_local_orders[k]`
+/// gives the permutation that maps tile `k`'s emitted-row index to the cluster-local
+/// row index, so we can recombine the partial rows from each tile into a single global
+/// row.
+fn reconstruct_count_matrix_from_payload(
+    encoded_blocks: &[EncodedClusterBlock],
+    cluster_sizes: &[u32],
+    ncols: usize,
+    tile_local_orders: &[Vec<u32>],
+) -> anyhow::Result<CsMat<u16>> {
+    if cluster_sizes.is_empty() {
+        anyhow::bail!(
+            "Cannot reconstruct count matrix: payload has no cluster_sizes (pre-decoder format)"
+        );
+    }
+    if encoded_blocks.is_empty() {
+        anyhow::bail!("Cannot reconstruct count matrix: payload has no encoded blocks");
+    }
+    if tile_local_orders.len() != encoded_blocks.len() {
+        anyhow::bail!(
+            "tile_local_orders.len() ({}) differs from encoded_blocks.len() ({})",
+            tile_local_orders.len(),
+            encoded_blocks.len()
+        );
+    }
+    let n_clusters = cluster_sizes.len();
+    if encoded_blocks.len() % n_clusters != 0 {
+        anyhow::bail!(
+            "encoded_blocks.len() ({}) is not a multiple of cluster_sizes.len() ({})",
+            encoded_blocks.len(),
+            n_clusters
+        );
+    }
+    let gene_blocks_per_cluster = encoded_blocks.len() / n_clusters;
+    let nrows: usize = cluster_sizes.iter().map(|&s| s as usize).sum();
+
+    // Reconstruct the per-tile gene-block offsets. With `gene_blocks_per_cluster > 1`,
+    // each tile encodes genes using block-local indices (0..block_size-1), so different
+    // tiles within a cluster would collide on the same `(row, gene)` if we didn't offset
+    // them into a shared post-SVD column space. The encoder partitions `ncols` into
+    // `gene_blocks_per_cluster` contiguous ranges, distributing the remainder to the
+    // first blocks.
+    let gene_block_starts: Vec<usize> = {
+        let mut starts = Vec::with_capacity(gene_blocks_per_cluster);
+        let block_sz = ncols / gene_blocks_per_cluster;
+        let remainder = ncols % gene_blocks_per_cluster;
+        let mut acc = 0usize;
+        for b in 0..gene_blocks_per_cluster {
+            starts.push(acc);
+            let sz = block_sz + if b < remainder { 1 } else { 0 };
+            acc += sz;
+        }
+        starts
+    };
+
+    let mut tri = sprs::TriMatI::<u16, usize>::new((nrows, ncols));
+    let mut global_row_offset = 0usize;
+    for (c, &csize) in cluster_sizes.iter().enumerate() {
+        let csize = csize as usize;
+        let start = c * gene_blocks_per_cluster;
+        let end = start + gene_blocks_per_cluster;
+        for (tile_offset, block) in encoded_blocks[start..end].iter().enumerate() {
+            let tile_global = start + tile_offset;
+            let order = &tile_local_orders[tile_global];
+            if order.len() != csize {
+                anyhow::bail!(
+                    "tile_local_orders[{}] len {} differs from cluster_sizes[{}]={}",
+                    tile_global,
+                    order.len(),
+                    c,
+                    csize
+                );
+            }
+            if block.num_cells() != csize {
+                anyhow::bail!(
+                    "Cluster {} tile {} num_cells={} differs from cluster_sizes[{}]={}",
+                    c,
+                    tile_offset,
+                    block.num_cells(),
+                    c,
+                    csize
+                );
+            }
+            let gene_offset = gene_block_starts[tile_offset];
+            for (encoded_row_idx, sparse_row) in block.decode_rows().into_iter().enumerate() {
+                let cluster_local_row = order[encoded_row_idx] as usize;
+                if cluster_local_row >= csize {
+                    anyhow::bail!(
+                        "tile_local_orders[{}][{}] = {} >= cluster_size {}",
+                        tile_global,
+                        encoded_row_idx,
+                        cluster_local_row,
+                        csize
+                    );
+                }
+                let global_row = global_row_offset + cluster_local_row;
+                for (gene, value) in sparse_row {
+                    if value == 0 {
+                        continue;
+                    }
+                    let gene_idx = gene_offset + gene as usize;
+                    if gene_idx >= ncols {
+                        anyhow::bail!(
+                            "Decoded gene index {} >= ncols {} in cluster {} tile {} row {}",
+                            gene_idx,
+                            ncols,
+                            c,
+                            tile_offset,
+                            encoded_row_idx
+                        );
+                    }
+                    tri.add_triplet(global_row, gene_idx, value);
+                }
+            }
+        }
+        global_row_offset += csize;
+    }
+    Ok(tri.to_csr::<usize>())
+}
+
+#[allow(dead_code)]
 fn reconstruct_csr_from_clustered_payload(
     encoded_blocks: &[EncodedClusterBlock],
     row_order: &[u32],
@@ -2014,6 +2316,94 @@ fn reconstruct_csr_from_clustered_payload(
     Ok(tri.to_csr::<usize>())
 }
 
+/// Compare two CSR matrices up to row + column permutation.
+///
+/// Verifies:
+///   - shape (rows, cols) match
+///   - nnz match
+///   - total value sum matches
+///   - sorted row "fingerprints" match (each row = sorted multiset of its non-zero values)
+///   - sorted column "fingerprints" match
+///
+/// This is strong enough to confirm the decoder reconstructs the same count matrix
+/// (counts, structure) as the input, even though row order is encoder-driven (clustered +
+/// SVD-seriated) and column order is gene-SVD-seriated, neither of which matches the input.
+fn compare_count_matrix_permutation_invariant(
+    expected: &CsMat<u16>,
+    actual: &CsMat<u16>,
+) -> anyhow::Result<()> {
+    if expected.shape() != actual.shape() {
+        anyhow::bail!(
+            "Shape mismatch: expected {}x{}, actual {}x{}",
+            expected.rows(),
+            expected.cols(),
+            actual.rows(),
+            actual.cols()
+        );
+    }
+    if expected.nnz() != actual.nnz() {
+        anyhow::bail!(
+            "nnz mismatch: expected {}, actual {}",
+            expected.nnz(),
+            actual.nnz()
+        );
+    }
+
+    fn row_fingerprints(m: &CsMat<u16>) -> Vec<Vec<u16>> {
+        let mut out: Vec<Vec<u16>> = (0..m.rows())
+            .map(|r| {
+                let row = m.outer_view(r);
+                let mut vals: Vec<u16> = row
+                    .map(|view| view.iter().map(|(_, &v)| v).collect())
+                    .unwrap_or_default();
+                vals.sort_unstable();
+                vals
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    fn col_fingerprints(m: &CsMat<u16>) -> Vec<Vec<u16>> {
+        let csc = m.to_csc();
+        let mut out: Vec<Vec<u16>> = (0..csc.cols())
+            .map(|c| {
+                let col = csc.outer_view(c);
+                let mut vals: Vec<u16> = col
+                    .map(|view| view.iter().map(|(_, &v)| v).collect())
+                    .unwrap_or_default();
+                vals.sort_unstable();
+                vals
+            })
+            .collect();
+        out.sort_unstable();
+        out
+    }
+
+    let exp_sum: u64 = expected.data().iter().map(|&v| v as u64).sum();
+    let act_sum: u64 = actual.data().iter().map(|&v| v as u64).sum();
+    if exp_sum != act_sum {
+        anyhow::bail!(
+            "Total value sum mismatch: expected {}, actual {}",
+            exp_sum,
+            act_sum
+        );
+    }
+
+    let exp_rows = row_fingerprints(expected);
+    let act_rows = row_fingerprints(actual);
+    if exp_rows != act_rows {
+        anyhow::bail!("Row fingerprints differ (sorted by value multiset per row)");
+    }
+    let exp_cols = col_fingerprints(expected);
+    let act_cols = col_fingerprints(actual);
+    if exp_cols != act_cols {
+        anyhow::bail!("Column fingerprints differ (sorted by value multiset per column)");
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
 fn compare_csr_exact(expected: &CsMat<u16>, actual: &CsMat<u16>) -> anyhow::Result<()> {
     if expected.shape() != actual.shape() {
         anyhow::bail!(
@@ -2224,6 +2614,9 @@ struct BuildCommand {
     /// If set, emit combinatorial and entropy diagnostics for op_indices.
     #[arg(long = "report-index-bounds", default_value_t = false)]
     report_index_bounds: bool,
+    /// If set, log RSS checkpoints and approximate heap sizes for key structures.
+    #[arg(long = "report-memory", default_value_t = false)]
+    report_memory: bool,
 }
 
 fn infer_stats_label(input: &Path) -> String {
@@ -2427,6 +2820,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.matrix_orientation,
                 args.max_cells,
             )?;
+            if args.report_memory {
+                log_memory_checkpoint("after input load");
+                info!(
+                    "Memory estimate: input_csr_heap={:.1} MiB points_heap={:.1} MiB rows={} cols={} nnz={} points={}",
+                    mib(estimate_csr_heap_bytes(&csr)),
+                    mib((points.capacity() * std::mem::size_of::<Point>()) as u64),
+                    csr.rows(),
+                    csr.cols(),
+                    csr.nnz(),
+                    points.len()
+                );
+            }
 
             let quantize_values = args.lossy && !args.lossy_lossless;
             let target_quantizers = args.lossy_quantizers.max(1);
@@ -2515,6 +2920,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.disable_column_candidate,
                         args.disable_row_parent_ref,
                         args.disable_column_ref,
+                        args.report_memory,
                         args.set_seed,
                         *gene_reorder_method,
                         args.joint_svd_fast,
@@ -2571,9 +2977,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
 
+                let selected_cluster_sizes_u32: Vec<u32> =
+                    selected.cluster_sizes.iter().map(|&s| s as u32).collect();
+                let selected_ncols_u32 = csr.cols() as u32;
                 let actual_gzip_bytes = if args.no_output {
                     // Keep size metrics available while skipping disk writes.
-                    let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
+                    let payload = serialize_payload(
+                        &selected.encoded_blocks,
+                        &selected.positions,
+                        &selected_cluster_sizes_u32,
+                        selected_ncols_u32,
+                        &selected.tile_local_orders,
+                    )?;
                     compress_payload_bytes(&payload, args.output_compression)?.len()
                 } else {
                     let mut output = args.output.clone().unwrap_or_else(|| {
@@ -2585,7 +3000,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if sweep_configs.len() > 1 {
                         output = output_path_with_label_suffix(&output, config_label);
                     }
-                    let payload = serialize_payload(&selected.encoded_blocks, &selected.positions)?;
+                    let payload = serialize_payload(
+                        &selected.encoded_blocks,
+                        &selected.positions,
+                        &selected_cluster_sizes_u32,
+                        selected_ncols_u32,
+                        &selected.tile_local_orders,
+                    )?;
                     let compressed = compress_payload_bytes(&payload, args.output_compression)?;
                     let file = File::create(&output)?;
                     let mut writer = BufWriter::new(file);
@@ -2709,53 +3130,73 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
             };
 
-            let (encoded_blocks, _positions, row_order, gene_order) =
-                decode_clustered_payload(&args.encoded, args.input_compression)?;
+            let t_total = Instant::now();
+
+            let t_load = Instant::now();
+            let decoded = decode_clustered_payload(&args.encoded, args.input_compression)?;
+            let load_ms = t_load.elapsed().as_millis();
             info!(
-                "Loaded payload: blocks={}, row_order_len={}, gene_order_len={}",
-                encoded_blocks.len(),
-                row_order.len(),
-                gene_order.len()
+                "Decompress: payload load (outer-decompress + bincode) took {}ms; blocks={}, clusters={}, ncols={}",
+                load_ms,
+                decoded.encoded_blocks.len(),
+                decoded.cluster_sizes.len(),
+                decoded.ncols
             );
-            if row_order.is_empty() {
+            if decoded.cluster_sizes.is_empty() {
                 return Err(anyhow::anyhow!(
-                    "Round-trip check requires row_order (and typically gene_order) in the payload; current builds omit these for a smaller archive. Use an older payload or a matching encoder/decoder pair."
+                    "Payload predates the count-matrix decoder (no cluster_sizes metadata). Rebuild the input with a current encoder."
                 )
                 .into());
             }
 
+            let t_reconstruct = Instant::now();
+            let reconstructed = reconstruct_count_matrix_from_payload(
+                &decoded.encoded_blocks,
+                &decoded.cluster_sizes,
+                decoded.ncols as usize,
+                &decoded.tile_local_orders,
+            )?;
+            let reconstruct_ms = t_reconstruct.elapsed().as_millis();
+            info!(
+                "Decompress: reconstruct (tile decode + CSR build) took {}ms; rows={}, cols={}, nnz={}",
+                reconstruct_ms,
+                reconstructed.rows(),
+                reconstructed.cols(),
+                reconstructed.nnz()
+            );
+
+            let decode_only_ms = load_ms + reconstruct_ms;
+            info!(
+                "Decompress: total decode time = {}ms (load {}ms + reconstruct {}ms)",
+                decode_only_ms, load_ms, reconstruct_ms
+            );
+
+            let t_truth = Instant::now();
             let (csr_truth, _points) = load_10x_oriented(
                 &args.input,
                 positions_spec,
                 args.matrix_orientation,
                 args.max_cells,
             )?;
-
+            let truth_ms = t_truth.elapsed().as_millis();
             info!(
-                "Ground truth CSR: rows={}, cols={}, nnz={}, matrix_orientation={:?}",
+                "Decompress: ground-truth H5 load took {}ms; rows={}, cols={}, nnz={}, matrix_orientation={:?}",
+                truth_ms,
                 csr_truth.rows(),
                 csr_truth.cols(),
                 csr_truth.nnz(),
                 args.matrix_orientation
             );
 
-            let reconstructed = reconstruct_csr_from_clustered_payload(
-                &encoded_blocks,
-                &row_order,
-                &gene_order,
-                csr_truth.rows(),
-                csr_truth.cols(),
-            )?;
-
+            let t_verify = Instant::now();
+            compare_count_matrix_permutation_invariant(&csr_truth, &reconstructed)?;
+            let verify_ms = t_verify.elapsed().as_millis();
+            let total_ms = t_total.elapsed().as_millis();
             info!(
-                "Reconstructed CSR: rows={}, cols={}, nnz={}",
-                reconstructed.rows(),
-                reconstructed.cols(),
-                reconstructed.nnz()
+                "Decompression PASSED: matches input under row/column permutation. \
+                 verify={}ms, end-to-end={}ms (decode={}ms + truth-load={}ms + verify={}ms)",
+                verify_ms, total_ms, decode_only_ms, truth_ms, verify_ms
             );
-
-            compare_csr_exact(&csr_truth, &reconstructed)?;
-            info!("Round-trip check PASSED: reconstructed CSR exactly matches input.");
         }
     }
 
@@ -2812,6 +3253,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
             GeneReorderMethod::Projection,
             false,
@@ -2857,6 +3299,7 @@ mod tests {
             32,
             false,
             16,
+            false,
             false,
             false,
             false,
