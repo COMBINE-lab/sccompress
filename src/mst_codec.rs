@@ -8,7 +8,7 @@ use petgraph::graph::UnGraph;
 use petgraph::visit::EdgeRef;
 use rayon::prelude::*;
 use sprs::CsMat;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -898,40 +898,22 @@ fn compute_sparse_expression(
     expression
 }
 
-fn build_local_gene_remap(expressions: &[SparseExpression]) -> (Vec<SparseExpression>, Vec<u32>) {
-    let mut local_to_global = Vec::<u32>::new();
-    for expr in expressions {
-        for &(gene, _) in expr {
-            local_to_global.push(gene);
-        }
-    }
-    local_to_global.sort_unstable();
-    local_to_global.dedup();
-
-    if local_to_global.is_empty() {
-        return (expressions.to_vec(), local_to_global);
-    }
-
-    let mut global_to_local = HashMap::<u32, u32>::with_capacity(local_to_global.len());
-    for (local, &global) in local_to_global.iter().enumerate() {
-        global_to_local.insert(global, local as u32);
-    }
-
-    let remapped = expressions
-        .iter()
-        .map(|expr| {
-            expr.iter()
-                .map(|&(gene, value)| {
-                    let local_gene = *global_to_local
-                        .get(&gene)
-                        .expect("global gene must exist in cluster dictionary");
-                    (local_gene, value)
-                })
-                .collect::<SparseExpression>()
-        })
-        .collect::<Vec<_>>();
-
-    (remapped, local_to_global)
+/// Build the per-tile `local_to_global` dictionary as the identity mapping
+/// `0..gene_block_size-1`. Gene indices in `expressions` are already in-block
+/// offsets (the caller filters with `gene_old_to_new`), so the dictionary is
+/// just an identity stream that compresses to ~0 bytes after entropy coding,
+/// and the decoder recovers the global gene id as
+/// `gene_block_start + in_block_offset`.
+///
+/// `gene_block_size` is required so that downstream loops that iterate over the
+/// dictionary (e.g. posting modes/counts) cover the whole gene block; entries
+/// for inactive columns end up empty and compress for free.
+fn build_local_gene_remap_identity(
+    expressions: &[SparseExpression],
+    gene_block_size: u32,
+) -> (Vec<SparseExpression>, Vec<u32>) {
+    let local_to_global: Vec<u32> = (0..gene_block_size).collect();
+    (expressions.to_vec(), local_to_global)
 }
 
 fn support_projection_weight(idx: u32, seed: u64) -> f64 {
@@ -1678,6 +1660,7 @@ pub fn encode_subarray_column(
     template_adaptive: bool,
     template_max: usize,
     gene_kruskal_mst: GeneKruskalMstParams,
+    gene_block_size: Option<u32>,
 ) -> Option<(EncodedColumnBlock, Vec<u32>)> {
     if points.is_empty() {
         return None;
@@ -1688,7 +1671,9 @@ pub fn encode_subarray_column(
         .par_iter()
         .map(|p| compute_sparse_expression(p, data, gene_old_to_new))
         .collect();
-    let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
+    let resolved_block_size = gene_block_size.unwrap_or(data.cols() as u32);
+    let (expressions, local_to_global_raw) =
+        build_local_gene_remap_identity(&expressions_global, resolved_block_size);
     record_mem_stat(
         &COLUMN_MEM_EXPRESSIONS_BYTES,
         &COLUMN_MEM_EXPRESSIONS_MAX_BYTES,
@@ -2094,6 +2079,7 @@ pub fn encode_subarray_mst_with_metric(
     row_template_adaptive: bool,
     row_template_max: usize,
     allow_parent_ref: bool,
+    gene_block_size: Option<u32>,
 ) -> Option<(EncodedDiffsMST, Vec<u32>)> {
     if points.is_empty() {
         return None;
@@ -2103,7 +2089,9 @@ pub fn encode_subarray_mst_with_metric(
         .par_iter()
         .map(|p| compute_sparse_expression(p, data, gene_old_to_new))
         .collect();
-    let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
+    let resolved_block_size = gene_block_size.unwrap_or(data.cols() as u32);
+    let (expressions, local_to_global_raw) =
+        build_local_gene_remap_identity(&expressions_global, resolved_block_size);
     record_elapsed_us(&ROW_TIMING_EXPRESSIONS_US, t_expressions);
 
     let t_build_mst = Instant::now();
@@ -2506,6 +2494,7 @@ pub fn encode_subarray_mst(
         false,
         0,
         true,
+        None,
     )
 }
 
@@ -2925,6 +2914,7 @@ mod tests {
             false,
             32,
             gene_cfg,
+            None,
         )
         .expect("column encoding should succeed");
         let decoded_rows = encoded.decode_rows();
@@ -2997,7 +2987,8 @@ mod tests {
             .iter()
             .map(|p| compute_sparse_expression(p, &csr, None))
             .collect();
-        let (expressions, local_to_global_raw) = build_local_gene_remap(&expressions_global);
+        let (expressions, local_to_global_raw) =
+            build_local_gene_remap_identity(&expressions_global, csr.cols() as u32);
         let num_genes = local_to_global_raw.len();
         let gene_sparse = sparse_vectors_per_local_gene(&expressions, num_genes);
         let k_gene = 8usize.min(num_genes.saturating_sub(1)).max(1);
@@ -3030,6 +3021,7 @@ mod tests {
             false,
             32,
             gene_cfg,
+            None,
         )
         .expect("column Kruskal gene-MST ref parents");
 
@@ -3047,6 +3039,7 @@ mod tests {
             false,
             32,
             true,
+            None,
         )
         .expect("row-MST projection-full-backrefs stream");
 

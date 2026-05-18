@@ -1545,8 +1545,13 @@ fn run_clustered_compression(
 
     let encode_tile = |cluster_points: &[Point],
                        block_gene_o2n: &[u32],
+                       gene_block_size: u32,
                        cluster_idx: usize|
      -> anyhow::Result<(EncodedClusterBlock, Vec<u32>, usize, bool, bool)> {
+        // `local_to_global` is always the identity over the tile's gene block (size B).
+        // The decoder recovers the global gene as `gene_block_start + in_block_offset`,
+        // so the per-tile dictionary collapses to ~0 bytes after entropy coding.
+        let gene_block_size_hint: Option<u32> = Some(gene_block_size);
         let mut row_selected_adaptive = false;
         let mut col_selected_adaptive = false;
 
@@ -1570,6 +1575,7 @@ fn run_clustered_compression(
                     adaptive,
                     row_template_max,
                     !disable_row_parent_ref,
+                    gene_block_size_hint,
                 );
                 row_mst_encode_us.fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
                 if let Some((row_block, traversal_order)) = encoded {
@@ -1617,6 +1623,7 @@ fn run_clustered_compression(
                     adaptive,
                     column_template_max,
                     gene_kruskal_cfg,
+                    gene_block_size_hint,
                 ) {
                     let (col_block, order) = col_block;
                     let bytes = col_block.total_bytes();
@@ -1703,8 +1710,10 @@ fn run_clustered_compression(
                 .par_iter()
                 .enumerate()
                 .map(|(gb_idx, block_gene_o2n)| {
+                    let gene_block_range = &gene_block_ranges[gb_idx];
+                    let gene_block_size = gene_block_range.end - gene_block_range.start;
                     let (encoded, local_order, bytes, row_fb, col_fb) =
-                        encode_tile(&cluster_points, block_gene_o2n, cluster_idx)?;
+                        encode_tile(&cluster_points, block_gene_o2n, gene_block_size, cluster_idx)?;
                     Ok((gb_idx, encoded, local_order, bytes, row_fb, col_fb))
                 })
                 .collect();
@@ -2186,69 +2195,121 @@ fn reconstruct_count_matrix_from_payload(
         starts
     };
 
-    let mut tri = sprs::TriMatI::<u16, usize>::new((nrows, ncols));
-    let mut global_row_offset = 0usize;
-    for (c, &csize) in cluster_sizes.iter().enumerate() {
-        let csize = csize as usize;
-        let start = c * gene_blocks_per_cluster;
-        let end = start + gene_blocks_per_cluster;
-        for (tile_offset, block) in encoded_blocks[start..end].iter().enumerate() {
-            let tile_global = start + tile_offset;
-            let order = &tile_local_orders[tile_global];
-            if order.len() != csize {
-                anyhow::bail!(
-                    "tile_local_orders[{}] len {} differs from cluster_sizes[{}]={}",
-                    tile_global,
-                    order.len(),
-                    c,
-                    csize
-                );
-            }
-            if block.num_cells() != csize {
-                anyhow::bail!(
-                    "Cluster {} tile {} num_cells={} differs from cluster_sizes[{}]={}",
-                    c,
-                    tile_offset,
-                    block.num_cells(),
-                    c,
-                    csize
-                );
-            }
-            let gene_offset = gene_block_starts[tile_offset];
-            for (encoded_row_idx, sparse_row) in block.decode_rows().into_iter().enumerate() {
-                let cluster_local_row = order[encoded_row_idx] as usize;
-                if cluster_local_row >= csize {
+    // Decode each cluster's tiles in parallel and build that cluster's portion of the
+    // CSR directly. Skips the global triplet-sort that `TriMatI::to_csr` would otherwise
+    // perform, and lets Rayon overlap the per-cluster decode + sort work.
+    let per_cluster_rows: anyhow::Result<Vec<Vec<Vec<(u32, u16)>>>> = (0..n_clusters)
+        .into_par_iter()
+        .map(|c| {
+            let csize = cluster_sizes[c] as usize;
+            let start = c * gene_blocks_per_cluster;
+            let mut rows: Vec<Vec<(u32, u16)>> = vec![Vec::new(); csize];
+            for tile_offset in 0..gene_blocks_per_cluster {
+                let tile_global = start + tile_offset;
+                let block = &encoded_blocks[tile_global];
+                let order = &tile_local_orders[tile_global];
+                if order.len() != csize {
                     anyhow::bail!(
-                        "tile_local_orders[{}][{}] = {} >= cluster_size {}",
+                        "tile_local_orders[{}] len {} differs from cluster_sizes[{}]={}",
                         tile_global,
-                        encoded_row_idx,
-                        cluster_local_row,
+                        order.len(),
+                        c,
                         csize
                     );
                 }
-                let global_row = global_row_offset + cluster_local_row;
-                for (gene, value) in sparse_row {
-                    if value == 0 {
-                        continue;
-                    }
-                    let gene_idx = gene_offset + gene as usize;
-                    if gene_idx >= ncols {
+                if block.num_cells() != csize {
+                    anyhow::bail!(
+                        "Cluster {} tile {} num_cells={} differs from cluster_sizes[{}]={}",
+                        c,
+                        tile_offset,
+                        block.num_cells(),
+                        c,
+                        csize
+                    );
+                }
+                let gene_offset = gene_block_starts[tile_offset];
+                for (encoded_row_idx, sparse_row) in block.decode_rows().into_iter().enumerate() {
+                    let cluster_local_row = order[encoded_row_idx] as usize;
+                    if cluster_local_row >= csize {
                         anyhow::bail!(
-                            "Decoded gene index {} >= ncols {} in cluster {} tile {} row {}",
-                            gene_idx,
-                            ncols,
-                            c,
-                            tile_offset,
-                            encoded_row_idx
+                            "tile_local_orders[{}][{}] = {} >= cluster_size {}",
+                            tile_global,
+                            encoded_row_idx,
+                            cluster_local_row,
+                            csize
                         );
                     }
-                    tri.add_triplet(global_row, gene_idx, value);
+                    let row_buf = &mut rows[cluster_local_row];
+                    row_buf.reserve(sparse_row.len());
+                    for (gene, value) in sparse_row {
+                        if value == 0 {
+                            continue;
+                        }
+                        let gene_idx = gene_offset + gene as usize;
+                        if gene_idx >= ncols {
+                            anyhow::bail!(
+                                "Decoded gene index {} >= ncols {} in cluster {} tile {} row {}",
+                                gene_idx,
+                                ncols,
+                                c,
+                                tile_offset,
+                                encoded_row_idx
+                            );
+                        }
+                        row_buf.push((gene_idx as u32, value));
+                    }
                 }
             }
+            // Different gene blocks contribute disjoint, ascending column ranges, so the
+            // concatenated per-row buffer is already sorted across blocks. Within a single
+            // tile, `decode_rows()` produces (gene, value) pairs in ascending gene order.
+            // Still, defend against future changes with a cheap sorted-check + sort.
+            for row in rows.iter_mut() {
+                let mut sorted = true;
+                for w in row.windows(2) {
+                    if w[0].0 > w[1].0 {
+                        sorted = false;
+                        break;
+                    }
+                }
+                if !sorted {
+                    row.sort_unstable_by_key(|&(col, _)| col);
+                }
+            }
+            Ok(rows)
+        })
+        .collect();
+    let per_cluster_rows = per_cluster_rows?;
+
+    // Stitch per-cluster CSR portions into the final matrix.
+    let total_nnz: usize = per_cluster_rows
+        .iter()
+        .flat_map(|rows| rows.iter().map(|r| r.len()))
+        .sum();
+    let mut indptr = Vec::with_capacity(nrows + 1);
+    let mut indices: Vec<usize> = Vec::with_capacity(total_nnz);
+    let mut data: Vec<u16> = Vec::with_capacity(total_nnz);
+    indptr.push(0usize);
+    for (c, rows) in per_cluster_rows.into_iter().enumerate() {
+        if rows.len() != cluster_sizes[c] as usize {
+            anyhow::bail!(
+                "per_cluster_rows[{}].len()={} differs from cluster_sizes[{}]={}",
+                c,
+                rows.len(),
+                c,
+                cluster_sizes[c]
+            );
         }
-        global_row_offset += csize;
+        for row in rows {
+            for (col, val) in row {
+                indices.push(col as usize);
+                data.push(val);
+            }
+            indptr.push(indices.len());
+        }
     }
-    Ok(tri.to_csr::<usize>())
+
+    Ok(CsMat::new((nrows, ncols), indptr, indices, data))
 }
 
 #[allow(dead_code)]
@@ -2851,7 +2912,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let disable_row_mst_candidate = args.disable_row_mst_candidate || args.column_only;
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_column_candidate={} disable_row_parent_ref={} disable_column_ref={} index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_column_candidate={} disable_row_parent_ref={} disable_column_ref={} local_to_global_mode=identity index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
