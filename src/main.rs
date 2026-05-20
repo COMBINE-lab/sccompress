@@ -2037,10 +2037,20 @@ struct DecodedPayload {
     tile_local_orders: Vec<Vec<u32>>,
 }
 
+/// Fine-grained breakdown of the load phase, in microseconds. Useful for figuring out
+/// whether `decompress_load_ms` is dominated by the outer (zstd/gzip/7z) stream read
+/// or by bincode-deserialising the tile structs.
+#[derive(Clone, Copy, Debug, Default)]
+struct DecodeLoadStats {
+    outer_decompress_us: u128,
+    bincode_decode_us: u128,
+    raw_payload_bytes: usize,
+}
+
 fn decode_clustered_payload(
     input: &Path,
     input_compression: Option<PayloadCompressionArg>,
-) -> anyhow::Result<DecodedPayload> {
+) -> anyhow::Result<(DecodedPayload, DecodeLoadStats)> {
     let compression = input_compression.unwrap_or_else(|| {
         input
             .extension()
@@ -2060,6 +2070,7 @@ fn decode_clustered_payload(
         .with_little_endian()
         .with_fixed_int_encoding();
 
+    let t_outer = Instant::now();
     let raw_payload = match compression {
         PayloadCompressionArg::Gzip => {
             let file = File::open(input)?;
@@ -2085,8 +2096,11 @@ fn decode_clustered_payload(
             output.stdout
         }
     };
+    let outer_decompress_us = t_outer.elapsed().as_micros();
+    let raw_payload_bytes = raw_payload.len();
     let mut payload_reader = Cursor::new(raw_payload);
 
+    let t_bincode = Instant::now();
     let encoded_blocks: Vec<EncodedClusterBlock> =
         bincode::decode_from_std_read(&mut payload_reader, config)?;
     let positions: Vec<DatalessPoint> = bincode::decode_from_std_read(&mut payload_reader, config)?;
@@ -2121,15 +2135,23 @@ fn decode_clustered_payload(
     } else {
         Vec::new()
     };
-    Ok(DecodedPayload {
-        encoded_blocks,
-        positions,
-        row_order,
-        gene_order,
-        cluster_sizes,
-        ncols,
-        tile_local_orders,
-    })
+    let bincode_decode_us = t_bincode.elapsed().as_micros();
+    Ok((
+        DecodedPayload {
+            encoded_blocks,
+            positions,
+            row_order,
+            gene_order,
+            cluster_sizes,
+            ncols,
+            tile_local_orders,
+        },
+        DecodeLoadStats {
+            outer_decompress_us,
+            bincode_decode_us,
+            raw_payload_bytes,
+        },
+    ))
 }
 
 /// Reconstruct a sparse count matrix from the encoded payload using the
@@ -2144,6 +2166,25 @@ fn decode_clustered_payload(
 /// gives the permutation that maps tile `k`'s emitted-row index to the cluster-local
 /// row index, so we can recombine the partial rows from each tile into a single global
 /// row.
+/// Per-phase timing accumulators in microseconds. Each thread adds to the atomics, so the
+/// reported numbers are *total CPU work* (sum across threads) for that phase, not wall.
+#[derive(Default)]
+struct ReconstructPhaseStats {
+    tile_decode_us: AtomicU64,
+    row_assemble_us: AtomicU64,
+    sort_check_us: AtomicU64,
+}
+
+fn record_us(slot: &AtomicU64, t: Instant) {
+    let us = t.elapsed().as_micros() as u64;
+    slot.fetch_add(us, Ordering::Relaxed);
+}
+
+/// Reconstruct the sparse count matrix from the decoded tile structs.
+///
+/// Tile-parallel: spawns one Rayon task per tile (`n_clusters * gene_blocks_per_cluster`
+/// tasks total) so the work-stealer can load-balance across all available threads.
+/// Per-cluster row assembly and CSR stitch are cheap and run separately.
 fn reconstruct_count_matrix_from_payload(
     encoded_blocks: &[EncodedClusterBlock],
     cluster_sizes: &[u32],
@@ -2195,40 +2236,73 @@ fn reconstruct_count_matrix_from_payload(
         starts
     };
 
-    // Decode each cluster's tiles in parallel and build that cluster's portion of the
-    // CSR directly. Skips the global triplet-sort that `TriMatI::to_csr` would otherwise
-    // perform, and lets Rayon overlap the per-cluster decode + sort work.
-    let per_cluster_rows: anyhow::Result<Vec<Vec<Vec<(u32, u16)>>>> = (0..n_clusters)
+    // Validate tile-level invariants once, up front, so the hot paths don't have to.
+    for c in 0..n_clusters {
+        let csize = cluster_sizes[c] as usize;
+        let start = c * gene_blocks_per_cluster;
+        for tile_offset in 0..gene_blocks_per_cluster {
+            let tile_global = start + tile_offset;
+            let order = &tile_local_orders[tile_global];
+            if order.len() != csize {
+                anyhow::bail!(
+                    "tile_local_orders[{}] len {} differs from cluster_sizes[{}]={}",
+                    tile_global,
+                    order.len(),
+                    c,
+                    csize
+                );
+            }
+            if encoded_blocks[tile_global].num_cells() != csize {
+                anyhow::bail!(
+                    "Cluster {} tile {} num_cells={} differs from cluster_sizes[{}]={}",
+                    c,
+                    tile_offset,
+                    encoded_blocks[tile_global].num_cells(),
+                    c,
+                    csize
+                );
+            }
+        }
+    }
+
+    let phase = ReconstructPhaseStats::default();
+
+    // --- Phase A: decode tile bytes -> sparse rows -----------------------------------
+    // What this owns: arithmetic decoding, MST traversal, parent/template edits, value
+    // bin lookups. This is the heavy CPU step (~95% of reconstruct time in practice).
+    //
+    // Output shape: `tile_sparse_rows[tile_global][emitted_row_idx] = Vec<(gene, value)>`
+    // with `gene` still in *tile-local* coordinates (0..gene_block_size).
+    let decode_one_tile = |tile_global: usize| -> Vec<Vec<(u32, u16)>> {
+        let t = Instant::now();
+        let rows = encoded_blocks[tile_global].decode_rows();
+        record_us(&phase.tile_decode_us, t);
+        rows
+    };
+
+    let tile_sparse_rows: Vec<Vec<Vec<(u32, u16)>>> = (0..encoded_blocks.len())
         .into_par_iter()
-        .map(|c| {
+        .map(decode_one_tile)
+        .collect();
+
+    // --- Phase B: assemble per-cluster row buffers -----------------------------------
+    // What this owns: applying `tile_local_orders` to remap emitted-row index back to
+    // cluster-local row, offsetting tile-local gene id to global column, and concat'ing
+    // the disjoint gene-block ranges into one sorted per-row vector.
+    //
+    // Clusters are disjoint so this is trivially parallel over clusters.
+    let per_cluster_rows: anyhow::Result<Vec<Vec<Vec<(u32, u16)>>>> = {
+        let assemble_one_cluster = |c: usize| -> anyhow::Result<Vec<Vec<(u32, u16)>>> {
+            let t_assemble = Instant::now();
             let csize = cluster_sizes[c] as usize;
             let start = c * gene_blocks_per_cluster;
             let mut rows: Vec<Vec<(u32, u16)>> = vec![Vec::new(); csize];
             for tile_offset in 0..gene_blocks_per_cluster {
                 let tile_global = start + tile_offset;
-                let block = &encoded_blocks[tile_global];
                 let order = &tile_local_orders[tile_global];
-                if order.len() != csize {
-                    anyhow::bail!(
-                        "tile_local_orders[{}] len {} differs from cluster_sizes[{}]={}",
-                        tile_global,
-                        order.len(),
-                        c,
-                        csize
-                    );
-                }
-                if block.num_cells() != csize {
-                    anyhow::bail!(
-                        "Cluster {} tile {} num_cells={} differs from cluster_sizes[{}]={}",
-                        c,
-                        tile_offset,
-                        block.num_cells(),
-                        c,
-                        csize
-                    );
-                }
                 let gene_offset = gene_block_starts[tile_offset];
-                for (encoded_row_idx, sparse_row) in block.decode_rows().into_iter().enumerate() {
+                let tile_rows = &tile_sparse_rows[tile_global];
+                for (encoded_row_idx, sparse_row) in tile_rows.iter().enumerate() {
                     let cluster_local_row = order[encoded_row_idx] as usize;
                     if cluster_local_row >= csize {
                         anyhow::bail!(
@@ -2241,7 +2315,7 @@ fn reconstruct_count_matrix_from_payload(
                     }
                     let row_buf = &mut rows[cluster_local_row];
                     row_buf.reserve(sparse_row.len());
-                    for (gene, value) in sparse_row {
+                    for &(gene, value) in sparse_row.iter() {
                         if value == 0 {
                             continue;
                         }
@@ -2260,10 +2334,13 @@ fn reconstruct_count_matrix_from_payload(
                     }
                 }
             }
+            record_us(&phase.row_assemble_us, t_assemble);
+
             // Different gene blocks contribute disjoint, ascending column ranges, so the
             // concatenated per-row buffer is already sorted across blocks. Within a single
             // tile, `decode_rows()` produces (gene, value) pairs in ascending gene order.
             // Still, defend against future changes with a cheap sorted-check + sort.
+            let t_sort = Instant::now();
             for row in rows.iter_mut() {
                 let mut sorted = true;
                 for w in row.windows(2) {
@@ -2276,12 +2353,18 @@ fn reconstruct_count_matrix_from_payload(
                     row.sort_unstable_by_key(|&(col, _)| col);
                 }
             }
+            record_us(&phase.sort_check_us, t_sort);
             Ok(rows)
-        })
-        .collect();
+        };
+        (0..n_clusters)
+            .into_par_iter()
+            .map(assemble_one_cluster)
+            .collect()
+    };
     let per_cluster_rows = per_cluster_rows?;
 
-    // Stitch per-cluster CSR portions into the final matrix.
+    // --- Phase C: stitch per-cluster CSR portions into the final CsMat ---------------
+    let t_stitch = Instant::now();
     let total_nnz: usize = per_cluster_rows
         .iter()
         .flat_map(|rows| rows.iter().map(|r| r.len()))
@@ -2308,6 +2391,22 @@ fn reconstruct_count_matrix_from_payload(
             indptr.push(indices.len());
         }
     }
+    let stitch_us = t_stitch.elapsed().as_micros();
+
+    let tile_decode_us = phase.tile_decode_us.load(Ordering::Relaxed);
+    let row_assemble_us = phase.row_assemble_us.load(Ordering::Relaxed);
+    let sort_check_us = phase.sort_check_us.load(Ordering::Relaxed);
+    tracing::info!(
+        "Decompress phase breakdown (threads={}): tile_decode={}us row_assemble={}us sort_check={}us stitch={}us  [sums across threads; total_tiles={}, n_clusters={}, gene_blocks_per_cluster={}]",
+        rayon::current_num_threads(),
+        tile_decode_us,
+        row_assemble_us,
+        sort_check_us,
+        stitch_us,
+        encoded_blocks.len(),
+        n_clusters,
+        gene_blocks_per_cluster,
+    );
 
     Ok(CsMat::new((nrows, ncols), indptr, indices, data))
 }
@@ -2834,6 +2933,12 @@ struct RoundtripCheckCommand {
     max_cells: Option<usize>,
 }
 
+/// Number of Rayon worker threads we install when the user has not set
+/// `RAYON_NUM_THREADS`. Picked to match the SLURM-default `--cpus-per-task` in
+/// `scripts/submit_patro_datasets_parallel_single_cell.sh` so running the bare
+/// binary locally produces the same parallelism profile as on the cluster.
+const DEFAULT_RAYON_THREADS: usize = 4;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(fmt::layer())
@@ -2844,6 +2949,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .add_directive("ureq=warn".parse()?),
         )
         .init();
+
+    // Install a 4-thread global Rayon pool by default. If the user already set
+    // `RAYON_NUM_THREADS` (or built a global pool by some other means) we leave
+    // it alone -- `build_global` returns an Err on the second call.
+    if std::env::var_os("RAYON_NUM_THREADS").is_none() {
+        match rayon::ThreadPoolBuilder::new()
+            .num_threads(DEFAULT_RAYON_THREADS)
+            .build_global()
+        {
+            Ok(()) => tracing::debug!(
+                "Installed default Rayon pool with {} threads (RAYON_NUM_THREADS unset)",
+                DEFAULT_RAYON_THREADS
+            ),
+            Err(e) => tracing::debug!("Rayon global pool already initialised: {}", e),
+        }
+    }
 
     let cli = Cli::parse();
 
@@ -3194,11 +3315,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t_total = Instant::now();
 
             let t_load = Instant::now();
-            let decoded = decode_clustered_payload(&args.encoded, args.input_compression)?;
+            let (decoded, load_stats) =
+                decode_clustered_payload(&args.encoded, args.input_compression)?;
             let load_ms = t_load.elapsed().as_millis();
             info!(
-                "Decompress: payload load (outer-decompress + bincode) took {}ms; blocks={}, clusters={}, ncols={}",
+                "Decompress: payload load (outer-decompress + bincode) took {}ms; \
+                 outer_decompress={}us, bincode_decode={}us, raw_payload={}KB; \
+                 blocks={}, clusters={}, ncols={}",
                 load_ms,
+                load_stats.outer_decompress_us,
+                load_stats.bincode_decode_us,
+                load_stats.raw_payload_bytes / 1024,
                 decoded.encoded_blocks.len(),
                 decoded.cluster_sizes.len(),
                 decoded.ncols
