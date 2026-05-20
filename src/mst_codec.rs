@@ -116,37 +116,41 @@ impl EncodedDiffsMST {
     }
 
     fn apply_edit_ops(
-        parent: &[(u32, i32)],
+        parent: &[(u32, u16)],
         removes: &[u32],
         adds: &[(u32, u32)],
         updates: &[(u32, u32)],
-    ) -> Vec<(u32, i32)> {
+    ) -> Vec<(u32, u16)> {
         let mut result = Vec::with_capacity(parent.len().saturating_add(adds.len()));
+        let parent_len = parent.len();
+        let adds_len = adds.len();
+        let removes_len = removes.len();
+        let updates_len = updates.len();
         let mut i = 0usize;
         let mut r = 0usize;
         let mut a = 0usize;
         let mut u = 0usize;
 
-        while i < parent.len() || a < adds.len() {
-            let next_parent_gene = parent.get(i).map(|(g, _)| *g);
-            let next_add_gene = adds.get(a).map(|(g, _)| *g);
+        while i < parent_len || a < adds_len {
+            let next_parent_gene = if i < parent_len { Some(parent[i].0) } else { None };
+            let next_add_gene = if a < adds_len { Some(adds[a].0) } else { None };
 
             match (next_parent_gene, next_add_gene) {
                 (Some(pg), Some(ag)) if ag < pg => {
-                    let value = adds[a].1 as i32;
+                    let value = adds[a].1 as u16;
                     if value > 0 {
                         result.push((ag, value));
                     }
                     a += 1;
                 }
                 (Some(pg), _) => {
-                    if removes.get(r).copied() == Some(pg) {
+                    if r < removes_len && removes[r] == pg {
                         i += 1;
                         r += 1;
                         continue;
                     }
-                    if updates.get(u).map(|(g, _)| *g) == Some(pg) {
-                        let value = updates[u].1 as i32;
+                    if u < updates_len && updates[u].0 == pg {
+                        let value = updates[u].1 as u16;
                         if value > 0 {
                             result.push((pg, value));
                         }
@@ -162,7 +166,7 @@ impl EncodedDiffsMST {
                     i += 1;
                 }
                 (None, Some(ag)) => {
-                    let value = adds[a].1 as i32;
+                    let value = adds[a].1 as u16;
                     if value > 0 {
                         result.push((ag, value));
                     }
@@ -340,6 +344,25 @@ impl EncodedColumnBlock {
             return Vec::new();
         }
         let mut out = Vec::with_capacity(count);
+        Self::decode_sorted_rows_into(count, firsts, gaps, first_cursor, gap_cursor, &mut out);
+        out
+    }
+
+    /// Decode `count` sorted (first + gaps) rows directly into the back of
+    /// `out`, growing it by exactly `count` elements. Used by the Raw branch
+    /// of the column decoder so 90 k+ tiny Vec allocations collapse to one
+    /// large pre-sized buffer per tile.
+    fn decode_sorted_rows_into(
+        count: usize,
+        firsts: &[u32],
+        gaps: &[u32],
+        first_cursor: &mut usize,
+        gap_cursor: &mut usize,
+        out: &mut Vec<u32>,
+    ) {
+        if count == 0 {
+            return;
+        }
         let mut row = firsts.get(*first_cursor).copied().unwrap_or(0);
         *first_cursor += 1;
         out.push(row);
@@ -349,7 +372,6 @@ impl EncodedColumnBlock {
             row = row.saturating_add(gap);
             out.push(row);
         }
-        out
     }
 
     fn apply_row_edits(parent: &[u32], removes: &[u32], adds: &[u32]) -> Vec<u32> {
@@ -386,10 +408,16 @@ impl EncodedColumnBlock {
     }
 
     pub fn decode_rows(&self) -> Vec<Vec<(u32, u16)>> {
+        // Plans hold either an empty marker, a `Raw` reference to a flat arena
+        // slice (so ~90 k small `Vec<u32>` allocs per tile become **one** big
+        // alloc on the typical single-cell tile), or a `Ref`/`Template` with
+        // remove/add edits which still allocate locally (those are rare: <2%
+        // of genes for 17k single-cell).
         #[derive(Clone)]
         enum SupportPlan {
             Empty,
-            Raw(Vec<u32>),
+            /// Slice into `raw_arena` of the rows that express this gene.
+            Raw { arena_start: u32, len: u32 },
             Ref {
                 parent_idx: usize,
                 removes: Vec<u32>,
@@ -402,75 +430,188 @@ impl EncodedColumnBlock {
             },
         }
 
-        fn resolve_support_rows(
+        // Resolve a gene's posting rows, returning a borrowed slice.
+        //
+        // Hot path (`Raw`) borrows directly out of `raw_arena` -- no alloc, no
+        // memo write. `Ref`/`Template` plans materialise their result into
+        // `memo` exactly once and we then return a borrow of the memo entry.
+        fn resolve_support_rows<'m>(
             gene_idx: usize,
-            plans: &[SupportPlan],
-            templates: &[Vec<u32>],
-            memo: &mut [Option<Vec<u32>>],
+            plans: &'m [SupportPlan],
+            templates: &'m [Vec<u32>],
+            raw_arena: &'m [u32],
+            memo: &'m mut [Option<Vec<u32>>],
             visiting: &mut [bool],
-        ) -> Vec<u32> {
-            if let Some(rows) = memo.get(gene_idx).and_then(Option::as_ref) {
-                return rows.clone();
-            }
+        ) -> &'m [u32] {
             if gene_idx >= plans.len() || visiting.get(gene_idx).copied().unwrap_or(false) {
-                return Vec::new();
+                return &[];
+            }
+            // Hot path: Raw plans point into the shared arena.
+            if let SupportPlan::Raw { arena_start, len } = &plans[gene_idx] {
+                let start = *arena_start as usize;
+                let end = start.saturating_add(*len as usize);
+                if end <= raw_arena.len() {
+                    return &raw_arena[start..end];
+                }
+                return &[];
+            }
+            // Memo hit for previously-resolved Ref/Template genes.
+            if memo[gene_idx].is_some() {
+                return memo[gene_idx].as_deref().unwrap();
             }
 
             visiting[gene_idx] = true;
-            let rows = match &plans[gene_idx] {
+            let rows: Vec<u32> = match &plans[gene_idx] {
                 SupportPlan::Empty => Vec::new(),
-                SupportPlan::Raw(rows) => rows.clone(),
+                SupportPlan::Raw { .. } => unreachable!("Raw handled above"),
                 SupportPlan::Ref {
                     parent_idx,
                     removes,
                     adds,
                 } => {
-                    let parent_rows = if *parent_idx == gene_idx {
-                        Vec::new()
+                    let parent_idx = *parent_idx;
+                    if parent_idx == gene_idx {
+                        EncodedColumnBlock::apply_row_edits(&[], removes, adds)
                     } else {
-                        resolve_support_rows(*parent_idx, plans, templates, memo, visiting)
-                    };
-                    EncodedColumnBlock::apply_row_edits(&parent_rows, removes, adds)
+                        // Resolve the parent's rows first, then drop the borrow before
+                        // touching `memo[gene_idx]` again.
+                        let parent_rows: Vec<u32> = resolve_support_rows(
+                            parent_idx, plans, templates, raw_arena, memo, visiting,
+                        )
+                        .to_vec();
+                        EncodedColumnBlock::apply_row_edits(&parent_rows, removes, adds)
+                    }
                 }
                 SupportPlan::Template {
                     template_idx,
                     removes,
                     adds,
                 } => {
-                    let template_rows = templates.get(*template_idx).cloned().unwrap_or_default();
-                    EncodedColumnBlock::apply_row_edits(&template_rows, removes, adds)
+                    let template_rows = templates
+                        .get(*template_idx)
+                        .map(Vec::as_slice)
+                        .unwrap_or(&[]);
+                    EncodedColumnBlock::apply_row_edits(template_rows, removes, adds)
                 }
             };
             visiting[gene_idx] = false;
-            memo[gene_idx] = Some(rows.clone());
-            rows
+            memo[gene_idx] = Some(rows);
+            memo[gene_idx].as_deref().unwrap()
         }
 
         let nrows = self.num_cells as usize;
-        let mut rows: Vec<Vec<(u32, u16)>> = vec![Vec::new(); nrows];
 
         let local_to_global = self.local_to_global.decode_all_u32();
         let modes = self.posting_modes.decode_all().unwrap_or_default();
         let counts = self.posting_counts.decode_all().unwrap_or_default();
-        let raw_firsts = self.raw_row_firsts.decode_all();
-        let raw_gaps = self.raw_row_gaps.decode_all();
-        let template_counts = self.template_counts.decode_all().unwrap_or_default();
-        let template_row_firsts = self.template_row_firsts.decode_all();
-        let template_row_gaps = self.template_row_gaps.decode_all();
-        let ref_parent_deltas = self.ref_parent_deltas.decode_all();
-        let ref_remove_counts = self.ref_remove_counts.decode_all().unwrap_or_default();
-        let ref_add_counts = self.ref_add_counts.decode_all().unwrap_or_default();
-        let ref_remove_firsts = self.ref_remove_firsts.decode_all();
-        let ref_remove_gaps = self.ref_remove_gaps.decode_all();
-        let ref_add_firsts = self.ref_add_firsts.decode_all();
-        let ref_add_gaps = self.ref_add_gaps.decode_all();
-        let template_ids = self.template_ids.decode_all();
-        let template_remove_counts = self.template_remove_counts.decode_all().unwrap_or_default();
-        let template_add_counts = self.template_add_counts.decode_all().unwrap_or_default();
-        let template_remove_firsts = self.template_remove_firsts.decode_all();
-        let template_remove_gaps = self.template_remove_gaps.decode_all();
-        let template_add_firsts = self.template_add_firsts.decode_all();
-        let template_add_gaps = self.template_add_gaps.decode_all();
+
+        // Group-skip whole stream groups when their corresponding posting mode
+        // is unused by this tile. For single-cell tiles `template_counts` is
+        // almost always empty (no template-mode postings), so we save 5-6
+        // arithmetic-decode passes per tile. Ref-mode is also often unused.
+        let any_ref = modes.iter().any(|&m| m == Self::MODE_REF);
+        let any_template = modes.iter().any(|&m| m == Self::MODE_TEMPLATE);
+        let any_raw = modes.iter().any(|&m| m == Self::MODE_RAW);
+
+        let raw_firsts = if any_raw {
+            self.raw_row_firsts.decode_all()
+        } else {
+            Vec::new()
+        };
+        let raw_gaps = if any_raw {
+            self.raw_row_gaps.decode_all()
+        } else {
+            Vec::new()
+        };
+
+        let template_counts = if any_template {
+            self.template_counts.decode_all().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let template_row_firsts = if any_template {
+            self.template_row_firsts.decode_all()
+        } else {
+            Vec::new()
+        };
+        let template_row_gaps = if any_template {
+            self.template_row_gaps.decode_all()
+        } else {
+            Vec::new()
+        };
+
+        let ref_parent_deltas = if any_ref {
+            self.ref_parent_deltas.decode_all()
+        } else {
+            Vec::new()
+        };
+        let ref_remove_counts = if any_ref {
+            self.ref_remove_counts.decode_all().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let ref_add_counts = if any_ref {
+            self.ref_add_counts.decode_all().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let ref_remove_firsts = if any_ref {
+            self.ref_remove_firsts.decode_all()
+        } else {
+            Vec::new()
+        };
+        let ref_remove_gaps = if any_ref {
+            self.ref_remove_gaps.decode_all()
+        } else {
+            Vec::new()
+        };
+        let ref_add_firsts = if any_ref {
+            self.ref_add_firsts.decode_all()
+        } else {
+            Vec::new()
+        };
+        let ref_add_gaps = if any_ref {
+            self.ref_add_gaps.decode_all()
+        } else {
+            Vec::new()
+        };
+
+        let template_ids = if any_template {
+            self.template_ids.decode_all()
+        } else {
+            Vec::new()
+        };
+        let template_remove_counts = if any_template {
+            self.template_remove_counts.decode_all().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let template_add_counts = if any_template {
+            self.template_add_counts.decode_all().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let template_remove_firsts = if any_template {
+            self.template_remove_firsts.decode_all()
+        } else {
+            Vec::new()
+        };
+        let template_remove_gaps = if any_template {
+            self.template_remove_gaps.decode_all()
+        } else {
+            Vec::new()
+        };
+        let template_add_firsts = if any_template {
+            self.template_add_firsts.decode_all()
+        } else {
+            Vec::new()
+        };
+        let template_add_gaps = if any_template {
+            self.template_add_gaps.decode_all()
+        } else {
+            Vec::new()
+        };
+
         let vals = self.vals.decode_flattened(&counts);
 
         let mut raw_first_cursor = 0usize;
@@ -493,6 +634,24 @@ impl EncodedColumnBlock {
         let mut plans: Vec<SupportPlan> = Vec::with_capacity(local_to_global.len());
         let mut counts_per_gene = Vec::with_capacity(local_to_global.len());
         let mut templates = Vec::with_capacity(template_counts.len());
+
+        // Compute total Raw row count so we can size the arena once. Raw is
+        // ~99% of postings for typical single-cell tiles (raw=90228 vs
+        // ref=1046, template=0 on 17k), so this saves ~90 k small Vec<u32>
+        // allocations per tile, replaced by one large `raw_arena`.
+        let raw_arena_cap: usize = local_to_global
+            .iter()
+            .enumerate()
+            .map(|(gp, _)| {
+                let mode = modes.get(gp).copied().unwrap_or(Self::MODE_RAW);
+                if mode == Self::MODE_RAW {
+                    counts.get(gp).copied().unwrap_or(0) as usize
+                } else {
+                    0
+                }
+            })
+            .sum();
+        let mut raw_arena: Vec<u32> = Vec::with_capacity(raw_arena_cap);
         for &count_u32 in &template_counts {
             let count = count_u32 as usize;
             let rows = Self::decode_sorted_rows(
@@ -584,24 +743,79 @@ impl EncodedColumnBlock {
                     adds,
                 }
             } else {
-                let raw_rows = Self::decode_sorted_rows(
+                // Append the decoded row list directly into `raw_arena`; the
+                // plan only carries the (start, len) into that arena.
+                let arena_start = raw_arena.len() as u32;
+                Self::decode_sorted_rows_into(
                     count,
                     &raw_firsts,
                     &raw_gaps,
                     &mut raw_first_cursor,
                     &mut raw_gap_cursor,
+                    &mut raw_arena,
                 );
-                SupportPlan::Raw(raw_rows)
+                SupportPlan::Raw {
+                    arena_start,
+                    len: count as u32,
+                }
             };
             plans.push(plan);
         }
 
+        // First pass: count how many entries land in each output row so we
+        // can `Vec::with_capacity` each row's buffer exactly. Without this the
+        // ~22 M `rows[row].push(...)` calls in the fill loop trigger ~10
+        // doublings per row's Vec (1 -> 2 -> 4 -> ... -> ~700 entries) which
+        // is a serial cascade of `realloc`s.
         let mut memo: Vec<Option<Vec<u32>>> = vec![None; local_to_global.len()];
         let mut visiting = vec![false; local_to_global.len()];
+        let mut row_nnz: Vec<u32> = vec![0u32; nrows];
+        for gene_pos in 0..local_to_global.len() {
+            let count = counts_per_gene.get(gene_pos).copied().unwrap_or(0);
+            if count == 0 {
+                continue;
+            }
+            let posting_rows = resolve_support_rows(
+                gene_pos,
+                &plans,
+                &templates,
+                &raw_arena,
+                &mut memo,
+                &mut visiting,
+            );
+            let take = count.min(posting_rows.len());
+            for &r in &posting_rows[..take] {
+                let r = r as usize;
+                if r < nrows {
+                    row_nnz[r] = row_nnz[r].saturating_add(1);
+                }
+            }
+        }
+
+        // Now allocate each row buffer with exactly its expected capacity.
+        // (Off-by-a-handful possible if some encoded values happen to be 0,
+        // which is rare; over-allocation is harmless.)
+        let mut rows: Vec<Vec<(u32, u16)>> = row_nnz
+            .iter()
+            .map(|&n| Vec::with_capacity(n as usize))
+            .collect();
+
+        // Second pass: actual fill. resolve_support_rows is now alloc-free
+        // (Raw plans borrow from arena, Ref/Template plans are memo hits).
         for (gene_pos, &gene) in local_to_global.iter().enumerate() {
             let count = counts_per_gene.get(gene_pos).copied().unwrap_or(0);
-            let posting_rows =
-                resolve_support_rows(gene_pos, &plans, &templates, &mut memo, &mut visiting);
+            if count == 0 {
+                val_cursor = val_cursor.saturating_add(count);
+                continue;
+            }
+            let posting_rows = resolve_support_rows(
+                gene_pos,
+                &plans,
+                &templates,
+                &raw_arena,
+                &mut memo,
+                &mut visiting,
+            );
             for value_idx in 0..count {
                 let value = vals.get(val_cursor).copied().unwrap_or(0) as u16;
                 val_cursor += 1;
@@ -2535,9 +2749,19 @@ pub struct SparseExpressionIterMST<'a> {
     encoded: &'a EncodedDiffsMST,
     next_dfs: usize,
     local_to_global: Vec<u32>,
-    states: Vec<Vec<(u32, i32)>>,
+    /// True iff `local_to_global[i] == i as u32` for all i. When true we can
+    /// skip the per-row remap pass and emit each row's nonzeros directly.
+    local_to_global_is_identity: bool,
+    /// Per-cell expression state in DFS pre-order. Each entry is a sorted
+    /// `Vec<(gene, value)>`. Values are stored as `u16` (no i32 widening) so
+    /// `Iterator::next` can clone the state straight into the output row.
+    states: Vec<Vec<(u32, u16)>>,
+    /// Children-still-to-emit count per DFS pos. When a cell's count hits
+    /// zero, its state is no longer referenced and we drop the buffer so the
+    /// allocator can reuse it. See `apply_edit_ops` recycling in `next()`.
+    states_refs: Vec<u32>,
     child_modes: Vec<u32>,
-    row_templates: Vec<Vec<(u32, i32)>>,
+    row_templates: Vec<Vec<(u32, u16)>>,
     child_template_base: Vec<Option<usize>>,
     child_full_entries: Vec<Vec<(u32, u32)>>,
     child_removes: Vec<Vec<u32>>,
@@ -2549,6 +2773,14 @@ impl<'a> SparseExpressionIterMST<'a> {
     fn new(encoded: &'a EncodedDiffsMST) -> Self {
         let ncells = encoded.num_cells();
         let local_to_global = encoded.local_to_global.decode_all_u32();
+        // Identity check: when this fires we skip the per-row gene remap loop
+        // entirely and emit `(gene, value)` directly. After the
+        // `--implicit-local-to-global` cleanup this is the only mode we ever
+        // emit, but the check is cheap and protects against future divergence.
+        let local_to_global_is_identity = local_to_global
+            .iter()
+            .enumerate()
+            .all(|(i, &g)| g == i as u32);
         let mut states = Vec::with_capacity(ncells);
         let mut child_modes = vec![0u32; ncells];
         let mut child_template_base = vec![None; ncells];
@@ -2556,18 +2788,18 @@ impl<'a> SparseExpressionIterMST<'a> {
         let mut child_removes = vec![Vec::new(); ncells];
         let mut child_adds = vec![Vec::new(); ncells];
         let mut child_updates = vec![Vec::new(); ncells];
-        let mut row_templates: Vec<Vec<(u32, i32)>> = Vec::new();
+        let mut row_templates: Vec<Vec<(u32, u16)>> = Vec::new();
 
         const ROW_MODE_PARENT: u32 = 0;
         const ROW_MODE_FULL: u32 = 1;
         const ROW_MODE_TEMPLATE: u32 = 2;
 
         if ncells > 0 {
-            let mut root_state = Vec::new();
             let root_indices = encoded.root_indices.decode_all_u32();
             let root_vals = encoded.root_vals.decode_all().unwrap_or_default();
+            let mut root_state: Vec<(u32, u16)> = Vec::with_capacity(root_indices.len());
             for (i, &gene) in root_indices.iter().enumerate() {
-                let value = root_vals.get(i).copied().unwrap_or(0) as i32;
+                let value = root_vals.get(i).copied().unwrap_or(0) as u16;
                 root_state.push((gene, value));
             }
             states.push(root_state);
@@ -2616,7 +2848,7 @@ impl<'a> SparseExpressionIterMST<'a> {
 
             for &count_raw in &template_counts {
                 let count = count_raw as usize;
-                let mut entries = Vec::with_capacity(count);
+                let mut entries: Vec<(u32, u16)> = Vec::with_capacity(count);
                 if count > 0 {
                     let mut gene = template_first_genes
                         .get(template_first_cursor)
@@ -2625,14 +2857,14 @@ impl<'a> SparseExpressionIterMST<'a> {
                     template_first_cursor += 1;
                     let first_val = template_vals.get(template_val_cursor).copied().unwrap_or(0);
                     template_val_cursor += 1;
-                    entries.push((gene, first_val as i32));
+                    entries.push((gene, first_val as u16));
                     for _ in 1..count {
                         let gap = template_gaps.get(template_gap_cursor).copied().unwrap_or(0);
                         template_gap_cursor += 1;
                         gene = gene.saturating_add(gap);
                         let value = template_vals.get(template_val_cursor).copied().unwrap_or(0);
                         template_val_cursor += 1;
-                        entries.push((gene, value as i32));
+                        entries.push((gene, value as u16));
                     }
                 }
                 row_templates.push(entries);
@@ -2737,11 +2969,29 @@ impl<'a> SparseExpressionIterMST<'a> {
             }
         }
 
+        // Pre-compute, for every cell, how many of its children still need its
+        // expression state alive. We count any child whose mode is not FULL
+        // (PARENT always uses parent state; TEMPLATE may fall back to parent
+        // state if the template lookup fails -- counting both is safe). When
+        // the count hits zero in `Iterator::next`, the state buffer is freed.
+        let mut states_refs = vec![0u32; ncells];
+        for dfs_pos in 1..ncells {
+            if child_modes[dfs_pos] == ROW_MODE_FULL {
+                continue;
+            }
+            let parent_dfs = encoded.parent_dfs_pos(dfs_pos);
+            if parent_dfs < ncells {
+                states_refs[parent_dfs] = states_refs[parent_dfs].saturating_add(1);
+            }
+        }
+
         Self {
             encoded,
             next_dfs: 0,
             local_to_global,
+            local_to_global_is_identity,
             states,
+            states_refs,
             child_modes,
             row_templates,
             child_template_base,
@@ -2767,24 +3017,30 @@ impl Iterator for SparseExpressionIterMST<'_> {
         if current_dfs > 0 {
             let parent_dfs = self.encoded.parent_dfs_pos(current_dfs);
             let mode = self.child_modes[current_dfs];
-            let current_state = if mode == 1 {
-                self.child_full_entries[current_dfs]
-                    .iter()
-                    .filter_map(|(gene, value)| {
-                        if *value > 0 {
-                            Some((*gene, *value as i32))
-                        } else {
-                            None
-                        }
-                    })
-                    .collect::<Vec<_>>()
+            let current_state: Vec<(u32, u16)> = if mode == 1 {
+                // FULL: row given directly, no parent dependency. The encoder
+                // may emit zero-valued entries (rare, but possible after lossy
+                // quantization), so we drop them here -- after this point the
+                // state Vec is guaranteed to contain only nonzeros.
+                let full = &self.child_full_entries[current_dfs];
+                let mut s: Vec<(u32, u16)> = Vec::with_capacity(full.len());
+                for &(gene, value) in full {
+                    if value > 0 {
+                        s.push((gene, value as u16));
+                    }
+                }
+                s
             } else {
-                let base_state = if mode == 2 {
+                // PARENT or TEMPLATE: apply edits over a base state. Templates
+                // can fall back to parent state if the template lookup fails,
+                // hence `states_refs` counts both modes.
+                let base_state: &[(u32, u16)] = if mode == 2 {
                     self.child_template_base[current_dfs]
                         .and_then(|idx| self.row_templates.get(idx))
-                        .unwrap_or(&self.states[parent_dfs])
+                        .map(Vec::as_slice)
+                        .unwrap_or_else(|| self.states[parent_dfs].as_slice())
                 } else {
-                    &self.states[parent_dfs]
+                    self.states[parent_dfs].as_slice()
                 };
                 EncodedDiffsMST::apply_edit_ops(
                     base_state,
@@ -2793,24 +3049,44 @@ impl Iterator for SparseExpressionIterMST<'_> {
                     &self.child_updates[current_dfs],
                 )
             };
+
+            // Release parent state once no future child still references it.
+            // mode == FULL never reads parent so we never decrement for it.
+            if mode != 1 {
+                if let Some(slot) = self.states_refs.get_mut(parent_dfs) {
+                    *slot = slot.saturating_sub(1);
+                    if *slot == 0 {
+                        // Free the heap buffer. mem::take leaves Vec::new in
+                        // place, which has no allocation; safe because the
+                        // refcount guarantees no future read will see this.
+                        let _drop = std::mem::take(&mut self.states[parent_dfs]);
+                    }
+                }
+            }
+
             self.states.push(current_state);
         }
 
-        let sparse = self.states[current_dfs]
-            .iter()
-            .filter_map(|(gene, value)| {
-                if *value > 0 {
-                    let mapped_gene = self
-                        .local_to_global
-                        .get(*gene as usize)
-                        .copied()
-                        .unwrap_or(*gene);
-                    Some((mapped_gene, *value as u16))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        // Build output. Both `apply_edit_ops` and the FULL mode above already
+        // dropped value == 0 entries, so the state vector contains only
+        // nonzeros. With identity local_to_global (the only mode emitted
+        // today) we just clone the state straight out -- no remap walk, no
+        // second filter pass.
+        let state = &self.states[current_dfs];
+        let sparse: Vec<(u32, u16)> = if self.local_to_global_is_identity {
+            state.clone()
+        } else {
+            let mut out = Vec::with_capacity(state.len());
+            for &(gene, value) in state {
+                let mapped = self
+                    .local_to_global
+                    .get(gene as usize)
+                    .copied()
+                    .unwrap_or(gene);
+                out.push((mapped, value));
+            }
+            out
+        };
 
         Some(sparse)
     }

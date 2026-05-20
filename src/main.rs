@@ -1353,6 +1353,7 @@ fn run_clustered_compression(
     disable_column_candidate: bool,
     disable_row_parent_ref: bool,
     disable_column_ref: bool,
+    prefer_column_on_tie: bool,
     report_memory: bool,
     cluster_seed: Option<u64>,
     gene_reorder_method: GeneReorderMethod,
@@ -1646,7 +1647,16 @@ fn run_clustered_compression(
         let col_available = col_candidate.is_some();
         let (encoded, local_order, bytes) = match (row_candidate, col_candidate) {
             (Some(r), Some(c)) => {
-                if r.2 <= c.2 {
+                // Default: row wins ties (smaller-or-equal beats column).
+                // With --prefer-column-on-tie: column wins ties, since column
+                // tiles decode ~3-4x faster than row-MST tiles per tile and a
+                // byte-for-byte tie should be broken on decode speed.
+                let pick_row = if prefer_column_on_tie {
+                    r.2 < c.2
+                } else {
+                    r.2 <= c.2
+                };
+                if pick_row {
                     r
                 } else {
                     c
@@ -2364,16 +2374,22 @@ fn reconstruct_count_matrix_from_payload(
     let per_cluster_rows = per_cluster_rows?;
 
     // --- Phase C: stitch per-cluster CSR portions into the final CsMat ---------------
+    // Pass 1 (serial, cheap): walk per_cluster_rows reading only Vec lengths
+    // to build `indptr` and `cluster_nnz_offsets` (offset into `indices`/
+    // `data` where each cluster's slice starts). Costs O(nrows + n_clusters).
+    //
+    // Pass 2 (parallel over clusters): each cluster has a *disjoint* output
+    // slice [cluster_nnz_offsets[c]..cluster_nnz_offsets[c+1]), so writes are
+    // race-free without any synchronisation. Uses `set_len` + raw pointer
+    // writes to skip Vec::push's per-element capacity check.
     let t_stitch = Instant::now();
-    let total_nnz: usize = per_cluster_rows
-        .iter()
-        .flat_map(|rows| rows.iter().map(|r| r.len()))
-        .sum();
-    let mut indptr = Vec::with_capacity(nrows + 1);
-    let mut indices: Vec<usize> = Vec::with_capacity(total_nnz);
-    let mut data: Vec<u16> = Vec::with_capacity(total_nnz);
+
+    let mut indptr: Vec<usize> = Vec::with_capacity(nrows + 1);
     indptr.push(0usize);
-    for (c, rows) in per_cluster_rows.into_iter().enumerate() {
+    let mut cluster_nnz_offsets: Vec<usize> = Vec::with_capacity(n_clusters + 1);
+    cluster_nnz_offsets.push(0usize);
+    let mut running = 0usize;
+    for (c, rows) in per_cluster_rows.iter().enumerate() {
         if rows.len() != cluster_sizes[c] as usize {
             anyhow::bail!(
                 "per_cluster_rows[{}].len()={} differs from cluster_sizes[{}]={}",
@@ -2383,14 +2399,71 @@ fn reconstruct_count_matrix_from_payload(
                 cluster_sizes[c]
             );
         }
-        for row in rows {
-            for (col, val) in row {
-                indices.push(col as usize);
-                data.push(val);
-            }
-            indptr.push(indices.len());
+        for row in rows.iter() {
+            running = running.saturating_add(row.len());
+            indptr.push(running);
         }
+        cluster_nnz_offsets.push(running);
     }
+    let total_nnz = running;
+
+    let mut indices: Vec<usize> = Vec::with_capacity(total_nnz);
+    let mut data: Vec<u16> = Vec::with_capacity(total_nnz);
+    // SAFETY: `with_capacity(N)` guarantees at least N elements of backing
+    // storage. We initialise every slot in the parallel loop below before the
+    // Vecs are observed by any external code (CsMat::new reads len, not
+    // capacity).
+    unsafe {
+        indices.set_len(total_nnz);
+        data.set_len(total_nnz);
+    }
+    // Cast the mutable raw pointers to `usize` so they can be sent across
+    // Rayon worker boundaries. Raw pointers are `!Send` in safe Rust; the
+    // pattern `as usize` is the standard idiom for sharing them, valid here
+    // because the per-cluster slices we write to are disjoint by construction.
+    let indices_addr = indices.as_mut_ptr() as usize;
+    let data_addr = data.as_mut_ptr() as usize;
+    let nnz_offsets = &cluster_nnz_offsets;
+    per_cluster_rows
+        .into_par_iter()
+        .enumerate()
+        .try_for_each(|(c, rows)| -> anyhow::Result<()> {
+            let start = nnz_offsets[c];
+            let end = nnz_offsets[c + 1];
+            let mut off = start;
+            let indices_ptr = indices_addr as *mut usize;
+            let data_ptr = data_addr as *mut u16;
+            for row in rows.into_iter() {
+                for (col, val) in row.into_iter() {
+                    if off >= end {
+                        return Err(anyhow::anyhow!(
+                            "stitch overflow: cluster {} wrote past its slice [{}, {})",
+                            c,
+                            start,
+                            end
+                        ));
+                    }
+                    // SAFETY: `off` is in cluster c's exclusive range
+                    // [start, end), and clusters have disjoint ranges, so no
+                    // two threads write to the same address.
+                    unsafe {
+                        indices_ptr.add(off).write(col as usize);
+                        data_ptr.add(off).write(val);
+                    }
+                    off += 1;
+                }
+            }
+            debug_assert_eq!(
+                off, end,
+                "cluster {} wrote {} entries but expected slice [{},{}) of len {}",
+                c,
+                off - start,
+                start,
+                end,
+                end - start
+            );
+            Ok(())
+        })?;
     let stitch_us = t_stitch.elapsed().as_micros();
 
     let tile_decode_us = phase.tile_decode_us.load(Ordering::Relaxed);
@@ -2771,6 +2844,11 @@ struct BuildCommand {
     /// Disable reference posting mode inside column blocks.
     #[arg(long = "disable-column-ref", default_value_t = false)]
     disable_column_ref: bool,
+    /// When the row-MST and column candidates produce the same compressed
+    /// byte size for a tile, prefer the column candidate. Default behaviour
+    /// prefers row-MST on ties (which can pick the slower-to-decode encoding).
+    #[arg(long = "prefer-column-on-tie", default_value_t = false)]
+    prefer_column_on_tie: bool,
     /// If set, emit combinatorial and entropy diagnostics for op_indices.
     #[arg(long = "report-index-bounds", default_value_t = false)]
     report_index_bounds: bool,
@@ -3033,7 +3111,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let disable_row_mst_candidate = args.disable_row_mst_candidate || args.column_only;
 
             info!(
-                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_column_candidate={} disable_row_parent_ref={} disable_column_ref={} local_to_global_mode=identity index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
+                "Encoding mode: {} | output_compression={:?} lossy_quantizers={} cell_blocks={} bins={} sweep={:?} max_cluster_size={:?} cell_cluster_method=svd-joint knn_metric={:?} mst_weight={:?} row_mst_window={} row_mst_stream=projection-full-backrefs row_mst_column_order=existing column_row_order=projection matrix_orientation={:?} coordinate_mode={} input_rows={} input_cols={} input_nnz={} joint_svd_fast={} joint_svd_row_vectors=2 row_full_fallback={} disable_row_mst_candidate={} disable_column_candidate={} disable_row_parent_ref={} disable_column_ref={} prefer_column_on_tie={} local_to_global_mode=identity index_codec={:?} sorted_index_codec={:?} forest_cut_factor={:?} cluster_encoding=Hybrid column_template_count={} column_template_adaptive={} column_template_max={} row_template_adaptive={} row_template_max={}",
                 if quantize_values { "lossy" } else { "lossless" },
                 args.output_compression,
                 target_quantizers,
@@ -3055,6 +3133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 args.disable_column_candidate,
                 args.disable_row_parent_ref,
                 args.disable_column_ref,
+                args.prefer_column_on_tie,
                 args.index_codec,
                 args.sorted_index_codec,
                 forest_cut_factor,
@@ -3102,6 +3181,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         args.disable_column_candidate,
                         args.disable_row_parent_ref,
                         args.disable_column_ref,
+                        args.prefer_column_on_tie,
                         args.report_memory,
                         args.set_seed,
                         *gene_reorder_method,
@@ -3442,6 +3522,7 @@ mod tests {
             false,
             false,
             false,
+            false,
             None,
             GeneReorderMethod::Projection,
             false,
@@ -3487,6 +3568,7 @@ mod tests {
             32,
             false,
             16,
+            false,
             false,
             false,
             false,
