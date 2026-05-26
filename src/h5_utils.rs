@@ -1,9 +1,11 @@
 use hdf5::{File, Group};
 use hdf5::types::FixedAscii;
 use ndarray::Array1;
+use sprs::CsMat;
 use std::path::Path;
 
 /// Helper to read 10x fixed-length strings from HDF5
+#[allow(dead_code)]
 fn read_strings(ds: hdf5::Dataset) -> anyhow::Result<Vec<String>> {
     // Try common 10x fixed-length string sizes
     if let Ok(arr) = ds.read_1d::<FixedAscii<7>>() {
@@ -40,6 +42,7 @@ fn write_strings_metadata(group: &Group, name: &str, strings: &[String]) -> anyh
 }
 
 /// Subsets an existing 10x HDF5 file based on a list of cell indices.
+#[allow(dead_code)]
 pub fn subset_10x_h5<P: AsRef<Path>>(
     input_path: P,
     output_path: P,
@@ -123,6 +126,72 @@ pub fn subset_10x_h5<P: AsRef<Path>>(
     write_strings_metadata(&out_features_group, "id", &gene_ids)?;
     write_strings_metadata(&out_features_group, "feature_type", &feature_types)?;
     write_strings_metadata(&out_features_group, "genome", &genomes)?;
+
+    Ok(())
+}
+
+/// Write a decoded CSR sparse count matrix to a 10x Genomics-style HDF5 file.
+///
+/// The input `csr` is in `(n_cells × n_genes)` row-major layout — i.e. the
+/// shape produced by `reconstruct_count_matrix_from_payload`. Because the
+/// 10x on-disk format and a `(cells × genes)` CSR share the same
+/// `(data, indices, indptr)` triple (the only difference is the `shape`
+/// field, which is `[n_genes, n_cells]` on disk), we can write the CSR
+/// arrays directly without any transposition.
+///
+/// The decoder cannot recover the original barcode / gene labels from the
+/// payload (the row/column permutation back to the input H5 is not stored).
+/// We therefore write **placeholder** metadata: barcodes are
+/// `cell_0..cell_{n_cells-1}` and feature names/ids are
+/// `gene_0..gene_{n_genes-1}`. Downstream tools that consume the matrix by
+/// position (count totals, PCA, clustering on the decoded matrix) will work
+/// fine; tools that rely on barcode-specific lookups will need a separate
+/// mapping step.
+pub fn write_csr_10x_h5<P: AsRef<Path>>(
+    output_path: P,
+    csr: &CsMat<u16>,
+) -> anyhow::Result<()> {
+    if !csr.is_csr() {
+        anyhow::bail!("write_csr_10x_h5 requires a CSR matrix; got CSC");
+    }
+    let n_cells = csr.rows();
+    let n_genes = csr.cols();
+
+    let data: Vec<u16> = csr.data().to_vec();
+    let indices: Vec<usize> = csr.indices().to_vec();
+    let indptr: Vec<usize> = csr.indptr().raw_storage().to_vec();
+
+    let output_file = File::create(output_path.as_ref())?;
+    let matrix_group = output_file.create_group("matrix")?;
+
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&Array1::from_vec(data))
+        .create("data")?;
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&Array1::from_vec(indices))
+        .create("indices")?;
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&Array1::from_vec(indptr))
+        .create("indptr")?;
+    matrix_group
+        .new_dataset_builder()
+        .with_data(&Array1::from_vec(vec![n_genes, n_cells]))
+        .create("shape")?;
+
+    let barcodes: Vec<String> = (0..n_cells).map(|i| format!("cell_{}", i)).collect();
+    write_strings_metadata(&matrix_group, "barcodes", &barcodes)?;
+
+    let features_group = matrix_group.create_group("features")?;
+    let gene_names: Vec<String> = (0..n_genes).map(|i| format!("gene_{}", i)).collect();
+    let feature_types: Vec<String> = vec!["Gene Expression".to_string(); n_genes];
+    let genomes: Vec<String> = vec!["decoded".to_string(); n_genes];
+    write_strings_metadata(&features_group, "name", &gene_names)?;
+    write_strings_metadata(&features_group, "id", &gene_names)?;
+    write_strings_metadata(&features_group, "feature_type", &feature_types)?;
+    write_strings_metadata(&features_group, "genome", &genomes)?;
 
     Ok(())
 }

@@ -1,6 +1,7 @@
 mod arith_encode;
 mod cluster;
 mod delta_indices;
+mod h5_utils;
 mod index_stream;
 mod matrix_io;
 mod mst_codec;
@@ -2689,25 +2690,24 @@ fn compare_csr_exact(expected: &CsMat<u16>, actual: &CsMat<u16>) -> anyhow::Resu
 }
 
 fn resolve_position_columns(
-    platform: Option<Platform>,
+    platform: Platform,
     pos_x_col: Option<usize>,
     pos_y_col: Option<usize>,
 ) -> (usize, usize) {
     match platform {
-        Some(Platform::Visium) => (4, 5),
-        Some(Platform::Xenium) => (1, 2),
-        Some(Platform::SingleCell) => (pos_x_col.unwrap_or(0), pos_y_col.unwrap_or(1)),
-        None => (pos_x_col.unwrap_or(1), pos_y_col.unwrap_or(2)),
+        Platform::Visium => (4, 5),
+        Platform::Xenium => (1, 2),
+        Platform::SingleCell => (pos_x_col.unwrap_or(0), pos_y_col.unwrap_or(1)),
     }
 }
 
 fn coordinate_mode_label(
-    platform: Option<Platform>,
+    platform: Platform,
     input_pos: Option<&PathBuf>,
     matrix_orientation: MatrixOrientation,
 ) -> &'static str {
     match (platform, input_pos, matrix_orientation) {
-        (Some(Platform::SingleCell), _, _) | (_, None, _) => "none",
+        (Platform::SingleCell, _, _) | (_, None, _) => "none",
         (_, Some(_), MatrixOrientation::CellGene) => "coordinates",
         (_, Some(_), MatrixOrientation::GeneCell) => "requested-but-dummy-gene-rows",
     }
@@ -2725,7 +2725,7 @@ enum Commands {
     #[command(arg_required_else_help = true)]
     Build(BuildCommand),
     #[command(arg_required_else_help = true)]
-    RoundtripCheck(RoundtripCheckCommand),
+    Dump(DumpCommand),
 }
 
 #[derive(Debug, Args)]
@@ -2748,8 +2748,10 @@ struct BuildCommand {
     stats_csv: Option<PathBuf>,
     #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
-    #[arg(short = 'P', long = "platform", value_enum)]
-    platform: Option<Platform>,
+    /// Platform of the input matrix. Defaults to `single-cell` when not specified
+    /// (no positions required); use `visium` or `xenium` for spatial data with positions.
+    #[arg(short = 'P', long = "platform", value_enum, default_value_t = Platform::SingleCell)]
+    platform: Platform,
     /// Matrix row/column orientation used by the encoder.
     #[arg(long = "matrix-orientation", value_enum, default_value_t = MatrixOrientation::GeneCell)]
     matrix_orientation: MatrixOrientation,
@@ -2986,20 +2988,30 @@ fn append_build_stats_csv(
 }
 
 #[derive(Debug, Args)]
-struct RoundtripCheckCommand {
+struct DumpCommand {
     #[arg(short = 'e', long = "encoded")]
     encoded: PathBuf,
     /// Override encoded payload compression format (`gzip` or `zstd`).
     #[arg(long = "input-compression", value_enum)]
     input_compression: Option<PayloadCompressionArg>,
+    /// If set, write the decoded CSR count matrix to this path as a
+    /// 10x-style HDF5 file. The dumped matrix is in decoder (cluster + SVD)
+    /// order with placeholder `cell_*` / `gene_*` barcodes and feature names,
+    /// since the payload does not store the row/column permutation back to
+    /// the input H5.
+    #[arg(short = 'o', long = "output")]
+    output: Option<PathBuf>,
     #[arg(short = 'i', long)]
     input: PathBuf,
+    /// Optional positions file (CSV or Parquet). Required unless platform is `single-cell`.
     #[arg(short = 'p', long = "input-pos")]
-    input_pos: PathBuf,
+    input_pos: Option<PathBuf>,
     #[arg(short = 'F', long = "pos-format", value_enum, default_value_t = InputPosType::Parquet)]
     pos_format: InputPosType,
-    #[arg(short = 'P', long = "platform", value_enum)]
-    platform: Option<Platform>,
+    /// Platform of the encoded payload. Defaults to `single-cell` when not specified;
+    /// use `visium` or `xenium` for spatial payloads (and pass `--input-pos`).
+    #[arg(short = 'P', long = "platform", value_enum, default_value_t = Platform::SingleCell)]
+    platform: Platform,
     /// Matrix row/column orientation used when loading the ground-truth input.
     #[arg(long = "matrix-orientation", value_enum, default_value_t = MatrixOrientation::GeneCell)]
     matrix_orientation: MatrixOrientation,
@@ -3048,7 +3060,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Commands::Build(args) => {
-            let positions_arg: Option<&PathBuf> = if args.platform == Some(Platform::SingleCell) {
+            let positions_arg: Option<&PathBuf> = if args.platform == Platform::SingleCell {
                 None
             } else {
                 args.input_pos.as_ref()
@@ -3060,7 +3072,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let positions_spec = positions_arg
                 .map(|pos_path| (pos_path.as_path(), args.pos_format, pos_x_col, pos_y_col));
             if positions_spec.is_none()
-                && args.platform != Some(Platform::SingleCell)
+                && args.platform != Platform::SingleCell
                 && args.matrix_orientation == MatrixOrientation::CellGene
             {
                 return Err(anyhow::anyhow!(
@@ -3378,14 +3390,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
-        Commands::RoundtripCheck(args) => {
+        Commands::Dump(args) => {
             let (pos_x_col, pos_y_col) =
                 resolve_position_columns(args.platform, args.pos_x_col, args.pos_y_col);
-            let positions_spec = if args.platform == Some(Platform::SingleCell) {
+            let positions_spec = if args.platform == Platform::SingleCell {
                 None
             } else {
+                let input_pos = args.input_pos.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "--input-pos is required for --platform {:?}",
+                        args.platform
+                    )
+                })?;
                 Some((
-                    args.input_pos.as_path(),
+                    input_pos.as_path(),
                     args.pos_format,
                     pos_x_col,
                     pos_y_col,
@@ -3465,6 +3483,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                  verify={}ms, end-to-end={}ms (decode={}ms + truth-load={}ms + verify={}ms)",
                 verify_ms, total_ms, decode_only_ms, truth_ms, verify_ms
             );
+
+            if let Some(out_path) = args.output.as_ref() {
+                let t_write = Instant::now();
+                crate::h5_utils::write_csr_10x_h5(out_path, &reconstructed)?;
+                let write_ms = t_write.elapsed().as_millis();
+                info!(
+                    "Dumped decoded CSR matrix to {}: rows={}, cols={}, nnz={}, write={}ms \
+                     (placeholder barcodes/features; matrix is in decoder order)",
+                    out_path.display(),
+                    reconstructed.rows(),
+                    reconstructed.cols(),
+                    reconstructed.nnz(),
+                    write_ms
+                );
+            }
         }
     }
 
